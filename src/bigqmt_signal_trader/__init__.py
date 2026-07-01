@@ -11,10 +11,14 @@ from .models import (
     SignalStatus,
     TradeSignal,
 )
+from .xtquant_compat import BigQmtRpcClient, BigQmtXtData, BigQmtXtTrader
 
 __all__ = [
     "AccountSnapshot",
     "AssetSnapshot",
+    "BigQmtRpcClient",
+    "BigQmtXtData",
+    "BigQmtXtTrader",
     "OrderRequest",
     "OrderSubmitResult",
     "PositionSnapshot",

@@ -10,8 +10,28 @@ from ..models import CancelResult, OrderSnapshot, OrderSubmitResult, SignalActio
 from .position_bigqmt import _attr, _full_code
 
 
+PRICE_TYPE_ALIASES = {
+    "LIMIT": 11,
+    "FIX_PRICE": 11,
+    "LATEST_PRICE": 5,
+    "MARKET_PEER_PRICE_FIRST": 44,
+    "MARKET_SH_CONVERT_5_LIMIT": 43,
+    "MARKET_SZ_CONVERT_5_CANCEL": 47,
+}
+
+
 def _action_from_offset_flag(offset_flag):
     return SignalAction.BUY.value if int(offset_flag or 0) == 48 else SignalAction.SELL.value
+
+
+def _price_type_value(value, default):
+    if value is None or value == "":
+        return int(default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        text = str(value).strip().upper()
+        return int(PRICE_TYPE_ALIASES.get(text, default))
 
 
 class BigQmtOrderGateway:
@@ -75,7 +95,7 @@ class BigQmtOrderGateway:
             self.combo_type,
             account_id,
             normalize_stock_code(request.stock_code),
-            self.price_type,
+            _price_type_value(request.price_type, self.price_type),
             float(request.price),
             int(request.volume),
             request.strategy_name,
@@ -112,6 +132,9 @@ class BigQmtOrderGateway:
                     volume=int(_attr(row, ("m_nVolumeTotalOriginal", "volume"), 0) or 0),
                     traded_volume=int(_attr(row, ("m_nVolumeTraded", "traded_volume"), 0) or 0),
                     status=str(_attr(row, ("m_nOrderStatus", "status"), "") or ""),
+                    price=float(_attr(row, ("m_dLimitPrice", "m_dPrice", "price"), 0.0) or 0.0),
+                    strategy_name=str(_attr(row, ("m_strStrategyName", "strategy_name"), "") or ""),
+                    remark=str(_attr(row, ("m_strRemark", "remark"), "") or ""),
                 )
             )
         return result
@@ -139,6 +162,7 @@ class BigQmtOrderGateway:
                     action=_action_from_offset_flag(_attr(row, ("m_nOffsetFlag", "offset_flag"), 0)),
                     volume=int(_attr(row, ("m_nVolume", "volume"), 0) or 0),
                     price=float(_attr(row, ("m_dPrice", "m_dTradePrice", "price"), 0.0) or 0.0),
+                    traded_at=str(_attr(row, ("m_strTradeTime", "trade_time", "traded_at"), "") or ""),
                 )
             )
         return result

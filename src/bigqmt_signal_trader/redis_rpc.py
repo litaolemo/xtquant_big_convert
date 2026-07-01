@@ -226,7 +226,7 @@ class BigQmtRpcHandlers:
             stock_code=str(params.get("stock_code") or ""),
             volume=int(params.get("volume") or params.get("order_volume") or 0),
             price=float(price if price not in (None, "") else 0),
-            price_type=str(params.get("price_type") or "LIMIT"),
+            price_type=params.get("price_type") or "LIMIT",
             strategy_name=str(params.get("strategy_name") or "bigqmt_rpc"),
             remark=str(params.get("remark") or params.get("order_remark") or "redis_rpc"),
         )

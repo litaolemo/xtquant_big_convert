@@ -219,7 +219,19 @@ class OrderSubmitResult:
 
 
 class OrderSnapshot:
-    def __init__(self, order_sys_id, user_order_id, stock_code, action, volume, traded_volume, status):
+    def __init__(
+        self,
+        order_sys_id,
+        user_order_id,
+        stock_code,
+        action,
+        volume,
+        traded_volume,
+        status,
+        price=0.0,
+        strategy_name="",
+        remark="",
+    ):
         self.order_sys_id = order_sys_id
         self.user_order_id = user_order_id
         self.stock_code = stock_code
@@ -227,16 +239,20 @@ class OrderSnapshot:
         self.volume = volume
         self.traded_volume = traded_volume
         self.status = status
+        self.price = price
+        self.strategy_name = strategy_name
+        self.remark = remark
 
 
 class TradeSnapshot:
-    def __init__(self, trade_id, order_sys_id, stock_code, action, volume, price):
+    def __init__(self, trade_id, order_sys_id, stock_code, action, volume, price, traded_at=""):
         self.trade_id = trade_id
         self.order_sys_id = order_sys_id
         self.stock_code = stock_code
         self.action = action
         self.volume = volume
         self.price = price
+        self.traded_at = traded_at
 
 
 class OrderRef:

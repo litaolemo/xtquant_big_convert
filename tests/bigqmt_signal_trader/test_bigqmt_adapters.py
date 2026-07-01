@@ -94,7 +94,7 @@ class BigQmtAdaptersTest(unittest.TestCase):
             stock_code="600000",
             volume=300,
             price=10.12,
-            price_type="LIMIT",
+            price_type=44,
             strategy_name="bigqmt_signal_trader",
             remark="manual",
         )
@@ -102,7 +102,7 @@ class BigQmtAdaptersTest(unittest.TestCase):
         result = gateway.submit(request)
 
         self.assertEqual(result.status, "SUBMITTED")
-        self.assertEqual(calls[0][0:9], (23, 1101, "acct", "600000.SH", 11, 10.12, 300, "bigqmt_signal_trader", 2))
+        self.assertEqual(calls[0][0:9], (23, 1101, "acct", "600000.SH", 44, 10.12, 300, "bigqmt_signal_trader", 2))
         self.assertEqual(calls[0][9], result.user_order_id)
         self.assertIs(calls[0][10], context)
 
