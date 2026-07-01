@@ -1,10 +1,10 @@
-﻿# 大 QMT Redis Pub/Sub RPC 说明
+﻿# 大 QMT Redis Queue RPC 说明
 
-更新时间：2026-07-01
+更新时间：2026-07-02
 
 ## 目标
 
-在大 QMT 策略进程内启动一个 Redis Pub/Sub 订阅器，用来远程调用少量白名单方法：
+在大 QMT 策略进程内启动一个 Redis RPC 服务，用来远程调用少量白名单方法。实盘默认使用 Redis list queue + QMT `run_time("adjust", ...)` 调度 drain；请求 payload 会做安全编码，避免大 QMT 内置 Redis 客户端读取包含股票代码的 JSON 时触发 `Sensitive Data Detected`。
 
 - `ping`
 - `get_ticks`
@@ -35,7 +35,7 @@ RPC 服务端会把以下 MiniQMT 常用方法名映射到大 QMT 适配器：
 | `query_stock_position` | `query_stock_position` | 查询单只持仓，按 `stock_code` 过滤 |
 | `query_stock_orders` | `query_orders` | 查询委托；支持 `cancelable_only` 过滤 |
 | `query_stock_trades` | `query_trades` | 查询成交 |
-| `get_full_tick` | `get_ticks` | RPC 白名单仍保留；MiniQMT 兼容层默认改为 Redis 快照缓存读取 |
+| `get_full_tick` | `get_ticks` | 默认直接 RPC 调用；可选开启 Redis 快照缓存降载 |
 | `get_instrument_detail` / `get_instrumentdetail` | `get_instrument` | 查询合约详情 |
 | `order_stock` / `order_stock_async` | `submit_order` | 买卖下单；默认关闭 |
 | `cancel_order_stock` / `cancel_order_stock_sysid` | `cancel_order` | 撤单；默认关闭 |
@@ -46,14 +46,14 @@ RPC 服务端会把以下 MiniQMT 常用方法名映射到大 QMT 适配器：
 
 `get_full_tick/get_ticks` 的 `codes` 参数支持两种写法：传合约代码如 `["600000.SH", "000001.SZ"]` 查询指定标的；传市场代码如 `["SH", "SZ"]` 查询全市场全推快照。
 
-注意：兼容层的 `xtdata.get_full_tick(codes)` 默认不再通过 RPC 现拉全市场行情。客户端会把需求写入 Redis，10 秒内持续续约；大 QMT 在 `adjust` 中刷新活跃需求到 Redis 快照：**个股列表需求**按 `full_tick_refresh_interval_seconds`(默认 0.5s)快刷，**市场代码需求**(`SH/SZ/BJ/HK` 全市场)按 `full_tick_market_refresh_interval_seconds`(默认 3s)慢刷，避免每个快 tick 都传 5 万条数据；客户端只读取新鲜快照。个股列表若首次缓存未命中，会回退一次 live RPC(~ms)避免硬等；市场代码未命中则只抛超时、不 live 拉全市场。
+注意：兼容层的 `xtdata.get_full_tick(codes)` 默认走 Redis RPC 现调大 QMT。若需要降低全市场行情的大 payload 压力，可在客户端和 QMT 本地配置里显式打开 `full_tick_cache_enabled=True` / `BIGQMT_FULL_TICK_CACHE_CONFIG["enabled"]=True`，改为 Redis 需求驱动快照。
 
 ## 实现文件
 
-- `src/bigqmt_signal_trader/redis_rpc.py`：RPC 协议、订阅服务、外部客户端 helper。
+- `src/bigqmt_signal_trader/redis_rpc.py`：RPC 协议、Redis queue 服务、外部客户端 helper。
 - `src/bigqmt_signal_trader/xtquant_compat.py`：MiniQMT 风格客户端兼容层。
 - `src/xtquant/`：可选的 `xtquant` import shim，用于最终替换老 import。
-- `src/bigqmt_signal_trader_strategy.py`：在 `init` 中启动 RPC，在 `adjust/handlebar` 中处理请求队列。
+- `src/bigqmt_signal_trader_strategy.py`：在 `init` 中启动 RPC；默认由 QMT `run_time("adjust", ...)` drain Redis queue，避免大 QMT 冻结自建后台线程。
 - `src/bigqmt_signal_trader_redis_rpc_runtime.py`：大 QMT 策略入口，默认不消费交易信号，只启用 RPC 和持仓同步。
 - `tests/bigqmt_signal_trader/test_redis_rpc.py`：RPC 单测。
 
@@ -92,7 +92,12 @@ BIGQMT_REDIS_CONFIG = {
     "username": "",
     "password": "...",
     "rpc_allow_order_methods": False,
-    "full_tick_cache_enabled": True,
+    "rpc_process_in_listener": True,
+    "rpc_listener_methods": ("*",),
+    "rpc_background_threads": False,
+    "schedule_adjust": True,
+    "schedule_adjust_interval": "500nMilliSecond",
+    "full_tick_cache_enabled": False,
     "full_tick_demand_ttl_seconds": 10,
     "full_tick_cache_ttl_seconds": 10,
     "full_tick_refresh_interval_seconds": 3,
@@ -213,9 +218,9 @@ bigqmt:rpc:resp:{account_id}:{request_id}
 }
 ```
 
-### get_full_tick 需求驱动缓存
+### 可选：get_full_tick 需求驱动缓存
 
-客户端调用 `xtdata.get_full_tick(codes)` 时会写入需求：
+默认情况下，`xtdata.get_full_tick(codes)` 直接走 RPC。只有显式打开 `full_tick_cache_enabled=True` / `BIGQMT_FULL_TICK_CACHE_CONFIG["enabled"]=True` 时，客户端才会写入需求：
 
 ```text
 bigqmt:full_tick:demand:{account_id}
@@ -270,20 +275,40 @@ response = call_redis_rpc(
 print(response)
 ```
 
-## 延迟与轮询节奏
+## 延迟模式
 
-读 RPC 的主要延迟来源不是 Redis 传输，而是**服务端的队列排空节奏**：订阅线程只把请求塞进 `pending` 队列，真正调用 QMT 的 `drain_pending` 只在 `adjust/handlebar` 里跑，而 `adjust` 由 `run_time("adjust", schedule_adjust_interval)` 触发。因此除 `ping` 外的每个方法，最多要等一个 `schedule_adjust_interval` 才被执行。
+默认实盘模式下，客户端把安全编码后的请求写入 Redis list queue；大 QMT 侧通过 `run_time("adjust", ...)` 高频调度 drain 队列，并在 QMT 官方回调线程里同步调用 handler 和写回 Redis 响应。实测 500ms 调度下，连续请求通常会被同一轮 drain 批量处理，ping/持仓/get_full_tick 多数在十几毫秒返回，最坏会碰到一次调度边界。
 
-- `schedule_adjust_interval`：默认 `"500nMilliSecond"`，可在 `BIGQMT_REDIS_CONFIG` 里调（如 `"1000nMilliSecond"`/`"200nMilliSecond"`）。降低它按比例减少队列等待。
-- **务必在真机验证 `run_time` 真按该间隔触发**：启动后每 ~10 秒会打印一行 `adjust cadence: ticks=.. avg=.. min=.. max=..`，看 `avg` 是否贴近你设的间隔。若被 QMT 静默钳制（例如仍是 ~1s/3s），说明该间隔未生效，延迟不会下降。
-- 若 `run_time` 不可用或注册失败，会打印 `WARNING ... falls back to bar cadence`，此时排空退化到 bar 回调节奏（可能到分钟级），需要排查。
+当前推荐配置：
 
-提高 `adjust` 频率会增加策略线程负担（`tick_app`、full_tick 刷新也在其中），并可能挤占 order/trade 回调——上线后一并观察回调延迟。
+```python
+BIGQMT_REDIS_CONFIG = {
+    "rpc_process_in_listener": True,
+    "rpc_background_threads": False,
+    "schedule_adjust": True,
+    "schedule_adjust_interval": "500nMilliSecond",
+}
+```
+
+不推荐在大 QMT 中启用自建后台线程。实测部分版本会冻结 daemon thread，且内置 Redis 客户端读取包含股票代码的原始 JSON 会触发 `Sensitive Data Detected`；本仓库客户端 helper 已默认对请求做安全编码。
+
+### 当前真机延迟
+
+最近一次大 QMT 真机测试，`schedule_adjust_interval="500nMilliSecond"`：
+
+| 接口 | 成功率 | 平均 | P50 | P90 | 最大 |
+|---|---:|---:|---:|---:|---:|
+| `ping` | 30/30 | 20.2ms | 13.3ms | 13.9ms | 226.4ms |
+| `query_stock_asset` | 10/10 | 37.2ms | 15.0ms | 16.1ms | 237.2ms |
+| `query_stock_positions` | 10/10 | 13.4ms | 13.2ms | 14.5ms | 14.5ms |
+| `get_full_tick(["000001.SZ"])` | 20/20 | 24.9ms | 13.6ms | 14.8ms | 239.4ms |
+| `get_full_tick` 三只票 | 10/10 | 37.5ms | 17.2ms | 18.4ms | 225.2ms |
+
+结论：常态请求多在 12-18ms；偶发 200ms+ 主要来自 500ms 调度边界。队列测试后无残留，QMT 日志无新增 DataError/Traceback。
 
 ## 安全约束
 
-- Pub/Sub 线程只负责接收消息，不直接调用 QMT API。
-- QMT API 调用在 `adjust/handlebar` 中通过队列处理，避免在 Redis 订阅线程里碰 QMT 对象。
+- 默认生产模式不在自建线程里调用 QMT API；QMT API 调用在 `adjust/handlebar` 中处理。
 - 默认只读，远程下单关闭。
 - 账号不匹配会拒绝请求。
 - 响应写 Redis key 并设置 TTL，方便调用端超时后排查。
@@ -298,7 +323,7 @@ python -B -m unittest discover -s tests\bigqmt_signal_trader
 当前结果：
 
 ```text
-Ran 41 tests
+Ran 68 tests
 OK
 ```
 

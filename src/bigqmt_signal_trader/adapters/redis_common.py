@@ -3,6 +3,17 @@
 import os
 
 
+def _float_or_none(value, default=None):
+    if value is None:
+        return default
+    if value == "":
+        return default
+    text = str(value).strip()
+    if text.lower() in ("none", "null"):
+        return None
+    return float(value)
+
+
 def build_redis_client(config=None):
     config = config or {}
     try:
@@ -14,8 +25,8 @@ def build_redis_client(config=None):
     if url:
         return redis.Redis.from_url(
             url,
-            socket_connect_timeout=float(config.get("socket_connect_timeout", 1.5)),
-            socket_timeout=float(config.get("socket_timeout", 1.5)),
+            socket_connect_timeout=_float_or_none(config.get("socket_connect_timeout", 1.5), 1.5),
+            socket_timeout=_float_or_none(config.get("socket_timeout", 1.5), 1.5),
         )
 
     host = config.get("host") or os.environ.get("BIGQMT_REDIS_HOST") or "127.0.0.1"
@@ -29,8 +40,8 @@ def build_redis_client(config=None):
         db=db,
         username=username,
         password=password,
-        socket_connect_timeout=float(config.get("socket_connect_timeout", 1.5)),
-        socket_timeout=float(config.get("socket_timeout", 1.5)),
+        socket_connect_timeout=_float_or_none(config.get("socket_connect_timeout", 1.5), 1.5),
+        socket_timeout=_float_or_none(config.get("socket_timeout", 1.5), 1.5),
         health_check_interval=int(config.get("health_check_interval", 30)),
     )
 

@@ -1,10 +1,12 @@
 """Redis Pub/Sub RPC for the Big QMT runtime.
 
-The subscriber thread only receives Redis messages and pushes them into an
-in-memory queue. Real QMT calls are drained from the strategy callback thread
-by ``drain_pending``.
+By default the service can process selected requests directly in the Redis
+listener thread. The in-memory queue and ``drain_pending`` are kept as a
+runtime fallback for environments where a QMT API must run from a strategy
+callback thread.
 """
 
+import base64
 import datetime as _dt
 import json
 import math
@@ -65,6 +67,10 @@ ORDER_METHODS = {
     "cancel_order",
 }
 
+LISTENER_DEFERRED_METHODS = {
+    "sync_positions",
+}
+
 METHOD_ALIASES = {
     "get_full_tick": "get_ticks",
     "get_instrument_detail": "get_instrument",
@@ -83,6 +89,9 @@ METHOD_ALIASES = {
 BUY_ORDER_TYPES = {"23", "STOCK_BUY", "BUY", "B"}
 SELL_ORDER_TYPES = {"24", "STOCK_SELL", "SELL", "S"}
 CANCELABLE_ORDER_STATUSES = {"50", "55"}
+SAFE_B64_PREFIX = "b64s:"
+SAFE_B64_DIGIT_ENCODE = str.maketrans("0123456789", "!#$%&()*~?")
+SAFE_B64_DIGIT_DECODE = str.maketrans("!#$%&()*~?", "0123456789")
 MARKET_DATA_METHODS = {
     "get_instrument_type",
     "get_market_data",
@@ -368,51 +377,98 @@ def _bool_value(value, default=False):
     return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def encode_rpc_request_payload(request):
+    """Encode request JSON so patched QMT Redis clients do not inspect stock-code text."""
+
+    raw = json.dumps(request, ensure_ascii=False).encode("utf-8")
+    encoded = base64.b64encode(raw).decode("ascii").translate(SAFE_B64_DIGIT_ENCODE)
+    return SAFE_B64_PREFIX + encoded
+
+
+def decode_rpc_request_payload(text):
+    text = str(text)
+    if not text.startswith(SAFE_B64_PREFIX):
+        return text
+    encoded = text[len(SAFE_B64_PREFIX):].translate(SAFE_B64_DIGIT_DECODE)
+    return base64.b64decode(encoded.encode("ascii")).decode("utf-8")
+
+
 class RedisPubSubRpcService:
-    """Receive RPC requests from Redis Pub/Sub and write responses to Redis."""
+    """Receive RPC requests from Redis and write responses back to Redis."""
 
     def __init__(
         self,
         redis_client,
         handlers,
         account_id="",
+        response_redis_client=None,
         request_channel_template="bigqmt:rpc:req:{account_id}",
+        request_queue_template="bigqmt:rpc:queue:{account_id}",
         response_channel_template="bigqmt:rpc:resp:{account_id}:{request_id}",
+        response_list_template="bigqmt:rpc:respq:{account_id}:{request_id}",
         response_key_template="bigqmt:rpc:resp:{account_id}:{request_id}",
         response_ttl_seconds=60,
         max_queue_size=200,
         process_in_listener=False,
         listener_methods=None,
+        background_threads=True,
+        queue_poll_interval_seconds=0.02,
+        debug_log_limit=0,
         print_prefix="[bigqmt_rpc]",
     ):
-        self.redis = redis_client
+        self.listen_redis = redis_client
+        self.redis = response_redis_client or redis_client
         self.handlers = handlers
         self.account_id = str(account_id or "")
         self.request_channel_template = request_channel_template
+        self.request_queue_template = request_queue_template
         self.response_channel_template = response_channel_template
+        self.response_list_template = response_list_template
         self.response_key_template = response_key_template
         self.response_ttl_seconds = int(response_ttl_seconds)
         self.process_in_listener = bool(process_in_listener)
+        self.background_threads = bool(background_threads)
         if listener_methods is None:
             listener_methods = ("ping",)
-        self.listener_methods = set(str(name) for name in listener_methods)
+        self.listener_methods = self._expand_listener_methods(listener_methods)
+        self.queue_poll_interval_seconds = max(0.001, float(queue_poll_interval_seconds))
+        self.debug_log_limit = int(debug_log_limit)
+        self._received_count = 0
+        self._processed_count = 0
+        self._published_count = 0
         self.print_prefix = print_prefix
         self.pending = queue.Queue(maxsize=int(max_queue_size))
         self._running = threading.Event()
         self._thread = None
+        self._queue_thread = None
         self._pubsub = None
 
     @property
     def request_channel(self):
         return self.request_channel_template.format(account_id=self.account_id)
 
+    @property
+    def request_queue(self):
+        return self.request_queue_template.format(account_id=self.account_id)
+
     def start(self):
-        if self._thread is not None and self._thread.is_alive():
+        if not self.background_threads:
+            print("%s started queue=%s background_threads=False" % (self.print_prefix, self.request_queue))
+            return
+        if (
+            self._running.is_set()
+            and self._thread is not None
+            and self._thread.is_alive()
+            and self._queue_thread is not None
+            and self._queue_thread.is_alive()
+        ):
             return
         self._running.set()
         self._thread = threading.Thread(target=self._listen_loop, name="bigqmt-redis-rpc", daemon=True)
+        self._queue_thread = threading.Thread(target=self._queue_loop, name="bigqmt-redis-rpc-queue", daemon=True)
         self._thread.start()
-        print("%s started channel=%s" % (self.print_prefix, self.request_channel))
+        self._queue_thread.start()
+        print("%s started channel=%s queue=%s" % (self.print_prefix, self.request_channel, self.request_queue))
 
     def stop(self):
         self._running.clear()
@@ -425,19 +481,27 @@ class RedisPubSubRpcService:
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(1.0)
+        queue_thread = self._queue_thread
+        if queue_thread is not None and queue_thread.is_alive():
+            queue_thread.join(1.0)
         self._thread = None
+        self._queue_thread = None
 
     def _listen_loop(self):
         while self._running.is_set():
             try:
-                pubsub = self.redis.pubsub(ignore_subscribe_messages=True)
+                pubsub = self.listen_redis.pubsub(ignore_subscribe_messages=True)
                 self._pubsub = pubsub
                 pubsub.subscribe(self.request_channel)
+                if self.debug_log_limit > 0:
+                    print("%s subscribed channel=%s" % (self.print_prefix, self.request_channel))
                 while self._running.is_set():
                     message = pubsub.get_message(timeout=1.0)
+                    if not self._running.is_set():
+                        break
                     if not message or message.get("type") != "message":
                         continue
-                    self.enqueue_payload(message.get("data"))
+                    self._handle_received_payload(message.get("data"), "pubsub")
             except Exception:
                 print("%s listener failed:\n%s" % (self.print_prefix, traceback.format_exc()))
                 time.sleep(1.0)
@@ -449,18 +513,72 @@ class RedisPubSubRpcService:
                     pass
                 self._pubsub = None
 
+    def _queue_loop(self):
+        while self._running.is_set():
+            try:
+                if self.debug_log_limit > 0:
+                    print("%s queue polling key=%s" % (self.print_prefix, self.request_queue))
+                while self._running.is_set():
+                    item = self.listen_redis.lpop(self.request_queue)
+                    if not self._running.is_set():
+                        break
+                    if not item:
+                        time.sleep(self.queue_poll_interval_seconds)
+                        continue
+                    self._handle_received_payload(item, "queue")
+            except Exception:
+                print("%s queue listener failed:\n%s" % (self.print_prefix, traceback.format_exc()))
+                time.sleep(1.0)
+
+    def _handle_received_payload(self, raw_payload, source):
+        self._received_count += 1
+        if self._received_count <= self.debug_log_limit:
+            try:
+                preview = self._loads(raw_payload)
+                method = str(preview.get("method") or "")
+                print(
+                    "%s received source=%s method=%s inline=%s"
+                    % (self.print_prefix, source, method, self._should_process_in_listener(preview))
+                )
+                self.enqueue_payload(preview)
+                return
+            except Exception:
+                print("%s receive preview failed:\n%s" % (self.print_prefix, traceback.format_exc()))
+        self.enqueue_payload(raw_payload)
+
     def enqueue_payload(self, raw_payload):
         payload = self._loads(raw_payload)
-        method = str(payload.get("method") or "")
-        if self.process_in_listener and method in self.listener_methods:
+        if self._should_process_in_listener(payload):
             self.process_request(payload)
             return
         self.pending.put_nowait(payload)
+
+    def _should_process_in_listener(self, payload):
+        if not self.process_in_listener:
+            return False
+        method = str((payload or {}).get("method") or "")
+        if method in self.listener_methods:
+            return True
+        canonical = getattr(self.handlers, "_canonical_method", lambda value: value)(method)
+        return canonical in self.listener_methods
+
+    def _expand_listener_methods(self, listener_methods):
+        methods = set()
+        for method in listener_methods or ():
+            method = str(method)
+            if method in ("*", "all", "read", "readonly"):
+                methods.update(READ_METHODS - LISTENER_DEFERRED_METHODS)
+            else:
+                methods.add(method)
+                canonical = getattr(self.handlers, "_canonical_method", lambda value: value)(method)
+                methods.add(canonical)
+        return methods
 
     def _loads(self, raw_payload):
         if isinstance(raw_payload, dict):
             return dict(raw_payload)
         text = decode_text(raw_payload)
+        text = decode_rpc_request_payload(text)
         payload = json.loads(text)
         if not isinstance(payload, dict):
             raise ValueError("rpc payload must be a json object")
@@ -474,6 +592,16 @@ class RedisPubSubRpcService:
             except queue.Empty:
                 break
             self.process_request(request)
+            processed += 1
+        return processed
+
+    def drain_request_queue(self, max_items=20):
+        processed = 0
+        for _ in range(int(max_items)):
+            item = self.listen_redis.lpop(self.request_queue)
+            if not item:
+                break
+            self.process_request(self._loads(item))
             processed += 1
         return processed
 
@@ -500,6 +628,9 @@ class RedisPubSubRpcService:
         except Exception as exc:
             response["error"] = "%s: %s" % (exc.__class__.__name__, exc)
         self._publish_response(request, response)
+        self._processed_count += 1
+        if self._processed_count <= self.debug_log_limit:
+            print("%s responded method=%s ok=%s" % (self.print_prefix, method, response["ok"]))
         return response
 
     def _format_response_target(self, template, account_id, request_id):
@@ -518,13 +649,70 @@ class RedisPubSubRpcService:
         response_channel = request.get("reply_channel") or self._format_response_target(
             self.response_channel_template, account_id, request_id
         )
+        response_list = request.get("reply_list")
         if response_key:
-            if ttl_seconds > 0:
-                self.redis.setex(response_key, ttl_seconds, payload)
-            else:
-                self.redis.set(response_key, payload)
+            self._write_response_key(response_key, ttl_seconds, payload)
+        if response_list:
+            self._push_response_list(response_list, ttl_seconds, payload)
         if response_channel:
-            self.redis.publish(response_channel, payload)
+            self._publish_response_channel(response_channel, payload)
+
+    def _response_clients(self):
+        clients = [self.redis]
+        if self.listen_redis is not self.redis:
+            clients.append(self.listen_redis)
+        return clients
+
+    def _write_response_key(self, response_key, ttl_seconds, payload):
+        first_error = None
+        wrote = 0
+        for client in self._response_clients():
+            try:
+                if ttl_seconds > 0:
+                    client.setex(response_key, ttl_seconds, payload)
+                else:
+                    client.set(response_key, payload)
+                wrote += 1
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        if wrote <= 0 and first_error is not None:
+            raise first_error
+        return wrote
+
+    def _push_response_list(self, response_list, ttl_seconds, payload):
+        first_error = None
+        pushed = 0
+        for client in self._response_clients():
+            try:
+                client.rpush(response_list, payload)
+                if ttl_seconds > 0:
+                    client.expire(response_list, ttl_seconds)
+                pushed += 1
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        if pushed <= 0 and first_error is not None:
+            raise first_error
+        return pushed
+
+    def _publish_response_channel(self, response_channel, payload):
+        first_error = None
+        receivers = 0
+        published = 0
+        for client in self._response_clients():
+            try:
+                receivers += int(client.publish(response_channel, payload) or 0)
+                published += 1
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        if published <= 0 and first_error is not None:
+            raise first_error
+        self._published_count += 1
+        if self._published_count <= self.debug_log_limit:
+            print("%s published response receivers=%s" % (self.print_prefix, receivers))
+        return receivers
 
 
 def call_redis_rpc(
@@ -533,16 +721,21 @@ def call_redis_rpc(
     method,
     params=None,
     request_channel_template="bigqmt:rpc:req:{account_id}",
+    request_queue_template="bigqmt:rpc:queue:{account_id}",
     response_channel_template="bigqmt:rpc:resp:{account_id}:{request_id}",
+    response_list_template="bigqmt:rpc:respq:{account_id}:{request_id}",
     response_key_template="bigqmt:rpc:resp:{account_id}:{request_id}",
     timeout_seconds=3.0,
     ttl_seconds=60,
+    transport="queue",
 ):
     """Small external client helper for tests and admin scripts."""
 
     request_id = uuid.uuid4().hex
     request_channel = request_channel_template.format(account_id=account_id)
+    request_queue = request_queue_template.format(account_id=account_id)
     response_channel = response_channel_template.format(account_id=account_id, request_id=request_id)
+    response_list = response_list_template.format(account_id=account_id, request_id=request_id)
     response_key = response_key_template.format(account_id=account_id, request_id=request_id)
     request = {
         "schema_version": 1,
@@ -551,16 +744,38 @@ def call_redis_rpc(
         "method": method,
         "params": params or {},
         "reply_channel": response_channel,
+        "reply_list": response_list,
         "reply_key": response_key,
         "ttl_seconds": ttl_seconds,
     }
+    payload = encode_rpc_request_payload(request)
+    if str(transport or "queue").lower() in ("queue", "list", "blpop"):
+        redis_client.rpush(request_queue, payload)
+        redis_client.expire(request_queue, max(60, int(ttl_seconds)))
+        wait_timeout = max(1, int(float(timeout_seconds) + 0.999))
+        item = redis_client.blpop(response_list, timeout=wait_timeout)
+        if item:
+            raw_response = item[1] if isinstance(item, (list, tuple)) and len(item) >= 2 else item
+            try:
+                redis_client.delete(response_list)
+            except Exception:
+                pass
+            return json.loads(decode_text(raw_response))
+        raw_response = redis_client.get(response_key)
+        if raw_response:
+            return json.loads(decode_text(raw_response))
+        raise TimeoutError("redis rpc timeout: %s" % method)
+
     pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
     try:
         pubsub.subscribe(response_channel)
-        redis_client.publish(request_channel, json.dumps(request, ensure_ascii=False))
+        redis_client.publish(request_channel, payload)
         deadline = time.time() + float(timeout_seconds)
-        while time.time() < deadline:
-            message = pubsub.get_message(timeout=0.2)
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            message = pubsub.get_message(timeout=remaining)
             if not message or message.get("type") != "message":
                 continue
             response = json.loads(decode_text(message.get("data")))

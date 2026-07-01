@@ -18,18 +18,22 @@ BIGQMT_REDIS_CONFIG = {
     "password": "",
     # Keep order RPC disabled unless you explicitly want remote order/cancel.
     "rpc_allow_order_methods": False,
-    # How often the strategy thread drains the RPC queue (via run_time("adjust", ...)).
-    # This is the dominant read-RPC latency: a request waits up to one interval before
-    # it executes. Lower = lower latency but more load on the strategy thread. Confirm
-    # on the live box that run_time honors the value (see the "adjust cadence" log line)
-    # before trusting a low value; if it is clamped, latency stays high silently.
+    # Big QMT may freeze custom daemon threads after init and its bundled Redis
+    # client rejects raw stock-code JSON read from Redis. The default production
+    # path therefore uses an encoded Redis list queue and drains it from QMT's
+    # official run_time("adjust", ...) callback.
+    "rpc_process_in_listener": True,
+    "rpc_listener_methods": ("*",),
+    "rpc_background_threads": False,
+    "schedule_adjust": True,
     "schedule_adjust_interval": "500nMilliSecond",
-    # get_full_tick is served by a demand-driven Redis cache.
+    # The default mode calls get_full_tick through RPC. Enable this cache only
+    # if full-market payloads are too large for your latency/CPU budget.
     # When a client calls get_full_tick, it renews demand for 10 seconds.
     # Symbol-list demands refresh every full_tick_refresh_interval_seconds; whole-market
     # (SH/SZ/BJ/HK) demands refresh on the slower market interval so a ~50k row snapshot
     # is not pulled every fast tick.
-    "full_tick_cache_enabled": True,
+    "full_tick_cache_enabled": False,
     "full_tick_demand_ttl_seconds": 10,
     "full_tick_cache_ttl_seconds": 10,
     "full_tick_refresh_interval_seconds": 0.5,

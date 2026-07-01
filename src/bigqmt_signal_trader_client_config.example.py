@@ -19,10 +19,10 @@ BIGQMT_REDIS_CONFIG = {
     "password": "",
 }
 
-# Client-side get_full_tick reads Redis snapshots instead of making RPC calls.
-# The client renews demand for 10 seconds and waits briefly for the first fill.
+# Default direct mode calls get_full_tick through RPC. Set enabled=True only when
+# you want client-side get_full_tick to read demand-driven Redis snapshots.
 BIGQMT_FULL_TICK_CACHE_CONFIG = {
-    "enabled": True,
+    "enabled": False,
     "demand_ttl_seconds": 10,
     "cache_ttl_seconds": 10,
     "wait_seconds": 3.5,

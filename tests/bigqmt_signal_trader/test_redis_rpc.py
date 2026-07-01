@@ -9,7 +9,12 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from bigqmt_signal_trader.adapters.order_dryrun import DryRunOrderGateway
 from bigqmt_signal_trader.models import AssetSnapshot, OrderSnapshot, PositionSnapshot
-from bigqmt_signal_trader.redis_rpc import BigQmtRpcHandlers, RedisPubSubRpcService
+from bigqmt_signal_trader.redis_rpc import (
+    BigQmtRpcHandlers,
+    RedisPubSubRpcService,
+    decode_rpc_request_payload,
+    encode_rpc_request_payload,
+)
 
 
 class FakeRedis:
@@ -60,6 +65,14 @@ class FakePositionProvider:
 
 
 def _service(allow_order_methods=False, process_in_listener=False):
+    return _service_with_listener_methods(
+        allow_order_methods=allow_order_methods,
+        process_in_listener=process_in_listener,
+        listener_methods=None,
+    )
+
+
+def _service_with_listener_methods(allow_order_methods=False, process_in_listener=False, listener_methods=None):
     redis_client = FakeRedis()
     order_gateway = DryRunOrderGateway()
     handlers = BigQmtRpcHandlers(
@@ -74,6 +87,7 @@ def _service(allow_order_methods=False, process_in_listener=False):
         handlers,
         account_id="acct",
         process_in_listener=process_in_listener,
+        listener_methods=listener_methods,
     )
 
 
@@ -114,6 +128,20 @@ def _service_with_order_gateway(order_gateway, allow_order_methods=False):
 
 
 class RedisRpcTest(unittest.TestCase):
+    def test_encoded_request_payload_hides_stock_codes_from_qmt_redis_guard(self):
+        request = {
+            "request_id": "encoded",
+            "account_id": "acct",
+            "method": "get_full_tick",
+            "params": {"codes": ["000001.SZ", "600000.SH"]},
+        }
+
+        encoded = encode_rpc_request_payload(request)
+
+        self.assertNotIn("000001", encoded)
+        self.assertNotIn("600000", encoded)
+        self.assertEqual(json.loads(decode_rpc_request_payload(encoded)), request)
+
     def test_readonly_rpc_writes_position_response_to_key_and_channel(self):
         redis_client, service = _service()
 
@@ -169,6 +197,62 @@ class RedisRpcTest(unittest.TestCase):
         self.assertEqual(service.drain_pending(), 1)
         response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:queued-tick"])
         self.assertTrue(response["ok"], response["error"])
+
+    def test_process_in_listener_wildcard_handles_read_methods_but_queues_stateful_methods(self):
+        redis_client, service = _service_with_listener_methods(
+            allow_order_methods=True,
+            process_in_listener=True,
+            listener_methods=("*",),
+        )
+
+        service.enqueue_payload(
+            {
+                "request_id": "direct-tick",
+                "account_id": "acct",
+                "method": "get_full_tick",
+                "params": {"codes": ["600000.SH"]},
+            }
+        )
+
+        response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:direct-tick"])
+        self.assertTrue(response["ok"], response["error"])
+        self.assertEqual(response["data"]["600000.SH"]["lastPrice"], 10.5)
+        self.assertEqual(service.drain_pending(), 0)
+
+        service.enqueue_payload(
+            {
+                "request_id": "queued-sync",
+                "account_id": "acct",
+                "method": "sync_positions",
+                "params": {},
+            }
+        )
+
+        self.assertNotIn("bigqmt:rpc:resp:acct:queued-sync", redis_client.kv)
+        self.assertEqual(service.drain_pending(), 1)
+        sync_response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:queued-sync"])
+        self.assertTrue(sync_response["ok"], sync_response["error"])
+        self.assertEqual(sync_response["data"]["positions"]["600000.SH"]["available"], 800)
+
+        service.enqueue_payload(
+            {
+                "request_id": "queued-order",
+                "account_id": "acct",
+                "method": "order_stock",
+                "params": {
+                    "stock_code": "600000.SH",
+                    "order_type": 23,
+                    "order_volume": 100,
+                    "price_type": 11,
+                    "price": 10.1,
+                },
+            }
+        )
+
+        self.assertNotIn("bigqmt:rpc:resp:acct:queued-order", redis_client.kv)
+        self.assertEqual(service.drain_pending(), 1)
+        order_response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:queued-order"])
+        self.assertTrue(order_response["ok"], order_response["error"])
 
     def test_account_mismatch_is_rejected(self):
         redis_client, service = _service()

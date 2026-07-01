@@ -5,6 +5,30 @@ This entry does not consume trade signals. RPC order methods are disabled by
 default; read-only methods and position sync are enabled.
 """
 
+import os
+import sys
+
+
+# QMT loads strategy scripts via exec, so __file__ may be undefined. Build a
+# list of candidate directories (script dir guesses + cwd) and put any that
+# holds bigqmt_signal_trader_strategy.py on sys.path[0]. This keeps the package
+# and bigqmt_signal_trader_local_config importable regardless of how QMT
+# invokes the script.
+_CANDIDATE_DIRS = []
+try:
+    _CANDIDATE_DIRS.append(os.path.dirname(os.path.abspath(__file__)))
+except Exception:
+    pass
+_CANDIDATE_DIRS.append(os.getcwd())
+for _up in (".", ".."):
+    _CANDIDATE_DIRS.append(os.path.abspath(os.path.join(os.getcwd(), _up)))
+for _dir in _CANDIDATE_DIRS:
+    if os.path.exists(os.path.join(_dir, "bigqmt_signal_trader_strategy.py")):
+        if _dir not in sys.path:
+            sys.path.insert(0, _dir)
+        break
+
+
 from bigqmt_signal_trader_strategy import (  # noqa: E402
     adjust,
     bind_qmt_api,
@@ -28,12 +52,16 @@ REDIS_USERNAME = ""
 REDIS_PASSWORD = ""
 RPC_ALLOW_ORDER_METHODS = False
 RPC_PROCESS_IN_LISTENER = True
-RPC_LISTENER_METHODS = ("ping",)
+RPC_BACKGROUND_THREADS = False
+# "*" expands to read-only RPC methods only. Order/cancel/sync methods still go
+# through the queue fallback and require schedule_adjust=True when enabled.
+RPC_LISTENER_METHODS = ("*",)
+SCHEDULE_ADJUST_ENABLED = True
 # How often the strategy thread drains the RPC queue (via adjust). Lower = less
 # queue wait for read RPCs. Verify on the live box that run_time honors sub-3s
 # intervals (see the adjust cadence log) before trusting a low value.
 SCHEDULE_ADJUST_INTERVAL = "500nMilliSecond"
-FULL_TICK_CACHE_ENABLED = True
+FULL_TICK_CACHE_ENABLED = False
 FULL_TICK_DEMAND_TTL_SECONDS = 10
 FULL_TICK_CACHE_TTL_SECONDS = 10
 # Symbol-list demands refresh fast; whole-market (SH/SZ/BJ/HK) demands refresh on
@@ -60,7 +88,11 @@ RPC_ALLOW_ORDER_METHODS = bool(BIGQMT_REDIS_CONFIG.get("rpc_allow_order_methods"
 RPC_PROCESS_IN_LISTENER = bool(
     BIGQMT_REDIS_CONFIG.get("rpc_process_in_listener", RPC_PROCESS_IN_LISTENER and not RPC_ALLOW_ORDER_METHODS)
 )
+RPC_BACKGROUND_THREADS = bool(BIGQMT_REDIS_CONFIG.get("rpc_background_threads", RPC_BACKGROUND_THREADS))
 RPC_LISTENER_METHODS = tuple(BIGQMT_REDIS_CONFIG.get("rpc_listener_methods", RPC_LISTENER_METHODS))
+SCHEDULE_ADJUST_ENABLED = bool(BIGQMT_REDIS_CONFIG.get("schedule_adjust", SCHEDULE_ADJUST_ENABLED))
+if not RPC_BACKGROUND_THREADS:
+    SCHEDULE_ADJUST_ENABLED = True
 SCHEDULE_ADJUST_INTERVAL = str(BIGQMT_REDIS_CONFIG.get("schedule_adjust_interval", SCHEDULE_ADJUST_INTERVAL))
 FULL_TICK_CACHE_ENABLED = bool(BIGQMT_REDIS_CONFIG.get("full_tick_cache_enabled", FULL_TICK_CACHE_ENABLED))
 FULL_TICK_DEMAND_TTL_SECONDS = float(
@@ -90,7 +122,7 @@ def _apply_config(account_id):
         account_id=account_id,
         position_sync_type="redis",
         enable_rpc=True,
-        schedule_adjust=True,
+        schedule_adjust=SCHEDULE_ADJUST_ENABLED,
         schedule_adjust_interval=SCHEDULE_ADJUST_INTERVAL,
         redis={
             "host": REDIS_HOST,
@@ -112,6 +144,7 @@ def _apply_config(account_id):
             "drain_max_items": 20,
             "process_in_listener": RPC_PROCESS_IN_LISTENER,
             "listener_methods": RPC_LISTENER_METHODS,
+            "background_threads": RPC_BACKGROUND_THREADS,
         },
         full_tick_cache={
             "enabled": FULL_TICK_CACHE_ENABLED,
@@ -131,7 +164,7 @@ def configure_runtime_account(account_id):
 
 
 def configure_runtime_redis(redis_config):
-    global REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD, RPC_ALLOW_ORDER_METHODS, RPC_PROCESS_IN_LISTENER, RPC_LISTENER_METHODS, SCHEDULE_ADJUST_INTERVAL, FULL_TICK_CACHE_ENABLED, FULL_TICK_DEMAND_TTL_SECONDS, FULL_TICK_CACHE_TTL_SECONDS, FULL_TICK_REFRESH_INTERVAL_SECONDS, FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS, FULL_TICK_REFRESH_MAX_WALL_SECONDS, FULL_TICK_MAX_REQUESTS
+    global REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD, RPC_ALLOW_ORDER_METHODS, RPC_PROCESS_IN_LISTENER, RPC_BACKGROUND_THREADS, RPC_LISTENER_METHODS, SCHEDULE_ADJUST_ENABLED, SCHEDULE_ADJUST_INTERVAL, FULL_TICK_CACHE_ENABLED, FULL_TICK_DEMAND_TTL_SECONDS, FULL_TICK_CACHE_TTL_SECONDS, FULL_TICK_REFRESH_INTERVAL_SECONDS, FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS, FULL_TICK_REFRESH_MAX_WALL_SECONDS, FULL_TICK_MAX_REQUESTS
     redis_config = dict(redis_config or {})
     REDIS_HOST = redis_config.get("host", REDIS_HOST)
     REDIS_PORT = int(redis_config.get("port", REDIS_PORT))
@@ -142,7 +175,11 @@ def configure_runtime_redis(redis_config):
     RPC_PROCESS_IN_LISTENER = bool(
         redis_config.get("rpc_process_in_listener", RPC_PROCESS_IN_LISTENER and not RPC_ALLOW_ORDER_METHODS)
     )
+    RPC_BACKGROUND_THREADS = bool(redis_config.get("rpc_background_threads", RPC_BACKGROUND_THREADS))
     RPC_LISTENER_METHODS = tuple(redis_config.get("rpc_listener_methods", RPC_LISTENER_METHODS))
+    SCHEDULE_ADJUST_ENABLED = bool(redis_config.get("schedule_adjust", SCHEDULE_ADJUST_ENABLED))
+    if not RPC_BACKGROUND_THREADS:
+        SCHEDULE_ADJUST_ENABLED = True
     SCHEDULE_ADJUST_INTERVAL = str(redis_config.get("schedule_adjust_interval", SCHEDULE_ADJUST_INTERVAL))
     FULL_TICK_CACHE_ENABLED = bool(redis_config.get("full_tick_cache_enabled", FULL_TICK_CACHE_ENABLED))
     FULL_TICK_DEMAND_TTL_SECONDS = float(

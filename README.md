@@ -4,11 +4,12 @@
 
 ## 能力
 
-- 在大 QMT 策略进程中启动 Redis Pub/Sub RPC 服务。
+- 在大 QMT 策略进程中启动 Redis queue RPC 服务。
 - 查询资产、持仓、委托、成交、tick 和合约详情。
 - 透传行情/历史/财务/ETF/期权/模型/因子等 xtdata 风格接口到大 QMT `ContextInfo`。
 - 兼容 `query_stock_asset`、`query_stock_positions`、`query_stock_orders`、`query_stock_trades`、`get_full_tick`、`order_stock` 等 MiniQMT 常用方法名。
-- `get_full_tick` 默认走 Redis 需求驱动快照：客户端 10 秒内续约需求，大 QMT 约 3 秒刷新一次，客户端读取 Redis 而不是每次 RPC 现拉。
+- 默认生产模式：客户端写入安全编码后的 Redis queue，请求由大 QMT `run_time("adjust", ...)` 调度 drain，避免自建后台线程被冻结。
+- `get_full_tick` 默认直接 RPC 调用；仍保留 Redis 需求驱动快照缓存作为全市场行情的可选降载模式。
 - 提供 `bigqmt_signal_trader.xtquant_compat` 客户端兼容层，可把原来的 `xt_trader` / `xtdata` 调用转成 Redis RPC。
 - 提供可选 `src/xtquant/` shim，可让旧代码的 `from xtquant import xtdata, xtconstant` 命中本仓库兼容实现。
 - 行情订阅/反订阅状态写入 Redis：`bigqmt:quote_subscriptions:{account_id}` 和 `bigqmt:quote_events:{account_id}`。
@@ -45,9 +46,12 @@ BIGQMT_REDIS_CONFIG = {
     "username": "",
     "password": "******",
     "rpc_allow_order_methods": False,
-    # 读 RPC 排空节奏（主要延迟来源），越小延迟越低；真机需确认 run_time 真按此间隔触发。
+    "rpc_process_in_listener": True,
+    "rpc_listener_methods": ("*",),
+    "rpc_background_threads": False,
+    "schedule_adjust": True,
     "schedule_adjust_interval": "500nMilliSecond",
-    "full_tick_cache_enabled": True,
+    "full_tick_cache_enabled": False,
     "full_tick_demand_ttl_seconds": 10,
     "full_tick_cache_ttl_seconds": 10,
     "full_tick_refresh_interval_seconds": 0.5,
@@ -93,7 +97,7 @@ BIGQMT_REDIS_CONFIG = {
 }
 
 BIGQMT_FULL_TICK_CACHE_CONFIG = {
-    "enabled": True,
+    "enabled": False,
     "demand_ttl_seconds": 10,
     "cache_ttl_seconds": 10,
     "wait_seconds": 3.5,
@@ -124,7 +128,7 @@ from xtquant import xtdata, xtconstant
 
 - 大 QMT 内部运行 `bigqmt_signal_trader_redis_rpc_runtime.py`。
 - 内部策略使用 `passorder`、`get_trade_detail_data`、`ContextInfo` 行情/调度能力。
-- 外部旧系统继续使用 MiniQMT 风格的 `xt_trader` / `xtdata` API，由本仓库兼容层转换为 Redis RPC 或 Redis 行情快照读取。
+- 外部旧系统继续使用 MiniQMT 风格的 `xt_trader` / `xtdata` API，由本仓库兼容层转换为 Redis RPC；全市场行情可按需打开 Redis 快照缓存。
 
 如果后续券商环境明确开通 XtQuantServer 权限，并且 `XtQuantTrader(...).connect() == 0`，可以再增加直连模式；当前生产默认路径仍是“大 QMT 内部策略 + Redis/RPC”。
 
@@ -134,7 +138,21 @@ from xtquant import xtdata, xtconstant
 python -B -m unittest discover -s tests\bigqmt_signal_trader
 ```
 
-当前测试覆盖 66 个用例。
+当前测试覆盖 68 个用例。
+
+## 当前实测延迟
+
+大 QMT 端使用 Redis queue + `run_time("adjust", "500nMilliSecond")` drain。最近一次真机测试结果：
+
+| 接口 | 成功率 | 平均 | P50 | P90 | 最大 |
+|---|---:|---:|---:|---:|---:|
+| `ping` | 30/30 | 20.2ms | 13.3ms | 13.9ms | 226.4ms |
+| `query_stock_asset` | 10/10 | 37.2ms | 15.0ms | 16.1ms | 237.2ms |
+| `query_stock_positions` | 10/10 | 13.4ms | 13.2ms | 14.5ms | 14.5ms |
+| `get_full_tick(["000001.SZ"])` | 20/20 | 24.9ms | 13.6ms | 14.8ms | 239.4ms |
+| `get_full_tick` 三只票 | 10/10 | 37.5ms | 17.2ms | 18.4ms | 225.2ms |
+
+常态请求多在 12-18ms；偶发 200ms+ 主要来自 500ms 调度边界。队列测试后无残留，QMT 日志无新增 DataError/Traceback。
 
 ## QMT 本地配置
 

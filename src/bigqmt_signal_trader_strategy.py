@@ -89,6 +89,20 @@ def _resolve_runtime_name(name):
 def _detect_account_id(context_info=None):
     if _account_id:
         return _account_id
+    try:
+        import importlib
+        import bigqmt_signal_trader_local_config as _local_config
+
+        _local_config = importlib.reload(_local_config)
+        value = str(
+            getattr(_local_config, "BIGQMT_ACCOUNT_ID", "")
+            or (getattr(_local_config, "BIGQMT_REDIS_CONFIG", {}) or {}).get("account_id")
+            or ""
+        )
+        if value:
+            return value
+    except Exception:
+        pass
     for name in ("account", "account_id", "accountID"):
         value = _resolve_runtime_name(name)
         if value:
@@ -143,22 +157,31 @@ def _build_rpc_service(context_info, app, config):
         return None
 
     import importlib
+    from bigqmt_signal_trader.adapters import redis_common as _redis_common
     from bigqmt_signal_trader.adapters import market_bigqmt as _market_bigqmt
     from bigqmt_signal_trader.adapters import position_bigqmt as _position_bigqmt
-    from bigqmt_signal_trader.adapters.redis_common import build_redis_client
     from bigqmt_signal_trader.redis_rpc import BigQmtRpcHandlers, RedisPubSubRpcService
 
     # QMT keeps strategy modules in the same process between editor reruns.
     # Reload adapters here so synced local package fixes take effect immediately.
+    _redis_common = importlib.reload(_redis_common)
     _market_bigqmt = importlib.reload(_market_bigqmt)
     _position_bigqmt = importlib.reload(_position_bigqmt)
+    build_redis_client = _redis_common.build_redis_client
     BigQmtMarketDataProvider = _market_bigqmt.BigQmtMarketDataProvider
     BigQmtPositionProvider = _position_bigqmt.BigQmtPositionProvider
 
     qmt_api = dict(config.get("qmt_api") or {})
     redis_config = dict(config.get("redis") or {})
     redis_config.update(dict(rpc_config.get("redis") or {}))
-    redis_client = rpc_config.get("redis_client") or config.get("redis_client") or build_redis_client(redis_config)
+    listen_redis_config = dict(redis_config)
+    listen_redis_config["socket_timeout"] = None
+    redis_client = rpc_config.get("redis_client") or config.get("redis_client") or build_redis_client(listen_redis_config)
+    response_redis_client = (
+        rpc_config.get("response_redis_client")
+        or config.get("response_redis_client")
+        or build_redis_client(redis_config)
+    )
     account_id = str(rpc_config.get("account_id") or config.get("account_id") or _account_id or "")
     if not account_id:
         print("[bigqmt_rpc] disabled: account_id is empty")
@@ -176,8 +199,16 @@ def _build_rpc_service(context_info, app, config):
         allow_order_methods=allow_order_methods,
         allowed_methods=rpc_config.get("allowed_methods"),
     )
+    process_in_listener = _config_bool(rpc_config.get("process_in_listener"), True)
+    listener_methods = rpc_config.get("listener_methods") or ("*",)
+    background_threads = _config_bool(rpc_config.get("background_threads"), False)
+    print(
+        "[bigqmt_rpc] mode process_in_listener=%s listener_methods=%s allow_order_methods=%s background_threads=%s"
+        % (process_in_listener, listener_methods, allow_order_methods, background_threads)
+    )
     return RedisPubSubRpcService(
         redis_client=redis_client,
+        response_redis_client=response_redis_client,
         handlers=handlers,
         account_id=account_id,
         request_channel_template=rpc_config.get("request_channel_template", "bigqmt:rpc:req:{account_id}"),
@@ -185,8 +216,10 @@ def _build_rpc_service(context_info, app, config):
         response_key_template=rpc_config.get("response_key_template", "bigqmt:rpc:resp:{account_id}:{request_id}"),
         response_ttl_seconds=int(rpc_config.get("response_ttl_seconds", 60)),
         max_queue_size=int(rpc_config.get("max_queue_size", 200)),
-        process_in_listener=_config_bool(rpc_config.get("process_in_listener"), False),
-        listener_methods=rpc_config.get("listener_methods") or ("ping",),
+        process_in_listener=process_in_listener,
+        listener_methods=listener_methods,
+        background_threads=background_threads,
+        debug_log_limit=int(rpc_config.get("debug_log_limit", 5)),
     )
 
 
@@ -205,7 +238,11 @@ def _drain_rpc_service(config):
         return 0
     rpc_config = dict(config.get("rpc") or {})
     max_items = int(rpc_config.get("drain_max_items", 20))
-    return _rpc_service.drain_pending(max_items=max_items)
+    processed = 0
+    if hasattr(_rpc_service, "drain_request_queue"):
+        processed += _rpc_service.drain_request_queue(max_items=max_items)
+    processed += _rpc_service.drain_pending(max_items=max_items)
+    return processed
 
 
 def _refresh_full_tick_cache(context_info, config):

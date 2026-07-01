@@ -73,7 +73,7 @@ BIGQMT_REDIS_CONFIG = {
 }
 
 BIGQMT_FULL_TICK_CACHE_CONFIG = {
-    "enabled": True,
+    "enabled": False,
     "demand_ttl_seconds": 10,
     "cache_ttl_seconds": 10,
     "wait_seconds": 3.5,
@@ -111,7 +111,7 @@ $env:PYTHONPATH = "D:\gjzqqmt\xtquant_big_convert\src;$env:PYTHONPATH"
 | `query_stock_trades(acc)` | 已兼容 | 返回对象列表，含 `order_type`、`traded_volume`、`traded_price` |
 | `order_stock()` / `order_stock_async()` | 已兼容 | 需要大 QMT 本地配置打开 `rpc_allow_order_methods=True` |
 | `cancel_order_stock_sysid()` | 已兼容 | 需要大 QMT 本地配置打开 `rpc_allow_order_methods=True` |
-| `xtdata.get_full_tick(codes)` | 已兼容 | 默认读 Redis 快照缓存；客户端 10 秒续约需求，大 QMT 约 3 秒刷新一次；支持单票、ETF、`["SH", "SZ"]` 全市场 |
+| `xtdata.get_full_tick(codes)` | 已兼容 | 默认直接 RPC 调用；支持单票、ETF、`["SH", "SZ"]` 全市场；可选打开 Redis 快照缓存 |
 | `xtdata.get_instrument_detail(code)` | 已兼容 | 映射到大 QMT `get_instrumentdetail()` |
 | `xtdata.get_instrument_type(code)` | 已接入 | 优先调大 QMT；不支持时按代码前缀做基础判断 |
 | `xtdata.subscribe_quote(...)` / `subscribe_whole_quote(...)` | Redis 订阅兼容 | 写入 `bigqmt:quote_subscriptions:{account_id}`，并向 `bigqmt:quote_events:{account_id}` 发事件；callback 会收到一次当前快照/历史数据 |
@@ -214,7 +214,7 @@ print(xtdata.get_full_tick(["600000.SH"]))
 ## 注意事项
 
 - `subscribe_quote()` / `subscribe_whole_quote()` 当前通过 Redis 记录订阅意图，并给 callback 推一次当前数据；持续行情推送需要独立的 Redis 行情生产者消费 `bigqmt:quote_subscriptions:{account_id}`。
-- `get_full_tick()` 默认不走 RPC 现拉；第一次没有快照时会短等一轮大 QMT 刷新，仍没有新快照则超时，避免返回过期行情。
+- `get_full_tick()` 默认直接 RPC 现拉；如果全市场 payload 过大，再在客户端和 QMT 本地配置里打开 Redis 快照缓存。
 - `unsubscribe_quote(seq)` 当前按你的要求直接写 Redis：删除订阅表并推送 `unsubscribe_quote` 事件，不等待大 QMT 确认。
 - `get_stock_list_in_sector("沪深A股")` 的本地兜底会通过 `get_full_tick(["SH", "SZ"])` 过滤 A 股，速度取决于大 QMT 全市场快照返回耗时。
 - 历史行情、财务、ETF、期权、模型/因子等接口已经接到 RPC，但实际是否可用取决于大 QMT 策略环境里的 `ContextInfo` 是否暴露同名方法。

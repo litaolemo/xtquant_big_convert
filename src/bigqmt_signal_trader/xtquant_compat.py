@@ -290,7 +290,7 @@ class BigQmtRpcClient:
         self.full_tick_cache_config = {
             "enabled": _bool_value(
                 full_tick_cache_config.get("enabled", full_tick_cache_config.get("full_tick_cache_enabled")),
-                _env_bool("BIGQMT_FULL_TICK_CACHE_ENABLED", True),
+                _env_bool("BIGQMT_FULL_TICK_CACHE_ENABLED", False),
             ),
             "demand_ttl_seconds": float(
                 full_tick_cache_config.get("demand_ttl_seconds")
@@ -396,7 +396,7 @@ class BigQmtXtData:
         if not codes:
             return {}
         cache_config = dict(getattr(self.client, "full_tick_cache_config", {}) or {})
-        if _bool_value(cache_config.get("enabled"), True):
+        if _bool_value(cache_config.get("enabled"), False):
             redis_client = self.client._redis()
             request_full_tick_cache(
                 redis_client,
