@@ -101,8 +101,10 @@ pip install pymysql DBUtils  # mysql 传输（可选）
 src/bigqmt_signal_trader/          （整个核心包，含 transports/）
 src/bigqmt_signal_trader_strategy.py
 src/bigqmt_signal_trader_redis_rpc_runtime.py
-src/BIGQMT_REDIS_DRYRUN.py         （QMT 编辑器入口，GBK 编码）
+src/BIGQMT_REDIS_DRYRUN.py         （★ QMT 编辑器入口，GBK 编码，在 QMT 里加载这个）
 ```
+
+> **在 QMT 策略编辑器里只加载 `BIGQMT_REDIS_DRYRUN.py` 一个文件**。它会自动 import 上面其余文件。其余 `.py`（`bigqmt_signal_trader_*`）是它依赖的模块，不是直接运行的入口。
 
 ### 第 2 步：创建 QMT 端私有配置
 
@@ -139,16 +141,55 @@ BIGQMT_REDIS_CONFIG = {
 
 > **重要**：切到 zmq 或 mysql 时，必须同时设 `"rpc_background_threads": True`（这两种传输用自己的后台线程，不走 QMT 回调 drain）。
 
-### 第 3 步：在 QMT 里运行策略
+### 第 3 步：在 QMT 里运行策略（BIGQMT_REDIS_DRYRUN.py）
 
-在 QMT 策略编辑器加载并运行 `BIGQMT_REDIS_DRYRUN.py`（它是 GBK 编码入口，会自动 reload 模块 + 绑定 passorder/cancel/get_trade_detail_data）。
+**入口文件是 `src/BIGQMT_REDIS_DRYRUN.py`**（GBK 编码，QMT 友好）。在 QMT 策略编辑器加载并运行它。
 
-启动成功标志（QMT 输出面板）：
+#### 这个文件做什么
+
+它是 QMT 编辑器入口的"外壳"（shell），按顺序做 5 件事：
+
+1. **定位 python 目录**：把 QMT 的 `python` 目录加到 `sys.path`，让 `bigqmt_signal_trader` 包能 import。
+2. **reload 模块**：`importlib.reload` 刷新 `redis_common` / `redis_rpc` / `strategy` / `runtime` —— QMT 在编辑器里重跑策略时，进程不退出，reload 确保新代码立即生效。
+3. **注入 Redis 配置**：读 `bigqmt_signal_trader_local_config.py` 里的 `BIGQMT_REDIS_CONFIG`，调 `configure_runtime_redis()`。
+4. **注入账号**：读 `BIGQMT_ACCOUNT_ID`，调 `configure_runtime_account()`。如果配置没给，fallback 用 QMT 全局变量 `account`。
+5. **绑定 QMT 原生 API**：把 QMT 内置的 `passorder` / `cancel` / `get_trade_detail_data` 函数绑进 runtime（用 `try/except NameError` 包住，因为这些名字只在大 QMT 进程内存在）。
+6. **导出 QMT 回调**：`init = _runtime.init` / `handlebar = _runtime.handlebar` / `adjust = _runtime.adjust` 等，让 QMT 能回调到我们的策略逻辑。
+
+#### ⚠️ 硬编码路径（重要）
+
+`BIGQMT_REDIS_DRYRUN.py` 里有**一处写死的 QMT python 目录路径**，作为 `__file__` 找不到时的 fallback：
+
+```python
+def _known_qmt_python_dir():
+    root = "".join(chr(value) for value in (0x56fd, 0x91d1, 0x8bc1, 0x5238))   # 国金证券
+    suffix = "".join(chr(value) for value in (0x4ea4, 0x6613, 0x7aef))          # 交易端
+    return "D:\\" + root + "QMT" + suffix + "\\python"
+    # 解码后 = D:\国金证券QMT交易端\python
 ```
-[bigqmt_rpc] transport=redis mode process_in_listener=True ...
+
+- **`chr()` 编码**是为了规避 QMT 用 GBK 保存策略文件时中文乱码（用 Unicode 码点拼出"国金证券交易端"）。
+- **路径优先级**：先用 `__file__` 所在目录（脚本实际位置），找不到才用这个硬编码 fallback。
+- **如果你的 QMT 装在别的路径**（比如 `D:\华泰QMT\python`）：通常不用改，因为 `__file__` 优先。但如果你用 `exec` 方式加载（`__file__` 未定义），需要把 `_known_qmt_python_dir()` 改成你的路径，或直接硬编码：
+  ```python
+  def _known_qmt_python_dir():
+      return r"D:\你的券商QMT\python"
+  ```
+
+#### 启动成功标志（QMT 输出面板）
+
+```
+[bigqmt_shell] reload entry paths=['D:\\国金证券QMT交易端\\python']
+[bigqmt_shell] local redis config loaded keys=['host', 'port', 'db', ...]
+[bigqmt_shell] local account config loaded=True
+[bigqmt_rpc] transport=redis mode process_in_listener=True listener_methods=('*',) ...
 [bigqmt_rpc] started channel=bigqmt:rpc:req:你的账号
 [bigqmt_signal_trader] init ok
 ```
+
+> **为什么是 GBK 编码？** QMT 的策略编辑器用本地代码页（中文 Windows 是 GBK）保存文件。文件头 `#coding:gbk` 声明编码，避免 QMT 保存时破坏 UTF-8 内容。源码本身是 ASCII（中文用 `chr()` 拼），所以实际不会乱码。
+
+> **为什么不直接用 `bigqmt_signal_trader_redis_rpc_runtime.py`？** 那个文件是纯逻辑入口，不包含 reload 和 QMT API 绑定。`BIGQMT_REDIS_DRYRUN.py` 是给 QMT 编辑器专用的外壳，处理了 QMT 进程不退出导致模块缓存、API 绑定等坑。在 QMT 里**只加载 `BIGQMT_REDIS_DRYRUN.py`**。
 
 ### 第 4 步：客户端调用
 
