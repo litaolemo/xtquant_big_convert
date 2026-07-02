@@ -10,21 +10,24 @@
 
 ### RPC 接口（远程可调用）
 
-通过 RPC 可调用的大 QMT 能力（白名单 38 个只读方法 + 2 个下单方法）：
+通过 RPC 可调用的大 QMT 能力（**白名单 38 个只读方法 + 2 个下单方法 + 12 个 MiniQMT 风格别名**）：
 
 | 类别 | 方法 |
 |------|------|
+| **系统** | `ping` |
 | **行情快照** | `get_ticks` / `get_full_tick`（五档盘口）|
 | **合约/品种** | `get_instrument` / `get_instrument_type` |
 | **K线/历史** | `get_market_data` / `get_market_data_ex` / `get_local_data` |
-| **板块** | `get_stock_list_in_sector` / `get_sector_list` / `get_sector_info` |
-| **交易日历** | `get_trading_dates` / `get_holidays` / `get_market_last_trade_date` |
-| **下载** | `download_history_data` / `download_history_data2` / `download_financial_data` |
-| **财务/ETF/期权** | `get_financial_data` / `get_etf_info` / `get_option_list` / `get_ipo_info` |
-| **因子/模型** | `call_formula` / `subscribe_formula` / `get_formula_result` / `gen_factor_index` |
-| **账户查询** | `get_asset`（资金）/ `get_positions`（持仓）/ `query_orders`（委托）/ `query_trades`（成交）|
+| **板块** | `get_stock_list_in_sector` / `get_sector_list`* / `get_sector_info` |
+| **交易日历** | `get_trading_dates` / `get_holidays`* / `get_markets`* / `get_market_last_trade_date`* |
+| **数据下载** | `download_history_data` / `download_history_data2` / `download_holiday_data` / `download_etf_info` |
+| **财务/ETF/期权** | `get_financial_data` / `download_financial_data` / `download_financial_data2` / `get_etf_info` / `get_ipo_info` / `get_option_list` / `get_his_option_list` / `get_his_option_list_batch` / `get_divid_factors` |
+| **因子/模型** | `call_formula` / `subscribe_formula` / `unsubscribe_formula` / `get_formula_result` / `gen_factor_index` |
+| **账户查询** | `get_asset`（资金）/ `get_positions`（持仓）/ `query_stock_position`（单股持仓）/ `query_orders`（委托）/ `query_trades`（成交）|
 | **持仓同步** | `sync_positions`（写回 Redis 供客户端缓存）|
 | **下单/撤单** | `submit_order` / `cancel_order`（默认关闭，需显式开启）|
+
+> `*` 标记的方法在大 QMT（完整交易端）环境下用 **fallback** 实现（非原生数据）：`get_sector_list` 返回常用板块名清单，`get_holidays` 从交易日历反推，`get_markets` 返回固定市场集合，`get_market_last_trade_date` 从日历派生。详见 [docs/RPC_API_REFERENCE.md](docs/RPC_API_REFERENCE.md) 第 8 节「大 QMT 环境的能力边界」。
 
 ### 客户端兼容层
 
@@ -381,6 +384,7 @@ python -m pytest tests/bigqmt_signal_trader/ -q
 
 ## 相关文档
 
+- [docs/RPC_API_REFERENCE.md](docs/RPC_API_REFERENCE.md) — **全部 RPC 方法参考**（参数、返回值、别名、大 QMT 能力边界）
 - [docs/BIG_QMT_REDIS_RPC.md](docs/BIG_QMT_REDIS_RPC.md) — Redis RPC 协议与入口脚本详解
 - [docs/RPC_TRANSPORTS.md](docs/RPC_TRANSPORTS.md) — 可插拔传输层完整说明
 - [docs/XTQUANT_COMPAT_REPLACEMENT.md](docs/XTQUANT_COMPAT_REPLACEMENT.md) — 用兼容层替换旧 xtquant 的步骤
