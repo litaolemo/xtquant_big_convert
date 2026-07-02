@@ -60,6 +60,18 @@ READ_METHODS = {
     "query_trades",
     "query_stock_position",
     "sync_positions",
+    # 账户 / 融资融券扩展查询（经 get_trade_detail_data，需相应权限）
+    "query_account_infos",
+    "query_account_status",
+    "query_credit_detail",
+    "query_stk_compacts",
+    "query_credit_subjects",
+    "query_credit_slo_code",
+    "query_credit_assure",
+    "query_appointment_info",
+    "query_smt_secu_info",
+    "query_smt_secu_rate",
+    "smt_appointment",
 }
 
 ORDER_METHODS = {
@@ -168,6 +180,28 @@ MARKET_DATA_METHODS = {
     "get_svol",
     "get_bvol",
     "get_risk_free_rate",
+    # L2 行情（需 L2 权限 + 原生 xtdata SDK 行情服务）
+    "get_l2_quote",
+    "get_l2_order",
+    "get_l2_transaction",
+    "subscribe_l2thousand",
+    # 指数权重 / 交易日历 / 交易时段 / 可转债 / 品种判断
+    "get_index_weight",
+    "get_trading_calendar",
+    "get_trade_times",
+    "get_cb_info",
+    "is_stock_type",
+    # 板块增删
+    "add_sector",
+    "remove_sector",
+    # 数据下载扩展
+    "download_cb_data",
+    "download_history_contracts",
+    "download_index_weight",
+    "download_sector_data",
+    # 时间戳转换（纯计算，服务端本地）
+    "datetime_to_timetag",
+    "timetag_to_datetime",
 }
 
 # Keep READ_METHODS in sync with MARKET_DATA_METHODS: every market-data method
@@ -376,6 +410,59 @@ class BigQmtRpcHandlers:
             self.position_sync_sink.publish(snapshot)
         return snapshot
 
+    # ------------------------------------------------------------------
+    # 账户 / 融资融券扩展查询
+    # 这些在 MiniQMT 里走 XtQuantServer RPC；在 Big QMT 里只能通过
+    # get_trade_detail_data(account, type, <detail_type>) 查询，且需相应
+    # 账户权限（两融账户等）。无权限/上下文未绑定时降级为空。
+    # ------------------------------------------------------------------
+
+    def _query_trade_detail(self, params, detail_type, strategy_name=""):
+        account_id = self._request_account_id(params)
+        gateway = self.order_gateway
+        if gateway is None or gateway.get_trade_detail_data is None:
+            return []
+        try:
+            rows = gateway.get_trade_detail_data(account_id, gateway.account_type, detail_type, strategy_name)
+            return _normalize_detail_rows(rows)
+        except Exception:
+            # Big QMT 在无对应权限或上下文未绑定时会抛错，降级为空列表。
+            return []
+
+    def _handle_query_account_infos(self, params):
+        return self._query_trade_detail(params, "ACCOUNT")
+
+    def _handle_query_account_status(self, params):
+        return self._query_trade_detail(params, "ACCOUNT_STATUS")
+
+    def _handle_query_credit_detail(self, params):
+        return self._query_trade_detail(params, "CREDIT")
+
+    def _handle_query_stk_compacts(self, params):
+        return self._query_trade_detail(params, "COMPACT")
+
+    def _handle_query_credit_subjects(self, params):
+        return self._query_trade_detail(params, "CREDIT_SUBJECT")
+
+    def _handle_query_credit_slo_code(self, params):
+        return self._query_trade_detail(params, "CREDIT_SLO")
+
+    def _handle_query_credit_assure(self, params):
+        return self._query_trade_detail(params, "CREDIT_ASSURE")
+
+    def _handle_query_appointment_info(self, params):
+        return self._query_trade_detail(params, "APPOINTMENT")
+
+    def _handle_query_smt_secu_info(self, params):
+        return self._query_trade_detail(params, "SMT_SECU")
+
+    def _handle_query_smt_secu_rate(self, params):
+        return self._query_trade_detail(params, "SMT_RATE")
+
+    def _handle_smt_appointment(self, params):
+        # SMB/预约打新属于交易类，需要下单通道；当前不支持，返回未实现。
+        raise NotImplementedError("smt_appointment is not supported via Big QMT RPC")
+
     def _order_action_from_params(self, params):
         action = str(params.get("action") or "").upper()
         if action:
@@ -427,6 +514,34 @@ def _bool_value(value, default=False):
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _normalize_detail_rows(rows):
+    """Convert get_trade_detail_data row objects into JSON-serializable dicts.
+
+    QMT returns objects with m_strXxx / m_nXxx / m_dXxx attributes. We map
+    each to its public attributes so the result survives JSON encoding.
+    """
+    if not rows:
+        return []
+    result = []
+    for row in rows:
+        if isinstance(row, dict):
+            result.append(row)
+            continue
+        item = {}
+        for name in dir(row):
+            if name.startswith("_"):
+                continue
+            try:
+                value = getattr(row, name)
+            except Exception:
+                continue
+            if callable(value):
+                continue
+            item[name] = value
+        result.append(item)
+    return result
 
 
 def encode_rpc_request_payload(request):

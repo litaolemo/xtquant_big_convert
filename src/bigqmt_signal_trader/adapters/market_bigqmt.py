@@ -820,3 +820,197 @@ class BigQmtMarketDataProvider:
         # ContextInfo stub: get_risk_free_rate(index) — 无风险利率。
         return self._call_context("get_risk_free_rate", index)
 
+    # ------------------------------------------------------------------
+    # L2 行情（需 L2 权限）
+    # ------------------------------------------------------------------
+
+    def get_l2_quote(self, field_list=None, stock_code="", start_time="", end_time="", count=-1):
+        # xtdata SDK: get_l2_quote(field_list=[], stock_code='', start_time='', end_time='', count=-1)
+        # ContextInfo 无此方法；走原生 xtdata SDK，连不上则 NotImplementedError。
+        return self._native_or_context(
+            "get_l2_quote",
+            lambda: self._raise_unavailable("get_l2_quote"),
+            list(field_list or []), stock_code, start_time, end_time, count,
+        )
+
+    def get_l2_order(self, field_list=None, stock_code="", start_time="", end_time="", count=-1):
+        # xtdata SDK: get_l2_order(...) — L2 逐笔委托。
+        return self._native_or_context(
+            "get_l2_order",
+            lambda: self._raise_unavailable("get_l2_order"),
+            list(field_list or []), stock_code, start_time, end_time, count,
+        )
+
+    def get_l2_transaction(self, field_list=None, stock_code="", start_time="", end_time="", count=-1):
+        # xtdata SDK: get_l2_transaction(...) — L2 逐笔成交。
+        return self._native_or_context(
+            "get_l2_transaction",
+            lambda: self._raise_unavailable("get_l2_transaction"),
+            list(field_list or []), stock_code, start_time, end_time, count,
+        )
+
+    def subscribe_l2thousand(self, stock_code, gear_num=0, callback=None):
+        # xtdata SDK: subscribe_l2thousand(stock_code, gear_num=0, callback=None) — 千档盘口订阅。
+        # callback 在 RPC 模型下无意义（无回调通道），忽略。
+        module = self._native()
+        if module is not None and hasattr(module, "subscribe_l2thousand"):
+            try:
+                return module.subscribe_l2thousand(stock_code, gear_num, callback)
+            except Exception:
+                pass
+        return self._raise_unavailable("subscribe_l2thousand")
+
+    # ------------------------------------------------------------------
+    # 指数权重 / 交易日历 / 交易时段 / 可转债
+    # ------------------------------------------------------------------
+
+    def get_index_weight(self, index_code):
+        # xtdata SDK: get_index_weight(index_code) — 指数成分权重。
+        # ContextInfo 有 get_weight_in_index(indexcode, stockcode) 但语义不同（单股权重）。
+        return self._native_or_context(
+            "get_index_weight",
+            lambda: self._raise_unavailable("get_index_weight"),
+            index_code,
+        )
+
+    def get_trading_calendar(self, market, start_time="", end_time="", tradetimes=False):
+        # xtdata SDK: get_trading_calendar(market, start_time='', end_time='', tradetimes=False)
+        # ContextInfo 无此方法。SDK 不可用时从 get_trading_dates 派生（不含 tradetimes 时段）。
+        def _fallback():
+            try:
+                dates = self.get_trading_dates(market, start_time, end_time, -1) or []
+                return [str(d) for d in dates]
+            except Exception:
+                return self._raise_unavailable("get_trading_calendar")
+        return self._native_or_context(
+            "get_trading_calendar", _fallback, market, start_time, end_time, tradetimes
+        )
+
+    def get_trade_times(self, stockcode):
+        # xtdata SDK: get_trade_times(stockcode) — 日内交易时段。
+        # 传市场（'SH'）或代码（'600000.SH'）。返回 [[开始,结束,类型], ...]。
+        return self._native_or_context(
+            "get_trade_times",
+            lambda: self._raise_unavailable("get_trade_times"),
+            stockcode,
+        )
+
+    def get_cb_info(self, stockcode):
+        # xtdata SDK: get_cb_info(stockcode) — 可转债信息。
+        return self._native_or_context(
+            "get_cb_info",
+            lambda: self._raise_unavailable("get_cb_info"),
+            stockcode,
+        )
+
+    def is_stock_type(self, stock, tag):
+        # xtdata SDK: is_stock_type(stock, tag) — 品种判断（tag 如 'stock'/'fund'/'bond'）。
+        # ContextInfo 有 is_stock/is_fund/is_future 但签名不同，这里走 SDK。
+        return self._native_or_context(
+            "is_stock_type",
+            lambda: self._raise_unavailable("is_stock_type"),
+            stock, tag,
+        )
+
+    # ------------------------------------------------------------------
+    # 板块增删（自定义板块管理）
+    # ------------------------------------------------------------------
+
+    def add_sector(self, sector_name, stock_list):
+        # xtdata SDK: add_sector(sector_name, stock_list) — 向自定义板块追加股票。
+        # ContextInfo 用 create_sector（覆盖式），SDK 用 add_sector（追加式）。
+        module = self._native()
+        if module is not None and hasattr(module, "add_sector"):
+            try:
+                return module.add_sector(sector_name, list(stock_list or []))
+            except Exception:
+                pass
+        # ContextInfo fallback：create_sector 是覆盖式，语义略不同但可用。
+        return self._call_context("create_sector", sector_name, list(stock_list or []))
+
+    def remove_sector(self, sector_name):
+        # xtdata SDK: remove_sector(sector_name) — 删除自定义板块。
+        module = self._native()
+        if module is not None and hasattr(module, "remove_sector"):
+            try:
+                return module.remove_sector(sector_name)
+            except Exception:
+                pass
+        return self._raise_unavailable("remove_sector")
+
+    # ------------------------------------------------------------------
+    # 数据下载扩展
+    # ------------------------------------------------------------------
+
+    def download_cb_data(self):
+        # xtdata SDK: download_cb_data() — 下载可转债数据。
+        module = self._native()
+        if module is not None and hasattr(module, "download_cb_data"):
+            try:
+                return module.download_cb_data()
+            except Exception:
+                pass
+        return self._raise_unavailable("download_cb_data")
+
+    def download_history_contracts(self):
+        # xtdata SDK: download_history_contracts() — 下载过期合约数据。
+        module = self._native()
+        if module is not None and hasattr(module, "download_history_contracts"):
+            try:
+                return module.download_history_contracts()
+            except Exception:
+                pass
+        return self._raise_unavailable("download_history_contracts")
+
+    def download_index_weight(self):
+        # xtdata SDK: download_index_weight() — 下载指数权重数据。
+        module = self._native()
+        if module is not None and hasattr(module, "download_index_weight"):
+            try:
+                return module.download_index_weight()
+            except Exception:
+                pass
+        return self._raise_unavailable("download_index_weight")
+
+    def download_sector_data(self):
+        # xtdata SDK: download_sector_data() — 下载行业板块数据。
+        module = self._native()
+        if module is not None and hasattr(module, "download_sector_data"):
+            try:
+                return module.download_sector_data()
+            except Exception:
+                pass
+        return self._raise_unavailable("download_sector_data")
+
+    # ------------------------------------------------------------------
+    # 时间戳转换（纯计算，无需 QMT，服务端本地实现）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def datetime_to_timetag(datetime_str, format="%Y%m%d%H%M%S"):
+        # xtdata SDK: datetime_to_timetag(datetime, format="%Y%m%d%H%M%S")
+        # 把日期时间字符串转成毫秒时间戳。纯本地计算。
+        import datetime as _dt
+        try:
+            dt = _dt.datetime.strptime(str(datetime_str), format)
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def timetag_to_datetime(timetag, format):
+        # xtdata SDK: timetag_to_datetime(timetag, format) — 毫秒时间戳转字符串。
+        import datetime as _dt
+        try:
+            dt = _dt.datetime.fromtimestamp(int(timetag) / 1000.0)
+            return dt.strftime(format)
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _raise_unavailable(method_name):
+        raise NotImplementedError(
+            "%s is unavailable: needs native xtdata SDK quote service "
+            "(not reachable in Big QMT full terminal)" % method_name
+        )
+

@@ -932,6 +932,76 @@ class BigQmtXtData:
         """
         return self._call(method, **params)
 
+    # ------------------------------------------------------------------
+    # L2 行情（需 L2 权限 + 原生 xtdata SDK 行情服务）
+    # ------------------------------------------------------------------
+
+    def get_l2_quote(self, field_list=None, stock_code="", start_time="", end_time="", count=-1):
+        return self._call("get_l2_quote", field_list=list(field_list or []),
+                          stock_code=stock_code, start_time=start_time, end_time=end_time, count=count)
+
+    def get_l2_order(self, field_list=None, stock_code="", start_time="", end_time="", count=-1):
+        return self._call("get_l2_order", field_list=list(field_list or []),
+                          stock_code=stock_code, start_time=start_time, end_time=end_time, count=count)
+
+    def get_l2_transaction(self, field_list=None, stock_code="", start_time="", end_time="", count=-1):
+        return self._call("get_l2_transaction", field_list=list(field_list or []),
+                          stock_code=stock_code, start_time=start_time, end_time=end_time, count=count)
+
+    # ------------------------------------------------------------------
+    # 指数权重 / 交易日历 / 交易时段 / 可转债 / 品种判断
+    # ------------------------------------------------------------------
+
+    def get_index_weight(self, index_code):
+        return self._call("get_index_weight", index_code=index_code)
+
+    def get_trading_calendar(self, market, start_time="", end_time="", tradetimes=False):
+        return self._call("get_trading_calendar", market=market, start_time=start_time,
+                          end_time=end_time, tradetimes=tradetimes)
+
+    def get_trade_times(self, stockcode):
+        return self._call("get_trade_times", stockcode=stockcode)
+
+    def get_cb_info(self, stockcode):
+        return self._call("get_cb_info", stockcode=stockcode)
+
+    def is_stock_type(self, stock, tag):
+        return self._call("is_stock_type", stock=stock, tag=tag)
+
+    # ------------------------------------------------------------------
+    # 板块增删
+    # ------------------------------------------------------------------
+
+    def add_sector(self, sector_name, stock_list):
+        return self._call("add_sector", sector_name=sector_name, stock_list=list(stock_list or []))
+
+    def remove_sector(self, sector_name):
+        return self._call("remove_sector", sector_name=sector_name)
+
+    # ------------------------------------------------------------------
+    # 时间戳转换（纯计算）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def datetime_to_timetag(datetime_str, format="%Y%m%d%H%M%S"):
+        import datetime as _dt
+        try:
+            return int(_dt.datetime.strptime(str(datetime_str), format).timestamp() * 1000)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def timetag_to_datetime(timetag, format):
+        import datetime as _dt
+        try:
+            return _dt.datetime.fromtimestamp(int(timetag) / 1000.0).strftime(format)
+        except Exception:
+            return ""
+
+    @staticmethod
+    def timetagToDateTime(timetag, format):
+        return BigQmtXtData.timetag_to_datetime(timetag, format)
+
 
 class BigQmtXtTrader:
     def __init__(
@@ -1172,11 +1242,151 @@ class BigQmtXtTrader:
     def cancel_order_stock(self, account, order_id):
         return self.cancel_order_stock_sysid(account, "", order_id)
 
-    def query_ipo_data(self):
-        return {}
+    def unsubscribe(self, account):
+        # MiniQMT xttrader.unsubscribe(account) — 取消账户订阅。
+        # Big QMT RPC 模式下账户是被动响应，unsubscribe 为 no-op。
+        return 0
+
+    # ------------------------------------------------------------------
+    # 账户 / 融资融券扩展查询
+    # 这些在 MiniQMT 走 XtQuantServer RPC；Big QMT 经
+    # get_trade_detail_data 查询，需相应账户权限（两融账户等）。
+    # 无权限/上下文未绑定时服务端降级为 []。
+    # ------------------------------------------------------------------
+
+    def _query_account_list(self, account, method):
+        account_id = _account_id(account, self.client.account_id)
+        try:
+            return self.client.call(method, {"account_id": account_id}, account_id=account_id) or []
+        except Exception:
+            return []
+
+    def query_account_infos(self, account=None):
+        return self._query_account_list(account, "query_account_infos")
+
+    def query_account_status(self, account=None):
+        return self._query_account_list(account, "query_account_status")
+
+    def query_credit_detail(self, account):
+        return self._query_account_list(account, "query_credit_detail")
+
+    def query_stk_compacts(self, account):
+        return self._query_account_list(account, "query_stk_compacts")
+
+    def query_credit_subjects(self, account):
+        return self._query_account_list(account, "query_credit_subjects")
+
+    def query_credit_slo_code(self, account):
+        return self._query_account_list(account, "query_credit_slo_code")
+
+    def query_credit_assure(self, account):
+        return self._query_account_list(account, "query_credit_assure")
+
+    def query_appointment_info(self, account):
+        return self._query_account_list(account, "query_appointment_info")
+
+    def query_smt_secu_info(self, account):
+        return self._query_account_list(account, "query_smt_secu_info")
+
+    def query_smt_secu_rate(self, account, stock_code, max_term, fare_way, credit_type, trade_type):
+        account_id = _account_id(account, self.client.account_id)
+        try:
+            return self.client.call(
+                "query_smt_secu_rate",
+                {"account_id": account_id, "stock_code": stock_code, "max_term": max_term,
+                 "fare_way": fare_way, "credit_type": credit_type, "trade_type": trade_type},
+                account_id=account_id,
+            ) or []
+        except Exception:
+            return []
+
+    def query_ipo_data(self, account=None):
+        return self._query_account_list(account, "query_appointment_info")
 
     def query_new_purchase_limit(self, account):
         return {}
+
+    # ------------------------------------------------------------------
+    # async 变体：MiniQMT 的 *_async 方法返回 seq 后异步回调。
+    # 在 RPC 模型里请求-响应本就是同步的，这里直接转发到同步实现并
+    # 返回一个递增 seq，让旧代码 ``xt_trader.query_stock_positions_async(acc)``
+    # 不报错（回调仍由 register_callback 注册的回调在事件来时触发）。
+    # ------------------------------------------------------------------
+
+    _async_seq = 0
+
+    def _next_async_seq(self):
+        BigQmtXtTrader._async_seq += 1
+        return BigQmtXtTrader._async_seq
+
+    def query_stock_asset_async(self, account):
+        self.query_stock_asset(account)
+        return self._next_async_seq()
+
+    def query_stock_positions_async(self, account):
+        self.query_stock_positions(account)
+        return self._next_async_seq()
+
+    def query_stock_orders_async(self, account, cancelable_only=False):
+        self.query_stock_orders(account, cancelable_only)
+        return self._next_async_seq()
+
+    def query_stock_trades_async(self, account):
+        self.query_stock_trades(account)
+        return self._next_async_seq()
+
+    def query_account_infos_async(self, account=None):
+        self.query_account_infos(account)
+        return self._next_async_seq()
+
+    def query_account_status_async(self, account=None):
+        self.query_account_status(account)
+        return self._next_async_seq()
+
+    def query_credit_detail_async(self, account):
+        self.query_credit_detail(account)
+        return self._next_async_seq()
+
+    def query_stk_compacts_async(self, account):
+        self.query_stk_compacts(account)
+        return self._next_async_seq()
+
+    def query_credit_subjects_async(self, account):
+        self.query_credit_subjects(account)
+        return self._next_async_seq()
+
+    def query_credit_slo_code_async(self, account):
+        self.query_credit_slo_code(account)
+        return self._next_async_seq()
+
+    def query_credit_assure_async(self, account):
+        self.query_credit_assure(account)
+        return self._next_async_seq()
+
+    def query_ipo_data_async(self, account=None):
+        self.query_ipo_data(account)
+        return self._next_async_seq()
+
+    def query_new_purchase_limit_async(self, account):
+        self.query_new_purchase_limit(account)
+        return self._next_async_seq()
+
+    def query_appointment_info_async(self, account):
+        self.query_appointment_info(account)
+        return self._next_async_seq()
+
+    def cancel_order_stock_async(self, account, order_id):
+        return self.cancel_order_stock(account, order_id)
+
+    def cancel_order_stock_sysid_async(self, account, market, order_sysid):
+        return self.cancel_order_stock_sysid(account, market, order_sysid)
+
+    def set_relaxed_response_order_enabled(self, enabled=True):
+        # 内部行为开关，RPC 模式下无意义，no-op。
+        return 0
+
+    def smt_appointment_async(self, *args, **kwargs):
+        raise NotImplementedError("smt_appointment is not supported via Big QMT RPC")
 
     def _order_from_dict(self, account_id, item):
         action = item.get("action")
