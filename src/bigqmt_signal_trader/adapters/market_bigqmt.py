@@ -1,7 +1,33 @@
 """Big QMT market data adapter.
 
-This module only wraps ContextInfo. It does not make trading decisions.
+This module wraps two QMT runtime objects:
+
+* ``ContextInfo`` — the strategy-scoped object exposed inside ``handlebar`` /
+  ``init``. It carries methods that operate on the *current* subscribed context
+  (``get_market_data_ex``, ``get_full_tick``, ``get_instrumentdetail`` ...).
+* the **native xtdata SDK** (``bin.x64/Lib/site-packages/xtquant/xtdata.py``) —
+  a module of global functions that talk to the local quote service directly.
+  Some APIs only exist here, never as ContextInfo methods.
+
+The split matters. Per the official docs and the ContextInfo IDE stub
+(``_PyContextInfo.py``):
+
+* ``get_sector_list`` / ``get_holidays`` are **xtdata module functions**
+  (SDK xtdata.py lines 784 / 1197). They are *not* ContextInfo methods, so
+  calling ``ContextInfo.get_sector_list()`` raises NotImplementedError.
+* ``get_markets`` / ``get_market_last_trade_date`` do not exist in either the
+  ContextInfo stub or the xtdata SDK — they are MiniQMT-only conveniences that
+  must be synthesized from ``get_trading_dates``.
+* ``get_trading_dates`` exists on BOTH objects but with **different first
+  arguments**: the ContextInfo method takes ``stockcode`` while the xtdata
+  module function takes ``market``. We pass ``market`` (that is what every
+  caller in this codebase supplies), so we route through xtdata.
+
+This module does not make trading decisions.
 """
+
+import importlib
+import importlib.util
 
 from ..code_utils import normalize_stock_code
 
@@ -16,9 +42,87 @@ def normalize_market_or_stock_code(code):
     return normalize_stock_code(text)
 
 
+_NATIVE_XTDATA = None  # cached native xtdata SDK module (None = not yet tried)
+_NATIVE_XTDATA_UNAVAILABLE = object()  # sentinel: looked, not importable
+
+
+def _load_native_xtdata():
+    """Return the *native* xtdata SDK module shipped with the QMT install.
+
+    The Big QMT process ships two ``xtquant.xtdata`` modules:
+
+    * ``python/xtquant/xtdata.py`` — our RPC shim (forwards back over Redis).
+    * ``bin.x64/Lib/site-packages/xtquant/xtdata.py`` — the real SDK that
+      connects to the local quote service via ``get_client()``.
+
+    In the server-side adapter we need the real SDK because the global-data
+    functions (sectors, holidays, trading dates) only exist there. We load it
+    by absolute path so our shim (which may shadow it on ``sys.path``) never
+    wins. Returns ``None`` when the SDK is unavailable (e.g. running outside
+    QMT, or in a unit test) so callers can degrade gracefully.
+    """
+    global _NATIVE_XTDATA
+    if _NATIVE_XTDATA is _NATIVE_XTDATA_UNAVAILABLE:
+        return None
+    if _NATIVE_XTDATA is not None:
+        return _NATIVE_XTDATA
+    try:
+        import os
+
+        rel = os.path.join("bin.x64", "Lib", "site-packages", "xtquant", "xtdata.py")
+        # Walk up from this file looking for the QMT install root (the dir that
+        # contains bin.x64/). Robust to wherever the package happens to live
+        # (python/bigqmt_signal_trader/adapters/ in QMT, src/... in the repo).
+        start = os.path.abspath(__file__)
+        loaded = None
+        for _ in range(8):
+            parent = os.path.dirname(start)
+            if parent == start:
+                break
+            candidate = os.path.join(parent, rel)
+            if os.path.isfile(candidate):
+                spec = importlib.util.spec_from_file_location(
+                    "bigqmt_native_xtdata", candidate
+                )
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                loaded = module
+                break
+            start = parent
+        if loaded is None:
+            # Fall back to whatever ``xtquant.xtdata`` resolves to, as long as
+            # it is the real SDK. Our RPC shim (python/xtquant/xtdata.py and the
+            # repo's src/xtquant/xtdata.py) also exposes get_sector_list but only
+            # forwards back over RPC — using it here would recurse. Reject any
+            # module whose file lives under a "python" or "src" dir.
+            try:
+                candidate = importlib.import_module("xtquant.xtdata")
+            except Exception:
+                candidate = None
+            cand_file = getattr(candidate, "__file__", "") or ""
+            is_shim = (
+                candidate is not None
+                and hasattr(candidate, "get_sector_list")
+                and (
+                    candidate.__name__ == "bigqmt_native_xtdata"
+                    or candidate.__name__.endswith("xtquant_compat")
+                    or os.sep + "python" + os.sep in cand_file
+                    or os.sep + "src" + os.sep in cand_file
+                )
+            )
+            if candidate is not None and hasattr(candidate, "get_sector_list") and not is_shim:
+                loaded = candidate
+        _NATIVE_XTDATA = loaded if loaded is not None else _NATIVE_XTDATA_UNAVAILABLE
+    except Exception:
+        _NATIVE_XTDATA = _NATIVE_XTDATA_UNAVAILABLE
+    return None if _NATIVE_XTDATA is _NATIVE_XTDATA_UNAVAILABLE else _NATIVE_XTDATA
+
+
 class BigQmtMarketDataProvider:
-    def __init__(self, context_info):
+    def __init__(self, context_info, native_xtdata=None):
         self.context_info = context_info
+        # Allow injection for tests; otherwise resolve lazily on first use.
+        self._native_xtdata = native_xtdata
 
     def _context_method(self, method_name):
         method = getattr(self.context_info, method_name, None)
@@ -28,6 +132,27 @@ class BigQmtMarketDataProvider:
 
     def _call_context(self, method_name, *args, **kwargs):
         return self._context_method(method_name)(*args, **kwargs)
+
+    def _native(self):
+        """Return the native xtdata SDK, resolving it lazily on first use."""
+        if self._native_xtdata is None:
+            self._native_xtdata = _load_native_xtdata()
+        return self._native_xtdata
+
+    def _native_or_context(self, func_name, context_caller, *args, **kwargs):
+        """Prefer the xtdata SDK function, fall back to a ContextInfo call.
+
+        Several data APIs exist only as xtdata module functions. When the SDK
+        is available we use it (the authoritative source). Otherwise we fall
+        back to ContextInfo so that callers in backtest-only contexts still
+        get a best-effort answer instead of a hard NotImplementedError.
+        """
+        module = self._native()
+        if module is not None:
+            fn = getattr(module, func_name, None)
+            if fn is not None:
+                return fn(*args, **kwargs)
+        return context_caller()
 
     def _call_first_supported(self, shapes):
         last_error = None
@@ -210,13 +335,39 @@ class BigQmtMarketDataProvider:
         return self._call_context("download_history_data2", **kwargs)
 
     def get_trading_dates(self, market, start_time="", end_time="", count=-1):
-        return self._call_context("get_trading_dates", market, start_time, end_time, count)
+        # xtdata SDK signature: get_trading_dates(market, start_time, end_time, count)
+        # ContextInfo stub signature: get_trading_dates(stockcode, start_date, end_date, count, period)
+        # — note the FIRST argument differs (market vs stockcode). Every caller in
+        # this codebase passes a market code, so the xtdata SDK is the correct path.
+        def _via_context():
+            # ContextInfo's first arg is stockcode; pass market through anyway so
+            # backtest contexts still return something rather than crashing.
+            return self._call_context("get_trading_dates", market, start_time, end_time, count)
+
+        return self._native_or_context(
+            "get_trading_dates", _via_context, market, start_time, end_time, count
+        )
 
     def get_holidays(self):
-        return self._call_context("get_holidays")
+        # Holiday list is a GLOBAL datum, not context-scoped — only the xtdata
+        # SDK exposes it (xtdata.py line 1197). No ContextInfo method exists.
+        def _via_context():
+            return self._call_context("get_holidays")
+
+        return self._native_or_context("get_holidays", _via_context)
 
     def download_holiday_data(self, incrementally=True):
-        return self._call_context("download_holiday_data", incrementally=incrementally)
+        def _via_context():
+            return self._call_context("download_holiday_data", incrementally=incrementally)
+
+        module = self._native()
+        if module is not None and hasattr(module, "download_holiday_data"):
+            try:
+                return module.download_holiday_data(incrementally)
+            except TypeError:
+                # older SDKs may not accept the keyword
+                return module.download_holiday_data()
+        return _via_context()
 
     def get_ipo_info(self, start_time="", end_time=""):
         return self._call_context("get_ipo_info", start_time, end_time)
@@ -261,16 +412,35 @@ class BigQmtMarketDataProvider:
         return self._call_context("download_financial_data2", stock_list, table_list or [], start_time, end_time)
 
     def get_sector_list(self):
-        return self._call_context("get_sector_list")
+        # Sector list is a GLOBAL datum — only the xtdata SDK exposes it
+        # (xtdata.py line 784). No ContextInfo method exists.
+        def _via_context():
+            return self._call_context("get_sector_list")
+
+        return self._native_or_context("get_sector_list", _via_context)
 
     def get_sector_info(self, sector_name=""):
         return self._call_context("get_sector_info", sector_name)
 
     def get_markets(self):
-        return self._call_context("get_markets")
+        # No such function exists in either ContextInfo or the xtdata SDK.
+        # MiniQMT-only convenience; synthesize from the known A-share markets.
+        return list(MARKET_CODES)
 
     def get_market_last_trade_date(self, market):
-        return self._call_context("get_market_last_trade_date", market)
+        # No such function exists in either ContextInfo or the xtdata SDK.
+        # Derive it from get_trading_dates(market, count=1) — last entry.
+        try:
+            dates = self.get_trading_dates(market, "", "", 1) or []
+        except Exception:
+            dates = []
+        if not dates:
+            return None
+        # xtdata returns millisecond timestamps (long list); take the last one.
+        try:
+            return dates[-1]
+        except Exception:
+            return None
 
     def call_formula(self, formula_name, stock_code, period, start_time="", end_time="", count=-1, dividend_type=None, extend_param=None):
         return self._call_context(
