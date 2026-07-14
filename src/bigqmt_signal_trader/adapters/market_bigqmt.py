@@ -42,6 +42,33 @@ def normalize_market_or_stock_code(code):
     return normalize_stock_code(text)
 
 
+def _raw_frame_columns(field_list):
+    columns = [str(field) for field in (field_list or [])]
+    if columns and "stime" not in columns:
+        columns.insert(0, "stime")
+    return columns
+
+
+def _raw_market_data_payload(payload, field_list, stock_list):
+    if not isinstance(payload, dict):
+        return payload
+    source = {str(code): records for code, records in payload.items()}
+    codes = []
+    for code in list(stock_list or []) + list(source):
+        text = str(code)
+        if text not in codes:
+            codes.append(text)
+    columns = _raw_frame_columns(field_list)
+    return {
+        code: {
+            "__bigqmt_type__": "DataFrame",
+            "columns": columns,
+            "records": source.get(code) or [],
+        }
+        for code in codes
+    }
+
+
 _NATIVE_XTDATA = None  # cached native xtdata SDK module (None = not yet tried)
 _NATIVE_XTDATA_UNAVAILABLE = object()  # sentinel: looked, not importable
 
@@ -315,6 +342,16 @@ class BigQmtMarketDataProvider:
         )
 
     def get_market_data_ex(self, **kwargs):
+        raw_method = getattr(self.context_info, "get_market_data_ex_ori", None)
+        if callable(raw_method):
+            raw_data = self._call_first_supported(
+                self._market_data_shapes("get_market_data_ex_ori", **kwargs)
+            )
+            return _raw_market_data_payload(
+                raw_data,
+                kwargs.get("field_list") or kwargs.get("fields"),
+                kwargs.get("stock_list") or kwargs.get("stock_code"),
+            )
         shapes = self._market_data_shapes("get_market_data_ex", **kwargs)
         if hasattr(self.context_info, "get_market_data"):
             shapes.extend(self._market_data_shapes("get_market_data", **kwargs))
@@ -1050,4 +1087,3 @@ class BigQmtMarketDataProvider:
             "%s is unavailable: needs native xtdata SDK quote service "
             "(not reachable in Big QMT full terminal)" % method_name
         )
-

@@ -165,6 +165,7 @@ class BigQmtAdaptersTest(unittest.TestCase):
         result = gateway.submit(request)
 
         self.assertEqual(result.status, "SUBMITTED")
+        self.assertEqual(result.user_order_id, "manual")
         self.assertEqual(calls[0][0:9], (23, 1101, "acct", "600000.SH", 44, 10.12, 300, "bigqmt_signal_trader", 2))
         self.assertEqual(calls[0][9], result.user_order_id)
         self.assertIs(calls[0][10], context)

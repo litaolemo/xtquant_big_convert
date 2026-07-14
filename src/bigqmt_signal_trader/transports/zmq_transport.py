@@ -20,6 +20,7 @@ using DEALER + ``poll`` (synchronous request/response fits the RPC model).
 """
 
 import json
+import queue
 import threading
 import time
 import uuid
@@ -129,6 +130,9 @@ class ZmqTransport(RpcTransport):
         self._actual_bind_address = None  # set after start_receiving()
         self._pending_identities = {}  # request_id -> client identity bytes
         self._identity_lock = threading.Lock()
+        self._response_queue = queue.Queue()
+        self._queued_response_count = 0
+        self._sent_response_count = 0
         # client state
         self._dealer = None
         self._client_lock = threading.Lock()
@@ -260,6 +264,7 @@ class ZmqTransport(RpcTransport):
         zmq = self._zmq
         try:
             while self._running:
+                self._drain_response_queue()
                 try:
                     frames = self._router.recv_multipart()
                 except self._zmq.Again:
@@ -304,6 +309,20 @@ class ZmqTransport(RpcTransport):
                 pass
             self._router = None
 
+    def _drain_response_queue(self):
+        while True:
+            try:
+                identity, payload = self._response_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self._router.send_multipart([identity, payload])
+                self._sent_response_count += 1
+                if self._sent_response_count <= 5:
+                    print("%s zmq queued response sent" % self.print_prefix)
+            except Exception as exc:
+                print("%s zmq send failed: %s" % (self.print_prefix, exc))
+
     def send_response(self, request, response):
         if self._router is None:
             raise TransportError("zmq server socket is not bound")
@@ -315,9 +334,15 @@ class ZmqTransport(RpcTransport):
         if identity is None:
             # No matching peer — drop silently (client may have gone away).
             return
-        payload = encode_rpc_request_payload(response)
+        payload = encode_rpc_request_payload(response).encode("utf-8")
+        if threading.current_thread() is not self._router_thread:
+            self._queued_response_count += 1
+            if self._queued_response_count <= 5:
+                print("%s zmq response queued for router thread" % self.print_prefix)
+            self._response_queue.put((identity, payload))
+            return
         try:
-            self._router.send_multipart([identity, payload.encode("utf-8")])
+            self._router.send_multipart([identity, payload])
         except Exception as exc:
             print("%s zmq send failed: %s" % (self.print_prefix, exc))
 

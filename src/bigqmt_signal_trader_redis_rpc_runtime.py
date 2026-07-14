@@ -29,19 +29,38 @@ for _dir in _CANDIDATE_DIRS:
         break
 
 
-from bigqmt_signal_trader_strategy import (  # noqa: E402
-    adjust,
-    bind_qmt_api,
-    configure,
-    deal_callback,
-    handlebar,
-    init,
-    on_order,
-    on_trade,
-    order_callback,
-    set_account_id,
-    sync_positions,
-)
+try:
+    _load_bridge_module = __bigqmt_load_local_module
+except NameError:
+    _load_bridge_module = None
+
+if _load_bridge_module is not None:
+    _strategy_module = _load_bridge_module("bigqmt_signal_trader_strategy")
+    adjust = _strategy_module.adjust
+    bind_qmt_api = _strategy_module.bind_qmt_api
+    configure = _strategy_module.configure
+    deal_callback = _strategy_module.deal_callback
+    handlebar = _strategy_module.handlebar
+    init = _strategy_module.init
+    on_order = _strategy_module.on_order
+    on_trade = _strategy_module.on_trade
+    order_callback = _strategy_module.order_callback
+    set_account_id = _strategy_module.set_account_id
+    sync_positions = _strategy_module.sync_positions
+else:
+    from bigqmt_signal_trader_strategy import (  # noqa: E402
+        adjust,
+        bind_qmt_api,
+        configure,
+        deal_callback,
+        handlebar,
+        init,
+        on_order,
+        on_trade,
+        order_callback,
+        set_account_id,
+        sync_positions,
+    )
 
 
 ACCOUNT_ID = ""
@@ -149,7 +168,7 @@ def _apply_config(account_id):
     configure(
         mode="bigqmt",
         account_id=account_id,
-        position_sync_type="redis",
+        position_sync_type="redis" if RPC_TRANSPORT in ("redis", "", "default") else "",
         enable_rpc=True,
         schedule_adjust=SCHEDULE_ADJUST_ENABLED,
         schedule_adjust_interval=SCHEDULE_ADJUST_INTERVAL,

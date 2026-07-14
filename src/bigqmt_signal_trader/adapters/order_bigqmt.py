@@ -88,7 +88,7 @@ class BigQmtOrderGateway:
         else:
             raise ValueError("unsupported order action: %s" % request.action)
 
-        user_order_id = self.build_user_order_id(request.signal_id)
+        user_order_id = str(request.remark or "").strip() or self.build_user_order_id(request.signal_id)
         account_id = request.account_id or self.account_id
         passorder(
             op_type,
@@ -116,13 +116,14 @@ class BigQmtOrderGateway:
         return CancelResult(success=bool(ok), message="" if ok else "cancel returned false")
 
     def query_orders(self, account_id, strategy_name):
-        query = self._require_query_func()
-        # QMT's get_trade_detail_data can raise on ORDER queries in some states
-        # (e.g. context not bound). Degrade to empty like query_trades does.
         try:
-            rows = query(account_id, self.account_type, "ORDER", strategy_name) or []
+            return self.query_orders_strict(account_id, strategy_name)
         except Exception:
             return []
+
+    def query_orders_strict(self, account_id, strategy_name):
+        query = self._require_query_func()
+        rows = query(account_id, self.account_type, "ORDER", strategy_name) or []
         result = []
         for row in rows:
             result.append(
@@ -145,15 +146,24 @@ class BigQmtOrderGateway:
         return result
 
     def query_trades(self, account_id, strategy_name):
+        try:
+            return self.query_trades_strict(account_id, strategy_name)
+        except Exception:
+            return []
+
+    def query_trades_strict(self, account_id, strategy_name):
         query = self._require_query_func()
         rows = []
+        last_error = None
         for detail_type in ("DEAL", "TRADE"):
             try:
                 rows = query(account_id, self.account_type, detail_type, strategy_name) or []
                 if rows:
                     break
-            except Exception:
-                rows = []
+            except Exception as exc:
+                last_error = exc
+        if not rows and last_error is not None:
+            raise last_error
         result = []
         for row in rows:
             result.append(
@@ -168,6 +178,12 @@ class BigQmtOrderGateway:
                     volume=int(_attr(row, ("m_nVolume", "volume"), 0) or 0),
                     price=float(_attr(row, ("m_dPrice", "m_dTradePrice", "price"), 0.0) or 0.0),
                     traded_at=str(_attr(row, ("m_strTradeTime", "trade_time", "traded_at"), "") or ""),
+                    user_order_id=str(_attr(row, ("m_strRemark", "user_order_id", "remark"), "") or ""),
                 )
             )
         return result
+
+    def query_submission_identities_strict(self, account_id, strategy_name):
+        orders = self.query_orders_strict(account_id, strategy_name)
+        trades = self.query_trades_strict(account_id, strategy_name)
+        return orders, trades

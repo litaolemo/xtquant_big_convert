@@ -183,6 +183,44 @@ class ZmqTransportTest(unittest.TestCase):
         finally:
             server.stop()
 
+    def test_deferred_response_returns_through_router_thread(self):
+        from bigqmt_signal_trader.transports.zmq_transport import ZmqTransport
+
+        pending = []
+        server = ZmqTransport(
+            bind_address=self.address, account_id="acct", recv_timeout_seconds=0.05
+        )
+        server.start_receiving(lambda request: pending.append(request), background_threads=True)
+        client = ZmqTransport(connect_address=self.address, account_id="acct")
+        result = {}
+
+        def call_client():
+            result["response"] = client.send_request(_build_request(), timeout_seconds=2.0)
+
+        try:
+            thread = threading.Thread(target=call_client)
+            thread.start()
+            deadline = time.time() + 1.0
+            while not pending and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(pending)
+            request = pending[0]
+            server.send_response(
+                request,
+                {
+                    "request_id": request["request_id"],
+                    "ok": True,
+                    "data": {"deferred": True},
+                    "error": "",
+                },
+            )
+            thread.join(2.0)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result["response"]["data"], {"deferred": True})
+        finally:
+            client.stop()
+            server.stop()
+
     def test_timeout_raises(self):
         from bigqmt_signal_trader.transports.zmq_transport import ZmqTransport
 
