@@ -1423,6 +1423,34 @@ class BigQmtXtTrader:
         ) or []
         return [self._trade_from_dict(account_id, item) for item in _as_list(data)]
 
+    def query_execution_snapshot(
+        self,
+        account,
+        order_strategy_name="bigqmt_signal_trader",
+        trade_strategy_name="",
+    ):
+        """Query orders and account-wide trades in one RPC round trip."""
+        account_id = _account_id(account, self.client.account_id)
+        data = self.client.call(
+            "query_execution_snapshot",
+            {
+                "account_id": account_id,
+                "order_strategy_name": order_strategy_name,
+                "trade_strategy_name": trade_strategy_name,
+            },
+            account_id=account_id,
+        ) or {}
+        result = dict(data) if isinstance(data, dict) else {}
+        result["orders"] = [
+            self._order_from_dict(account_id, item)
+            for item in _as_list(result.get("orders"))
+        ]
+        result["trades"] = [
+            self._trade_from_dict(account_id, item)
+            for item in _as_list(result.get("trades"))
+        ]
+        return result
+
     def order_stock(
         self,
         account,

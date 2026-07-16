@@ -236,13 +236,13 @@ def _is_redis_transport(transport_name):
 def _resolve_background_threads(transport_name, configured):
     """Decide whether the RPC service runs its own background receive threads.
 
-    Non-redis transports (zmq/mysql/shm) own their receive threads and have no
-    QMT adjust-drain fallback, so they MUST run background threads or they bind
-    but never receive. Force it on so switching transport is a one-liner
-    (``transport: "zmq"``) — the user needn't also set rpc_background_threads.
-    Redis keeps the configured value (default False = adjust-drain path).
+    ZMQ supports the QMT adjust-drain path and therefore honors the configured
+    value. Other non-Redis transports still require their receiver threads.
     """
-    if not _is_redis_transport(transport_name):
+    normalized = str(transport_name or "redis").lower()
+    if normalized == "zmq":
+        return bool(configured)
+    if not _is_redis_transport(normalized):
         return True
     return bool(configured)
 

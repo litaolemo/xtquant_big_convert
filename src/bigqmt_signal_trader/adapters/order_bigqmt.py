@@ -157,7 +157,10 @@ class BigQmtOrderGateway:
         last_error = None
         for detail_type in ("DEAL", "TRADE"):
             try:
-                rows = query(account_id, self.account_type, detail_type, strategy_name) or []
+                if str(strategy_name or "").strip():
+                    rows = query(account_id, self.account_type, detail_type, strategy_name) or []
+                else:
+                    rows = query(account_id, self.account_type, detail_type) or []
                 if rows:
                     break
             except Exception as exc:

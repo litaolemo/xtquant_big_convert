@@ -21,6 +21,9 @@ from .code_utils import normalize_stock_code
 from .models import AccountSnapshot, OrderRef, OrderRequest
 
 
+RPC_REVISION = "20260715-execution-snapshot-v1"
+
+
 READ_METHODS = {
     "ping",
     "get_ticks",
@@ -58,6 +61,7 @@ READ_METHODS = {
     "get_asset",
     "query_orders",
     "query_trades",
+    "query_execution_snapshot",
     "query_stock_position",
     "sync_positions",
     # 账户 / 融资融券 / 交易扩展查询（官方全局函数 + detail types）
@@ -384,6 +388,7 @@ class BigQmtRpcHandlers:
             "pong": True,
             "account_id": self.account_id,
             "allow_order_methods": bool(self.allow_order_methods),
+            "rpc_revision": RPC_REVISION,
             "server_time": _dt.datetime.now(),
         }
 
@@ -442,10 +447,31 @@ class BigQmtRpcHandlers:
     def _handle_query_trades(self, params):
         if self.order_gateway is None:
             raise RuntimeError("order_gateway is not configured")
+        strategy_name = params.get("strategy_name")
+        if strategy_name is None:
+            strategy_name = "bigqmt_signal_trader"
         return self.order_gateway.query_trades(
             self._request_account_id(params),
-            str(params.get("strategy_name") or "bigqmt_signal_trader"),
+            str(strategy_name),
         )
+
+    def _handle_query_execution_snapshot(self, params):
+        if self.order_gateway is None:
+            raise RuntimeError("order_gateway is not configured")
+        account_id = self._request_account_id(params)
+        order_name = params.get("order_strategy_name")
+        if order_name is None:
+            order_name = params.get("strategy_name", "bigqmt_signal_trader")
+        trade_name = params.get("trade_strategy_name")
+        if trade_name is None:
+            trade_name = ""
+        return {
+            "account_id": account_id,
+            "server_time": _dt.datetime.now(),
+            "rpc_revision": RPC_REVISION,
+            "orders": self.order_gateway.query_orders(account_id, str(order_name)),
+            "trades": self.order_gateway.query_trades(account_id, str(trade_name)),
+        }
 
     def _handle_sync_positions(self, params):
         account_id = self._request_account_id(params)

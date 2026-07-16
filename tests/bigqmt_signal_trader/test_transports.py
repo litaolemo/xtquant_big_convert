@@ -183,6 +183,43 @@ class ZmqTransportTest(unittest.TestCase):
         finally:
             server.stop()
 
+    def test_main_thread_drain_round_trip(self):
+        from bigqmt_signal_trader.transports.zmq_transport import ZmqTransport
+
+        server = ZmqTransport(
+            bind_address=self.address, account_id="acct", recv_timeout_seconds=0.01
+        )
+        server.start_receiving(
+            lambda request: {
+                "request_id": request["request_id"],
+                "account_id": "acct",
+                "method": request["method"],
+                "ok": True,
+                "data": {"main_thread": True},
+                "error": "",
+            },
+            background_threads=False,
+        )
+        client = ZmqTransport(connect_address=self.address, account_id="acct")
+        result = {}
+
+        def call_client():
+            result["response"] = client.send_request(_build_request(), timeout_seconds=2.0)
+
+        try:
+            thread = threading.Thread(target=call_client)
+            thread.start()
+            deadline = time.time() + 1.0
+            while thread.is_alive() and time.time() < deadline:
+                server.drain_request_queue(max_items=10)
+                time.sleep(0.01)
+            thread.join(1.0)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result["response"]["data"], {"main_thread": True})
+        finally:
+            client.stop()
+            server.stop()
+
     def test_deferred_response_returns_through_router_thread(self):
         from bigqmt_signal_trader.transports.zmq_transport import ZmqTransport
 

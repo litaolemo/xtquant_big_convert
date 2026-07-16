@@ -18,10 +18,13 @@ class BackgroundThreadResolutionTest(unittest.TestCase):
         self.assertFalse(_resolve_background_threads("default", False))
         self.assertFalse(_resolve_background_threads(None, False))
 
-    def test_non_redis_transports_force_background_threads_on(self):
-        # zmq/mysql/shm own their own receive threads: must be on even if the
-        # user left rpc_background_threads unset/False (the one-line switch).
-        for name in ("zmq", "ZMQ", "mysql", "shm"):
+    def test_zmq_transport_keeps_configured_value(self):
+        self.assertFalse(_resolve_background_threads("zmq", False))
+        self.assertFalse(_resolve_background_threads("ZMQ", False))
+        self.assertTrue(_resolve_background_threads("zmq", True))
+
+    def test_other_non_redis_transports_force_background_threads_on(self):
+        for name in ("mysql", "shm"):
             self.assertTrue(_resolve_background_threads(name, False), name)
             self.assertTrue(_resolve_background_threads(name, True), name)
 

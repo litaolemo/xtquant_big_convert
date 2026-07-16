@@ -209,6 +209,39 @@ class BigQmtAdaptersTest(unittest.TestCase):
         self.assertEqual(orders[0].action, "SELL")
         self.assertEqual(orders[0].traded_volume, 200)
 
+    def test_query_trades_without_strategy_omits_strategy_filter(self):
+        calls = []
+
+        def fake_query(*args):
+            calls.append(args)
+            return [
+                Obj(
+                    m_strTradeID="manual-trade-1",
+                    m_strOrderSysID="manual-order-1",
+                    m_strInstrumentID="600276",
+                    m_strExchangeID="SH",
+                    m_nOffsetFlag=48,
+                    m_nVolume=100,
+                    m_dPrice=54.76,
+                    m_strTradeTime="130524",
+                    m_strRemark="",
+                )
+            ]
+
+        gateway = BigQmtOrderGateway(
+            context_info=object(),
+            get_trade_detail_data_func=fake_query,
+        )
+
+        trades = gateway.query_trades_strict("acct", "")
+
+        self.assertEqual(calls, [("acct", "STOCK", "DEAL")])
+        self.assertEqual(trades[0].trade_id, "manual-trade-1")
+        self.assertEqual(trades[0].stock_code, "600276.SH")
+        self.assertEqual(trades[0].action, "BUY")
+        self.assertEqual(trades[0].volume, 100)
+        self.assertEqual(trades[0].price, 54.76)
+
     def test_factory_bigqmt_mode_wires_real_adapters(self):
         app = build_app(
             FakeContext(),

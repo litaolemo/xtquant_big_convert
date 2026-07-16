@@ -8,8 +8,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from bigqmt_signal_trader.adapters.order_dryrun import DryRunOrderGateway
-from bigqmt_signal_trader.models import AssetSnapshot, OrderSnapshot, PositionSnapshot
+from bigqmt_signal_trader.models import AssetSnapshot, OrderSnapshot, PositionSnapshot, TradeSnapshot
 from bigqmt_signal_trader.redis_rpc import (
+    RPC_REVISION,
     BigQmtRpcHandlers,
     RedisPubSubRpcService,
     decode_rpc_request_payload,
@@ -134,6 +135,40 @@ class CountingOrderGateway(DryRunOrderGateway):
         return super().submit(request)
 
 
+class CapturingTradeGateway(DryRunOrderGateway):
+    def __init__(self):
+        super().__init__()
+        self.strategy_names = []
+
+    def query_trades(self, account_id, strategy_name):
+        self.strategy_names.append((account_id, strategy_name))
+        return []
+
+
+class CapturingExecutionGateway(CapturingTradeGateway):
+    def __init__(self):
+        super().__init__()
+        self.order_strategy_names = []
+
+    def query_orders(self, account_id, strategy_name):
+        self.order_strategy_names.append((account_id, strategy_name))
+        return [
+            OrderSnapshot(
+                order_sys_id="order-1", user_order_id="tag-1", stock_code="600276.SH",
+                action="SELL", volume=100, traded_volume=0, status="50", price=55.0,
+            )
+        ]
+
+    def query_trades(self, account_id, strategy_name):
+        self.strategy_names.append((account_id, strategy_name))
+        return [
+            TradeSnapshot(
+                trade_id="trade-1", order_sys_id="order-1", stock_code="600276.SH",
+                action="SELL", volume=100, price=55.0,
+            )
+        ]
+
+
 def _service_with_order_gateway(order_gateway, allow_order_methods=False):
     redis_client = FakeRedis()
     handlers = BigQmtRpcHandlers(
@@ -147,6 +182,46 @@ def _service_with_order_gateway(order_gateway, allow_order_methods=False):
 
 
 class RedisRpcTest(unittest.TestCase):
+    def test_execution_snapshot_queries_orders_and_all_trades_once(self):
+        gateway = CapturingExecutionGateway()
+        handlers = BigQmtRpcHandlers(
+            account_id="acct",
+            market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(),
+            order_gateway=gateway,
+        )
+
+        snapshot = handlers.handle(
+            "query_execution_snapshot",
+            {
+                "account_id": "acct",
+                "order_strategy_name": "icestone_grid_600276",
+                "trade_strategy_name": "",
+            },
+        )
+
+        self.assertEqual(gateway.order_strategy_names, [("acct", "icestone_grid_600276")])
+        self.assertEqual(gateway.strategy_names, [("acct", "")])
+        self.assertEqual(snapshot["orders"][0].order_sys_id, "order-1")
+        self.assertEqual(snapshot["trades"][0].trade_id, "trade-1")
+        self.assertEqual(snapshot["account_id"], "acct")
+
+    def test_query_trades_preserves_explicit_empty_strategy_name(self):
+        gateway = CapturingTradeGateway()
+        handlers = BigQmtRpcHandlers(
+            account_id="acct",
+            market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(),
+            order_gateway=gateway,
+        )
+
+        handlers.handle(
+            "query_stock_trades",
+            {"account_id": "acct", "strategy_name": ""},
+        )
+
+        self.assertEqual(gateway.strategy_names, [("acct", "")])
+
     def test_submit_orders_batch_returns_one_result_per_order(self):
         handlers = BigQmtRpcHandlers(
             account_id="acct",
@@ -337,6 +412,7 @@ class RedisRpcTest(unittest.TestCase):
         self.assertTrue(response["ok"], response["error"])
         self.assertTrue(response["data"]["pong"])
         self.assertFalse(response["data"]["allow_order_methods"])
+        self.assertEqual(response["data"]["rpc_revision"], RPC_REVISION)
         self.assertEqual(service.drain_pending(), 0)
 
     def test_process_in_listener_leaves_non_listener_methods_queued(self):

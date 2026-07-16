@@ -87,6 +87,25 @@ class FakeRpcClient:
                     "price": 10.0,
                 }
             ]
+        if method == "query_execution_snapshot":
+            return {
+                "account_id": "acct",
+                "server_time": "2026-07-15 10:00:00",
+                "orders": [
+                    {
+                        "order_sys_id": "sys-1", "user_order_id": "remark-1",
+                        "stock_code": "600000.SH", "action": "SELL", "volume": 300,
+                        "traded_volume": 100, "status": "50", "price": 10.1,
+                    }
+                ],
+                "trades": [
+                    {
+                        "trade_id": "trade-1", "order_sys_id": "sys-1",
+                        "user_order_id": "remark-1", "stock_code": "600000.SH",
+                        "action": "BUY", "volume": 100, "price": 10.0,
+                    }
+                ],
+            }
         if method == "order_stock":
             return {"status": "SUBMITTED", "user_order_id": "bq:1", "order_sys_id": "sys-2"}
         if method == "order_stock_batch":
@@ -241,6 +260,20 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(order_id, "sys-2")
         self.assertTrue(cancelled)
         self.assertEqual(trader.client.calls[-2][1]["price_type"], MARKET_PEER_PRICE_FIRST)
+
+    def test_execution_snapshot_maps_orders_and_trades_with_one_rpc(self):
+        trader = self._trader()
+        acc = StockAccount("acct")
+
+        snapshot = trader.query_execution_snapshot(
+            acc, order_strategy_name="icestone_grid_600276", trade_strategy_name=""
+        )
+
+        self.assertEqual(snapshot["orders"][0].order_sysid, "sys-1")
+        self.assertEqual(snapshot["trades"][0].trade_id, "trade-1")
+        self.assertEqual(snapshot["server_time"], "2026-07-15 10:00:00")
+        self.assertEqual(trader.client.calls[-1][0], "query_execution_snapshot")
+        self.assertEqual(trader.client.calls[-1][1]["trade_strategy_name"], "")
 
     def test_order_stock_never_returns_user_tag_as_real_order_id(self):
         trader = self._trader()

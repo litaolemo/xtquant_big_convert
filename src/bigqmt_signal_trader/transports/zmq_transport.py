@@ -261,43 +261,12 @@ class ZmqTransport(RpcTransport):
         )
 
     def _router_loop(self):
-        zmq = self._zmq
         try:
             while self._running:
                 self._drain_response_queue()
-                try:
-                    frames = self._router.recv_multipart()
-                except self._zmq.Again:
-                    continue
-                except Exception as exc:
-                    if not self._running:
-                        break
-                    print("%s zmq recv failed: %s" % (self.print_prefix, exc))
-                    time.sleep(0.5)
-                    continue
-                if len(frames) < 2:
-                    continue
-                identity, payload = frames[0], frames[-1]
-                try:
-                    request = _loads(payload)
-                except Exception as exc:
-                    print("%s zmq decode failed: %s" % (self.print_prefix, exc))
-                    continue
-                request_id = str(request.get("request_id") or uuid.uuid4().hex)
-                with self._identity_lock:
-                    self._pending_identities[request_id] = identity
-                t0 = time.perf_counter()
-                try:
-                    self.deliver(request)
-                except Exception as exc:
-                    print("%s zmq deliver failed: %s" % (self.print_prefix, exc))
-                handler_ms = (time.perf_counter() - t0) * 1000.0
-                if handler_ms > 50.0:
-                    # Distinguishes a slow handler (real work) from a GIL stall
-                    # (which the gil_probe catches): if handler_ms is small but pings
-                    # still spike, the stall is elsewhere in the process.
-                    print("%s zmq slow handler method=%s %.0fms"
-                          % (self.print_prefix, request.get("method"), handler_ms))
+                request = self._receive_request()
+                if request is not None:
+                    self._deliver_request(request)
         finally:
             # Close the ROUTER socket on the thread that owns it. On Windows,
             # closing a ZMQ socket from a different thread trips a signaler
@@ -308,6 +277,41 @@ class ZmqTransport(RpcTransport):
             except Exception:
                 pass
             self._router = None
+
+    def _receive_request(self, flags=0):
+        try:
+            frames = self._router.recv_multipart(flags=flags)
+        except self._zmq.Again:
+            return None
+        except Exception as exc:
+            if self._running:
+                print("%s zmq recv failed: %s" % (self.print_prefix, exc))
+                if not flags:
+                    time.sleep(0.5)
+            return None
+        if len(frames) < 2:
+            return None
+        identity, payload = frames[0], frames[-1]
+        try:
+            request = _loads(payload)
+        except Exception as exc:
+            print("%s zmq decode failed: %s" % (self.print_prefix, exc))
+            return None
+        request_id = str(request.get("request_id") or uuid.uuid4().hex)
+        with self._identity_lock:
+            self._pending_identities[request_id] = identity
+        return request
+
+    def _deliver_request(self, request):
+        started = time.perf_counter()
+        try:
+            self.deliver(request)
+        except Exception as exc:
+            print("%s zmq deliver failed: %s" % (self.print_prefix, exc))
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if elapsed_ms > 50.0:
+            print("%s zmq slow handler method=%s %.0fms"
+                  % (self.print_prefix, request.get("method"), elapsed_ms))
 
     def _drain_response_queue(self):
         while True:
@@ -335,7 +339,7 @@ class ZmqTransport(RpcTransport):
             # No matching peer — drop silently (client may have gone away).
             return
         payload = encode_rpc_request_payload(response).encode("utf-8")
-        if threading.current_thread() is not self._router_thread:
+        if self._router_thread is not None and threading.current_thread() is not self._router_thread:
             self._queued_response_count += 1
             if self._queued_response_count <= 5:
                 print("%s zmq response queued for router thread" % self.print_prefix)
@@ -347,11 +351,17 @@ class ZmqTransport(RpcTransport):
             print("%s zmq send failed: %s" % (self.print_prefix, exc))
 
     def drain_request_queue(self, max_items=20):
-        """No-op: the ROUTER thread delivers requests itself. Defining this makes
-        the RPC service's per-tick drain skip the Redis LPOP fallback, so the QMT
-        strategy thread does NOT do a pointless cross-LAN Redis round-trip (which
-        holds the GIL and can stall this transport thread) on every adjust tick."""
-        return 0
+        """Drain requests from the scheduled QMT thread when no receiver thread exists."""
+        if self._router_thread is not None or self._router is None:
+            return 0
+        processed = 0
+        for _index in range(max(int(max_items), 0)):
+            request = self._receive_request(flags=self._zmq.NOBLOCK)
+            if request is None:
+                break
+            self._deliver_request(request)
+            processed += 1
+        return processed
 
     # -- client side ------------------------------------------------------
     def _resolve_connect_address(self):
@@ -430,8 +440,15 @@ class ZmqTransport(RpcTransport):
         super(ZmqTransport, self).stop()
         # Clear _running so the router loop exits; the loop closes its own
         # socket (closing cross-thread trips a Windows signaler abort).
-        if self._router_thread is not None and self._router_thread.is_alive():
-            self._router_thread.join(2.0)
+        thread = self._router_thread
+        if thread is not None and thread.is_alive():
+            thread.join(2.0)
+        if thread is None and self._router is not None:
+            try:
+                self._router.close(linger=0)
+            except Exception:
+                pass
+            self._router = None
         self._router_thread = None
         # If we were a server that published a discovery address, clear it so
         # clients don't keep hitting a dead endpoint.
