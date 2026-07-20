@@ -56,6 +56,45 @@
 
 *zmq fast-path；约 30% 请求会撞 QMT 的 GIL 调度尖峰（~500ms）。
 
+### 独立 ZMQ 回测桥接
+
+`bigqmt_backtest` 与实盘 RPC 桥接完全分离，提供两个明确隔离的后端：
+
+- `QMT_NATIVE`：`BIGQMT_ZMQ_BACKTEST.py` 运行在 QMT 回测进程内。QMT 负责历史
+  行情推进、资金持仓、`passorder/cancel` 和原生撮合；ZMQ 只桥接 Bar、订单意图及
+  QMT 委托/成交结果。
+- `LOCAL_SIM`：端口 `16661` 的独立 CSV 工具，仅用于脱离 QMT 验证协议和策略逻辑，
+  使用本地撮合并输出本地结果文件。
+
+QMT 原生入口使用独立端口 `16662`、独立 `run_id/client_id`，强制验证
+`ContextInfo.do_back_test=true`，固定 `live_ready=false`，不会导入或修改
+`bigqmt_signal_trader`。
+
+启动 CSV 独立测试服务：
+
+```powershell
+python -m pip install -e .
+python -m bigqmt_backtest.server `
+  --data examples/backtest_bars.example.csv `
+  --config examples/backtest_config.example.json `
+  --run-id demo-001 `
+  --bind tcp://127.0.0.1:16661
+```
+
+另开一个终端运行外部策略：
+
+```powershell
+python examples/zmq_backtest_strategy.py `
+  --endpoint tcp://127.0.0.1:16661 `
+  --run-id demo-001 `
+  --symbol 600000.SH `
+  --fast 2 `
+  --slow 3
+```
+
+QMT 原生安装、逐 Bar 同步协议、CSV 备用模式和安全边界见
+[docs/ZMQ_BACKTEST_BRIDGE.md](docs/ZMQ_BACKTEST_BRIDGE.md)。
+
 ---
 
 ## 环境要求与依赖安装
@@ -368,7 +407,10 @@ src/xtquant/                       可选 xtquant import shim
 src/bigqmt_signal_trader_strategy.py        策略入口（init/handlebar/adjust）
 src/bigqmt_signal_trader_redis_rpc_runtime.py  Redis RPC runtime 入口
 src/BIGQMT_REDIS_DRYRUN.py                  QMT 编辑器加载入口（GBK）
+src/BIGQMT_ZMQ_BACKTEST.py                  独立 QMT 回测 ZMQ 入口（GBK）
+src/bigqmt_backtest/                        独立历史驱动、模拟撮合、ZMQ 协议与客户端
 tests/bigqmt_signal_trader/        单元测试（无 QMT 环境可跑）
+tests/bigqmt_backtest/             回测、确定性、隔离和 ZMQ 往返测试
 docs/                              详细文档
 bench_latency.py / bench_transports.py  延迟基准脚本
 ```
@@ -388,6 +430,7 @@ python -m pytest tests/bigqmt_signal_trader/ -q
 ## 安全默认值
 
 - `rpc_allow_order_methods` 默认 `False`：远程 `order_stock` / `cancel_order` 被拒绝。确认接入方、账号、风控后再显式开启。
+- 回测桥接永久 `live_ready=false`，协议中没有真实账户和实盘下单方法。
 - 配置文件含资金账号和密码，`bigqmt_signal_trader_local_config.py` / `bigqmt_signal_trader_client_config.py` 已在 `.gitignore`，**不要提交**。
 - 请求负载经过 base64 + 数字混淆编码（`encode_rpc_request_payload`），避免 QMT 的 Redis 客户端拦截含股票代码的明文。
 
@@ -400,6 +443,7 @@ python -m pytest tests/bigqmt_signal_trader/ -q
 - [docs/RPC_TRANSPORTS.md](docs/RPC_TRANSPORTS.md) — 可插拔传输层完整说明
 - [docs/XTQUANT_COMPAT_REPLACEMENT.md](docs/XTQUANT_COMPAT_REPLACEMENT.md) — 用兼容层替换旧 xtquant 的步骤
 - [docs/BIG_QMT_SIGNAL_TRADER_RUNBOOK.md](docs/BIG_QMT_SIGNAL_TRADER_RUNBOOK.md) — 信号交易运行手册
+- [docs/ZMQ_BACKTEST_BRIDGE.md](docs/ZMQ_BACKTEST_BRIDGE.md) — 独立 ZMQ 回测协议、撮合规则和 QMT 入口
 
 ---
 

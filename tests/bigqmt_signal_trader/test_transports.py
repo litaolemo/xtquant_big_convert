@@ -183,6 +183,99 @@ class ZmqTransportTest(unittest.TestCase):
         finally:
             server.stop()
 
+    def test_main_thread_drain_round_trip(self):
+        from bigqmt_signal_trader.transports.zmq_transport import ZmqTransport
+
+        server = ZmqTransport(
+            bind_address=self.address, account_id="acct", recv_timeout_seconds=0.01
+        )
+        server.start_receiving(
+            lambda request: {
+                "request_id": request["request_id"],
+                "account_id": "acct",
+                "method": request["method"],
+                "ok": True,
+                "data": {"main_thread": True},
+                "error": "",
+            },
+            background_threads=False,
+        )
+        client = ZmqTransport(connect_address=self.address, account_id="acct")
+        result = {}
+
+        def call_client():
+            result["response"] = client.send_request(_build_request(), timeout_seconds=2.0)
+
+        try:
+            thread = threading.Thread(target=call_client)
+            thread.start()
+            deadline = time.time() + 1.0
+            while thread.is_alive() and time.time() < deadline:
+                server.drain_request_queue(max_items=10)
+                time.sleep(0.01)
+            thread.join(1.0)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result["response"]["data"], {"main_thread": True})
+        finally:
+            client.stop()
+            server.stop()
+
+    def test_duplicate_server_address_fails_without_port_fallback(self):
+        from bigqmt_signal_trader.transports.zmq_transport import ZmqTransport
+
+        first = ZmqTransport(bind_address=self.address, account_id="acct")
+        duplicate = ZmqTransport(
+            bind_address=self.address, account_id="acct", port_scan_range=50
+        )
+        first.start_receiving(lambda _request: {}, background_threads=False)
+        try:
+            with self.assertRaisesRegex(TransportError, "ZMQ_BIND_CONFLICT"):
+                duplicate.start_receiving(
+                    lambda _request: {}, background_threads=False
+                )
+            self.assertIsNone(duplicate._actual_bind_address)
+        finally:
+            duplicate.stop()
+            first.stop()
+
+    def test_deferred_response_returns_through_router_thread(self):
+        from bigqmt_signal_trader.transports.zmq_transport import ZmqTransport
+
+        pending = []
+        server = ZmqTransport(
+            bind_address=self.address, account_id="acct", recv_timeout_seconds=0.05
+        )
+        server.start_receiving(lambda request: pending.append(request), background_threads=True)
+        client = ZmqTransport(connect_address=self.address, account_id="acct")
+        result = {}
+
+        def call_client():
+            result["response"] = client.send_request(_build_request(), timeout_seconds=2.0)
+
+        try:
+            thread = threading.Thread(target=call_client)
+            thread.start()
+            deadline = time.time() + 1.0
+            while not pending and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(pending)
+            request = pending[0]
+            server.send_response(
+                request,
+                {
+                    "request_id": request["request_id"],
+                    "ok": True,
+                    "data": {"deferred": True},
+                    "error": "",
+                },
+            )
+            thread.join(2.0)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result["response"]["data"], {"deferred": True})
+        finally:
+            client.stop()
+            server.stop()
+
     def test_timeout_raises(self):
         from bigqmt_signal_trader.transports.zmq_transport import ZmqTransport
 

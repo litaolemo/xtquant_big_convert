@@ -20,6 +20,7 @@ using DEALER + ``poll`` (synchronous request/response fits the RPC model).
 """
 
 import json
+import queue
 import threading
 import time
 import uuid
@@ -112,10 +113,9 @@ class ZmqTransport(RpcTransport):
         self.recv_timeout_seconds = float(recv_timeout_seconds)
         self.server_hwm = int(server_hwm)
         self.client_linger_ms = int(client_linger_ms)
-        # Service discovery: when the derived port is taken, the server scans
-        # upward for a free port and publishes the real address to Redis so the
-        # client can find it. Without a discovery client this falls back to the
-        # static derived address (and bind conflicts surface as errors).
+        # Discovery remains available for clients, but a server must bind the
+        # configured address exactly. ``port_scan_range`` is retained only for
+        # backward-compatible config loading and is intentionally not used.
         self.discovery_redis_client = discovery_redis_client
         self.discovery_key_template = discovery_key_template
         self.discovery_ttl_seconds = int(discovery_ttl_seconds)
@@ -129,6 +129,9 @@ class ZmqTransport(RpcTransport):
         self._actual_bind_address = None  # set after start_receiving()
         self._pending_identities = {}  # request_id -> client identity bytes
         self._identity_lock = threading.Lock()
+        self._response_queue = queue.Queue()
+        self._queued_response_count = 0
+        self._sent_response_count = 0
         # client state
         self._dealer = None
         self._client_lock = threading.Lock()
@@ -171,51 +174,29 @@ class ZmqTransport(RpcTransport):
         return self._zmq, self._ctx
 
     # -- server side ------------------------------------------------------
-    def _bind_with_fallback(self):
-        """Bind the ROUTER socket, scanning ports if the default is taken.
-
-        Tries ``self.bind_address`` first. On ZMQ EADDRINUSE, walks upward
-        from the base port for up to ``port_scan_range`` ports. The actually
-        bound address is recorded on ``self._actual_bind_address`` and, when a
-        discovery client is configured, published to Redis so clients can find
-        it. Re-raises the original error if no port in the range is free.
-        """
+    def _bind_configured_address(self):
+        """Bind exactly one configured address and reject duplicate servers."""
         zmq, ctx = self._ensure_zmq()
-        attempts = [self.bind_address]
-        # Build fallback ports from the base port upward. We always scan so a
-        # collision (e.g. a stale server on the derived port) is recovered
-        # automatically; an explicit bind_address just sets the scan origin.
+        sock = ctx.socket(zmq.ROUTER)
+        sock.setsockopt(zmq.RCVHWM, self.server_hwm)
+        sock.setsockopt(zmq.SNDHWM, self.server_hwm)
+        sock.setsockopt(zmq.RCVTIMEO, int(self.recv_timeout_seconds * 1000))
         try:
-            base = int(self.bind_address.rsplit(":", 1)[1])
-            host_part = self.bind_address.rsplit(":", 1)[0]
-            for offset in range(1, self.port_scan_range + 1):
-                attempts.append("%s:%d" % (host_part, base + offset))
-        except (ValueError, IndexError):
-            pass
-
-        last_error = None
-        for addr in attempts:
-            sock = ctx.socket(zmq.ROUTER)
-            sock.setsockopt(zmq.RCVHWM, self.server_hwm)
-            sock.setsockopt(zmq.SNDHWM, self.server_hwm)
-            sock.setsockopt(zmq.RCVTIMEO, int(self.recv_timeout_seconds * 1000))
+            sock.bind(self.bind_address)
+        except self._zmq.ZMQError as exc:
             try:
-                sock.bind(addr)
-                self._router = sock
-                self._actual_bind_address = addr
-                self._publish_discovery(addr)
-                return
-            except self._zmq.ZMQError as exc:
-                last_error = exc
-                try:
-                    sock.close(linger=0)
-                except Exception:
-                    pass
-                # Only EADDRINUSE is retriable; other errors (e.g. bad host) abort.
-                if getattr(exc, "errno", None) != zmq.EADDRINUSE:
-                    raise
-        # Exhausted the scan range.
-        raise last_error
+                sock.close(linger=0)
+            except Exception:
+                pass
+            if getattr(exc, "errno", None) == zmq.EADDRINUSE:
+                raise TransportError(
+                    "ZMQ_BIND_CONFLICT address=%s; another bridge instance "
+                    "already owns the configured endpoint" % self.bind_address
+                )
+            raise
+        self._router = sock
+        self._actual_bind_address = self.bind_address
+        self._publish_discovery(self.bind_address)
 
     def _publish_discovery(self, address):
         if self.discovery_redis_client is None:
@@ -240,7 +221,7 @@ class ZmqTransport(RpcTransport):
     def start_receiving(self, on_request, background_threads=True):
         super(ZmqTransport, self).start_receiving(on_request)
         zmq, ctx = self._ensure_zmq()
-        self._bind_with_fallback()
+        self._bind_configured_address()
         bound = self._actual_bind_address or self.bind_address
         if not background_threads:
             print(
@@ -257,42 +238,12 @@ class ZmqTransport(RpcTransport):
         )
 
     def _router_loop(self):
-        zmq = self._zmq
         try:
             while self._running:
-                try:
-                    frames = self._router.recv_multipart()
-                except self._zmq.Again:
-                    continue
-                except Exception as exc:
-                    if not self._running:
-                        break
-                    print("%s zmq recv failed: %s" % (self.print_prefix, exc))
-                    time.sleep(0.5)
-                    continue
-                if len(frames) < 2:
-                    continue
-                identity, payload = frames[0], frames[-1]
-                try:
-                    request = _loads(payload)
-                except Exception as exc:
-                    print("%s zmq decode failed: %s" % (self.print_prefix, exc))
-                    continue
-                request_id = str(request.get("request_id") or uuid.uuid4().hex)
-                with self._identity_lock:
-                    self._pending_identities[request_id] = identity
-                t0 = time.perf_counter()
-                try:
-                    self.deliver(request)
-                except Exception as exc:
-                    print("%s zmq deliver failed: %s" % (self.print_prefix, exc))
-                handler_ms = (time.perf_counter() - t0) * 1000.0
-                if handler_ms > 50.0:
-                    # Distinguishes a slow handler (real work) from a GIL stall
-                    # (which the gil_probe catches): if handler_ms is small but pings
-                    # still spike, the stall is elsewhere in the process.
-                    print("%s zmq slow handler method=%s %.0fms"
-                          % (self.print_prefix, request.get("method"), handler_ms))
+                self._drain_response_queue()
+                request = self._receive_request()
+                if request is not None:
+                    self._deliver_request(request)
         finally:
             # Close the ROUTER socket on the thread that owns it. On Windows,
             # closing a ZMQ socket from a different thread trips a signaler
@@ -303,6 +254,55 @@ class ZmqTransport(RpcTransport):
             except Exception:
                 pass
             self._router = None
+
+    def _receive_request(self, flags=0):
+        try:
+            frames = self._router.recv_multipart(flags=flags)
+        except self._zmq.Again:
+            return None
+        except Exception as exc:
+            if self._running:
+                print("%s zmq recv failed: %s" % (self.print_prefix, exc))
+                if not flags:
+                    time.sleep(0.5)
+            return None
+        if len(frames) < 2:
+            return None
+        identity, payload = frames[0], frames[-1]
+        try:
+            request = _loads(payload)
+        except Exception as exc:
+            print("%s zmq decode failed: %s" % (self.print_prefix, exc))
+            return None
+        request_id = str(request.get("request_id") or uuid.uuid4().hex)
+        with self._identity_lock:
+            self._pending_identities[request_id] = identity
+        return request
+
+    def _deliver_request(self, request):
+        started = time.perf_counter()
+        try:
+            self.deliver(request)
+        except Exception as exc:
+            print("%s zmq deliver failed: %s" % (self.print_prefix, exc))
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if elapsed_ms > 50.0:
+            print("%s zmq slow handler method=%s %.0fms"
+                  % (self.print_prefix, request.get("method"), elapsed_ms))
+
+    def _drain_response_queue(self):
+        while True:
+            try:
+                identity, payload = self._response_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self._router.send_multipart([identity, payload])
+                self._sent_response_count += 1
+                if self._sent_response_count <= 5:
+                    print("%s zmq queued response sent" % self.print_prefix)
+            except Exception as exc:
+                print("%s zmq send failed: %s" % (self.print_prefix, exc))
 
     def send_response(self, request, response):
         if self._router is None:
@@ -315,18 +315,30 @@ class ZmqTransport(RpcTransport):
         if identity is None:
             # No matching peer — drop silently (client may have gone away).
             return
-        payload = encode_rpc_request_payload(response)
+        payload = encode_rpc_request_payload(response).encode("utf-8")
+        if self._router_thread is not None and threading.current_thread() is not self._router_thread:
+            self._queued_response_count += 1
+            if self._queued_response_count <= 5:
+                print("%s zmq response queued for router thread" % self.print_prefix)
+            self._response_queue.put((identity, payload))
+            return
         try:
-            self._router.send_multipart([identity, payload.encode("utf-8")])
+            self._router.send_multipart([identity, payload])
         except Exception as exc:
             print("%s zmq send failed: %s" % (self.print_prefix, exc))
 
     def drain_request_queue(self, max_items=20):
-        """No-op: the ROUTER thread delivers requests itself. Defining this makes
-        the RPC service's per-tick drain skip the Redis LPOP fallback, so the QMT
-        strategy thread does NOT do a pointless cross-LAN Redis round-trip (which
-        holds the GIL and can stall this transport thread) on every adjust tick."""
-        return 0
+        """Drain requests from the scheduled QMT thread when no receiver thread exists."""
+        if self._router_thread is not None or self._router is None:
+            return 0
+        processed = 0
+        for _index in range(max(int(max_items), 0)):
+            request = self._receive_request(flags=self._zmq.NOBLOCK)
+            if request is None:
+                break
+            self._deliver_request(request)
+            processed += 1
+        return processed
 
     # -- client side ------------------------------------------------------
     def _resolve_connect_address(self):
@@ -405,8 +417,15 @@ class ZmqTransport(RpcTransport):
         super(ZmqTransport, self).stop()
         # Clear _running so the router loop exits; the loop closes its own
         # socket (closing cross-thread trips a Windows signaler abort).
-        if self._router_thread is not None and self._router_thread.is_alive():
-            self._router_thread.join(2.0)
+        thread = self._router_thread
+        if thread is not None and thread.is_alive():
+            thread.join(2.0)
+        if thread is None and self._router is not None:
+            try:
+                self._router.close(linger=0)
+            except Exception:
+                pass
+            self._router = None
         self._router_thread = None
         # If we were a server that published a discovery address, clear it so
         # clients don't keep hitting a dead endpoint.

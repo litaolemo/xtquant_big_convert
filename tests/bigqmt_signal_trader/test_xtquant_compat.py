@@ -80,14 +80,36 @@ class FakeRpcClient:
                 {
                     "trade_id": "trade-1",
                     "order_sys_id": "sys-1",
+                    "user_order_id": "remark-1",
                     "stock_code": "600000.SH",
                     "action": "BUY",
                     "volume": 100,
                     "price": 10.0,
                 }
             ]
+        if method == "query_execution_snapshot":
+            return {
+                "account_id": "acct",
+                "server_time": "2026-07-15 10:00:00",
+                "orders": [
+                    {
+                        "order_sys_id": "sys-1", "user_order_id": "remark-1",
+                        "stock_code": "600000.SH", "action": "SELL", "volume": 300,
+                        "traded_volume": 100, "status": "50", "price": 10.1,
+                    }
+                ],
+                "trades": [
+                    {
+                        "trade_id": "trade-1", "order_sys_id": "sys-1",
+                        "user_order_id": "remark-1", "stock_code": "600000.SH",
+                        "action": "BUY", "volume": 100, "price": 10.0,
+                    }
+                ],
+            }
         if method == "order_stock":
             return {"status": "SUBMITTED", "user_order_id": "bq:1", "order_sys_id": "sys-2"}
+        if method == "order_stock_batch":
+            return [{"success": True, "accepted": True, "user_order_id": "batch-tag"}]
         if method == "cancel_order_stock_sysid":
             return {"success": True}
         if method == "get_full_tick":
@@ -234,9 +256,64 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(orders[0].order_volume, 300)
         self.assertEqual(trades[0].order_type, STOCK_BUY)
         self.assertEqual(trades[0].traded_price, 10.0)
+        self.assertEqual(trades[0].order_remark, "remark-1")
         self.assertEqual(order_id, "sys-2")
         self.assertTrue(cancelled)
         self.assertEqual(trader.client.calls[-2][1]["price_type"], MARKET_PEER_PRICE_FIRST)
+
+    def test_execution_snapshot_maps_orders_and_trades_with_one_rpc(self):
+        trader = self._trader()
+        acc = StockAccount("acct")
+
+        snapshot = trader.query_execution_snapshot(
+            acc, order_strategy_name="icestone_grid_600276", trade_strategy_name=""
+        )
+
+        self.assertEqual(snapshot["orders"][0].order_sysid, "sys-1")
+        self.assertEqual(snapshot["trades"][0].trade_id, "trade-1")
+        self.assertEqual(snapshot["server_time"], "2026-07-15 10:00:00")
+        self.assertEqual(trader.client.calls[-1][0], "query_execution_snapshot")
+        self.assertEqual(trader.client.calls[-1][1]["trade_strategy_name"], "")
+
+    def test_order_stock_never_returns_user_tag_as_real_order_id(self):
+        trader = self._trader()
+        acc = StockAccount("acct")
+        trader.client.call = lambda *_args, **_kwargs: {
+            "status": "SUBMITTED", "user_order_id": "bq:request-only",
+            "order_sys_id": None,
+        }
+
+        order_id = trader.order_stock(
+            acc, "600000.SH", STOCK_BUY, 100, FIX_PRICE, 10.0,
+            "strategy", "remark",
+        )
+        result = trader.order_stock_result(
+            acc, "600000.SH", STOCK_BUY, 100, FIX_PRICE, 10.0,
+            "strategy", "remark",
+        )
+
+        self.assertEqual(order_id, -1)
+        self.assertEqual(result["user_order_id"], "bq:request-only")
+        self.assertIsNone(result["order_sys_id"])
+
+    def test_order_stock_batch_forwards_batch_identity(self):
+        trader = self._trader()
+        acc = StockAccount("acct")
+
+        result = trader.order_stock_batch(
+            acc,
+            [{"stock_code": "600000.SH", "order_type": STOCK_BUY,
+              "order_volume": 100, "price": 10.0,
+              "order_remark": "batch-tag"}],
+            batch_id="BATCH-IDENTITY-1",
+        )
+
+        method, params, account_id, _timeout = trader.client.calls[-1]
+        self.assertEqual(method, "order_stock_batch")
+        self.assertEqual(account_id, "acct")
+        self.assertEqual(params["batch_id"], "BATCH-IDENTITY-1")
+        self.assertEqual(params["orders"][0]["order_remark"], "batch-tag")
+        self.assertTrue(result[0]["accepted"])
 
     def test_xtdata_read_methods_and_sector_filter(self):
         xtdata = self._xtdata()
@@ -421,6 +498,27 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(positions[0].can_use_volume, 80)
         self.assertEqual(single.stock_name, "cached")
 
+    def test_zmq_query_failure_never_falls_back_to_redis_cache(self):
+        class FailingZmqClient(FakeRpcClient):
+            transport_name = "zmq"
+
+            def call(self, method, params=None, account_id=None, timeout_seconds=None):
+                raise RuntimeError("zmq timeout")
+
+            def _redis(self):
+                raise AssertionError("ZMQ query must not access Redis")
+
+        trader = BigQmtXtTrader(account_id="acct")
+        trader.client = FailingZmqClient()
+        acc = StockAccount("acct")
+
+        with self.assertRaisesRegex(RuntimeError, "zmq timeout"):
+            trader.query_stock_asset(acc)
+        with self.assertRaisesRegex(RuntimeError, "zmq timeout"):
+            trader.query_stock_positions(acc)
+        with self.assertRaisesRegex(RuntimeError, "zmq timeout"):
+            trader.query_stock_position(acc, "600000.SH")
+
     def test_client_call_via_transport_builds_valid_request(self):
         # Regression: the swappable-transport path in BigQmtRpcClient.call() built
         # request_id with __import__("uuid").uuid.uuid4() (AttributeError), crashing
@@ -447,6 +545,25 @@ class XtquantCompatTest(unittest.TestCase):
         # request_id must be a real 32-char uuid hex, not a crash.
         self.assertEqual(len(request["request_id"]), 32)
         int(request["request_id"], 16)
+
+    def test_zmq_with_explicit_address_never_builds_redis_discovery(self):
+        client = BigQmtRpcClient(
+            account_id="acct",
+            redis_config={
+                "transport": "zmq",
+                "zmq": {"connect_address": "tcp://127.0.0.1:20146"},
+            },
+        )
+
+        def forbidden_redis():
+            raise AssertionError("ZMQ explicit-address mode must not touch Redis")
+
+        client._redis = forbidden_redis
+        transport = client._transport()
+
+        self.assertEqual(transport.name, "zmq")
+        self.assertEqual(transport.connect_address, "tcp://127.0.0.1:20146")
+        self.assertIsNone(transport.discovery_redis_client)
 
 
 if __name__ == "__main__":

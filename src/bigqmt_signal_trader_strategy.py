@@ -26,16 +26,34 @@ if _af_mod is not None:
     except Exception as _reload_err:
         print("[bigqmt_signal_trader] reload adapter_factory failed: %s" % _reload_err)
 
-from bigqmt_signal_trader.adapter_factory import build_app as _default_build_app
-from bigqmt_signal_trader.runner import (
-    forward_order_event,
-    forward_trade_event,
-    init_app,
-    reset_app as _reset_runner_app,
-    sync_positions_app,
-    tick_app,
-)
-from bigqmt_signal_trader.runtime_bigqmt import BigQmtRuntimeAdapter
+try:
+    _load_bridge_module = __bigqmt_load_local_module
+except NameError:
+    _load_bridge_module = None
+
+if _load_bridge_module is not None:
+    _adapter_factory = _load_bridge_module("bigqmt_signal_trader.adapter_factory")
+    _runner = _load_bridge_module("bigqmt_signal_trader.runner")
+    _runtime_bigqmt = _load_bridge_module("bigqmt_signal_trader.runtime_bigqmt")
+    _default_build_app = _adapter_factory.build_app
+    forward_order_event = _runner.forward_order_event
+    forward_trade_event = _runner.forward_trade_event
+    init_app = _runner.init_app
+    _reset_runner_app = _runner.reset_app
+    sync_positions_app = _runner.sync_positions_app
+    tick_app = _runner.tick_app
+    BigQmtRuntimeAdapter = _runtime_bigqmt.BigQmtRuntimeAdapter
+else:
+    from bigqmt_signal_trader.adapter_factory import build_app as _default_build_app
+    from bigqmt_signal_trader.runner import (
+        forward_order_event,
+        forward_trade_event,
+        init_app,
+        reset_app as _reset_runner_app,
+        sync_positions_app,
+        tick_app,
+    )
+    from bigqmt_signal_trader.runtime_bigqmt import BigQmtRuntimeAdapter
 
 
 _app_factory = None
@@ -51,7 +69,7 @@ _scheduled_adjust = False
 #  - GIL probe: a heartbeat thread that measures how long the interpreter was
 #    unable to run it (i.e. the process was stalled), independent of any request.
 _GIL_SWITCH_INTERVAL = 0.001
-_LATENCY_PROBE_ENABLED = True
+_LATENCY_PROBE_ENABLED = False
 _LATENCY_PROBE_THRESHOLD_MS = 50.0
 _latency_probe_started = False
 _last_full_tick_refresh_at = 0.0
@@ -218,13 +236,13 @@ def _is_redis_transport(transport_name):
 def _resolve_background_threads(transport_name, configured):
     """Decide whether the RPC service runs its own background receive threads.
 
-    Non-redis transports (zmq/mysql/shm) own their receive threads and have no
-    QMT adjust-drain fallback, so they MUST run background threads or they bind
-    but never receive. Force it on so switching transport is a one-liner
-    (``transport: "zmq"``) — the user needn't also set rpc_background_threads.
-    Redis keeps the configured value (default False = adjust-drain path).
+    ZMQ supports the QMT adjust-drain path and therefore honors the configured
+    value. Other non-Redis transports still require their receiver threads.
     """
-    if not _is_redis_transport(transport_name):
+    normalized = str(transport_name or "redis").lower()
+    if normalized == "zmq":
+        return bool(configured)
+    if not _is_redis_transport(normalized):
         return True
     return bool(configured)
 
@@ -234,16 +252,23 @@ def _build_rpc_service(context_info, app, config):
     enabled = _config_bool(config.get("enable_rpc"), False) or _config_bool(rpc_config.get("enabled"), False)
     if not enabled:
         return None
+    transport_name = str(rpc_config.get("transport") or "redis").lower()
+    redis_transport = transport_name in ("redis", "", "default")
 
     import importlib
-    from bigqmt_signal_trader.adapters import redis_common as _redis_common
-    from bigqmt_signal_trader.adapters import market_bigqmt as _market_bigqmt
-    from bigqmt_signal_trader.adapters import position_bigqmt as _position_bigqmt
-    from bigqmt_signal_trader.redis_rpc import BigQmtRpcHandlers, RedisPubSubRpcService
+    if _load_bridge_module is not None:
+        _market_bigqmt = _load_bridge_module("bigqmt_signal_trader.adapters.market_bigqmt")
+        _position_bigqmt = _load_bridge_module("bigqmt_signal_trader.adapters.position_bigqmt")
+        _redis_rpc = _load_bridge_module("bigqmt_signal_trader.redis_rpc")
+        BigQmtRpcHandlers = _redis_rpc.BigQmtRpcHandlers
+        RedisPubSubRpcService = _redis_rpc.RedisPubSubRpcService
+    else:
+        from bigqmt_signal_trader.adapters import market_bigqmt as _market_bigqmt
+        from bigqmt_signal_trader.adapters import position_bigqmt as _position_bigqmt
+        from bigqmt_signal_trader.redis_rpc import BigQmtRpcHandlers, RedisPubSubRpcService
 
     # QMT keeps strategy modules in the same process between editor reruns.
     # Reload adapters here so synced local package fixes take effect immediately.
-    _redis_common = importlib.reload(_redis_common)
     _market_bigqmt = importlib.reload(_market_bigqmt)
     _position_bigqmt = importlib.reload(_position_bigqmt)
     # Reload the lazily-imported helper modules too, so edits to them take effect on
@@ -258,21 +283,29 @@ def _build_rpc_service(context_info, app, config):
             importlib.reload(importlib.import_module(_mod_name))
         except Exception as _reload_err:
             print("[bigqmt_rpc] reload %s failed: %s" % (_mod_name, _reload_err))
-    build_redis_client = _redis_common.build_redis_client
     BigQmtMarketDataProvider = _market_bigqmt.BigQmtMarketDataProvider
     BigQmtPositionProvider = _position_bigqmt.BigQmtPositionProvider
 
     qmt_api = dict(config.get("qmt_api") or {})
-    redis_config = dict(config.get("redis") or {})
-    redis_config.update(dict(rpc_config.get("redis") or {}))
-    listen_redis_config = dict(redis_config)
-    listen_redis_config["socket_timeout"] = None
-    redis_client = rpc_config.get("redis_client") or config.get("redis_client") or build_redis_client(listen_redis_config)
-    response_redis_client = (
-        rpc_config.get("response_redis_client")
-        or config.get("response_redis_client")
-        or build_redis_client(redis_config)
-    )
+    redis_client = None
+    response_redis_client = None
+    if redis_transport:
+        if _load_bridge_module is not None:
+            _redis_common = _load_bridge_module("bigqmt_signal_trader.adapters.redis_common")
+        else:
+            from bigqmt_signal_trader.adapters import redis_common as _redis_common
+
+        _redis_common = importlib.reload(_redis_common)
+        redis_config = dict(config.get("redis") or {})
+        redis_config.update(dict(rpc_config.get("redis") or {}))
+        listen_redis_config = dict(redis_config)
+        listen_redis_config["socket_timeout"] = None
+        redis_client = rpc_config.get("redis_client") or config.get("redis_client") or _redis_common.build_redis_client(listen_redis_config)
+        response_redis_client = (
+            rpc_config.get("response_redis_client")
+            or config.get("response_redis_client")
+            or _redis_common.build_redis_client(redis_config)
+        )
     account_id = str(rpc_config.get("account_id") or config.get("account_id") or _account_id or "")
     if not account_id:
         print("[bigqmt_rpc] disabled: account_id is empty")
@@ -293,7 +326,6 @@ def _build_rpc_service(context_info, app, config):
     )
     process_in_listener = _config_bool(rpc_config.get("process_in_listener"), True)
     listener_methods = rpc_config.get("listener_methods") or ("*",)
-    transport_name = str(rpc_config.get("transport") or "redis").lower()
     configured_bg = _config_bool(rpc_config.get("background_threads"), False)
     background_threads = _resolve_background_threads(transport_name, configured_bg)
     if background_threads and not configured_bg:
@@ -303,7 +335,10 @@ def _build_rpc_service(context_info, app, config):
     # bypass the Redis clients entirely.
     transport = None
     if transport_name not in ("redis", "", "default"):
-        from bigqmt_signal_trader.transports.factory import build_transport
+        if _load_bridge_module is not None:
+            build_transport = _load_bridge_module("bigqmt_signal_trader.transports.factory").build_transport
+        else:
+            from bigqmt_signal_trader.transports.factory import build_transport
 
         factory_config = dict(rpc_config)
         factory_config["account_id"] = account_id

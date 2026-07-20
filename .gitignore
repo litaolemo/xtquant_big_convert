@@ -21,3 +21,7 @@ src/bigqmt_signal_trader_client_config.py
 *.local.py
 *.log
 *.pid
+
+# Generated evidence from standalone/QMT backtest bridge runs.
+backtest_runs/
+qmt_backtest_runs/

@@ -43,35 +43,37 @@
 
 ### 服务端（QMT 进程）
 
-在 `bigqmt_signal_trader_local_config.py` 的 `BIGQMT_REDIS_CONFIG` 里加 `transport` 字段，**只改这一行即可**：
+在 `bigqmt_signal_trader_local_config.py` 的 `BIGQMT_REDIS_CONFIG` 里设置 `transport` 字段：
 
 ```python
 BIGQMT_REDIS_CONFIG = {
     "transport": "zmq",          # 默认 "redis"。可选: redis/zmq/mysql/shm
-    # ... 其他现有字段不变 (host/port/db/password, rpc_*, full_tick_*)
+    "zmq": {
+        "bind_address": "tcp://127.0.0.1:5560",  # Windows 同机使用 TCP 回环
+    },
+    "rpc_background_threads": False,
+    "schedule_adjust": True,
+    "schedule_adjust_interval": "100nMilliSecond",
+}
 ```
 
-> **注意（zmq/mysql/shm）**：非 redis 传输自带接收线程、没有 QMT adjust 兜底排空，
-> 必须跑后台线程才能收到请求。`_build_rpc_service` 会在 `transport != redis` 时
-> **自动把 `rpc_background_threads` 置 True**（启动日志打印
-> `transport=zmq -> background_threads auto-enabled`），所以你**不用**再手动配它。
+> **注意（ZMQ）**：ZMQ 支持由 QMT 官方 `adjust` 回调排空请求。低延迟实盘建议设置
+> `rpc_background_threads=False`，并把 `schedule_adjust_interval` 设置为
+> `100nMilliSecond`，避免后台 Python 线程受 QMT 进程 GIL 调度影响。
+> MySQL/SHM 仍会自动启用后台接收线程。
 > 端口不写时按账号自动派生 `tcp://127.0.0.1:{15560 + 账号%100}`（同机回环）。
-> 需要自定义绑定地址时再加 `zmq` 块：
+> Linux 同机也可使用 `ipc:///tmp/bigqmt_rpc.sock`。
+
+`transport=mysql` 时可额外配置：
 
 ```python
-    # 可选：仅当要覆盖自动派生的地址时才写
-    "zmq": {
-        "bind_address": "tcp://127.0.0.1:5560",   # 同机最快用 tcp 回环
-        # Windows 不支持 ipc://, 用 tcp
-        # Linux 同机可用 "ipc:///tmp/bigqmt_rpc.sock" 更快
-    },
-
-    # transport=mysql 时生效：
-    "mysql": {
-        "driver": "pymysql",      # 或 mysql.connector
-        "host": "127.0.0.1", "port": 3306,
-        "user": "rpc", "password": "***", "database": "bigqmt_rpc",
-        "pool_config": {"mincached": 1, "maxcached": 4, "maxshared": 3, "maxconnections": 8},
+BIGQMT_REDIS_CONFIG["mysql"] = {
+    "driver": "pymysql",      # 或 mysql.connector
+    "host": "127.0.0.1", "port": 3306,
+    "user": "rpc", "password": "***", "database": "bigqmt_rpc",
+    "pool_config": {
+        "mincached": 1, "maxcached": 4,
+        "maxshared": 3, "maxconnections": 8,
     },
 }
 ```

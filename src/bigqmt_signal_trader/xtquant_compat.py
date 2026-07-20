@@ -363,6 +363,8 @@ class BigQmtRpcClient:
             or os.environ.get("BIGQMT_RPC_TRANSPORT")
             or "redis"
         ).lower()
+        self.zmq_config = dict(merged_redis_config.get("zmq") or {})
+        self.mysql_config = dict(merged_redis_config.get("mysql") or {})
         self._transport_instance = None  # lazily built by _transport()
 
     def _redis(self):
@@ -387,13 +389,17 @@ class BigQmtRpcClient:
             client_config = load_client_config()
             config_redis = dict(client_config.get("redis_config") or {})
             zmq_config = dict(config_redis.get("zmq") or {})
-            # Give the ZMQ transport a discovery client so it can find a server
-            # that moved off the default port. Reuse this client's redis
-            # connection (already used for the legacy fallback path).
-            zmq_config.setdefault("discovery_redis_client", self._redis())
+            zmq_config.update(self.zmq_config)
+            # ZMQ must work without Redis. Discovery is opt-in and unnecessary
+            # when connect_address is explicitly configured.
+            if (
+                not zmq_config.get("connect_address")
+                and bool(zmq_config.get("redis_discovery_enabled", False))
+            ):
+                zmq_config.setdefault("discovery_redis_client", self._redis())
             factory_config = {
                 "zmq": zmq_config,
-                "mysql": config_redis.get("mysql") or {},
+                "mysql": dict(config_redis.get("mysql") or {}, **self.mysql_config),
             }
             self._transport_instance = build_transport(
                 self.transport_name,
@@ -1190,6 +1196,13 @@ class BigQmtXtTrader:
         asset = snapshot.get("asset") if isinstance(snapshot, dict) else None
         return asset if isinstance(asset, dict) else {}
 
+    def _redis_cache_enabled(self):
+        return str(getattr(self.client, "transport_name", "redis") or "redis").lower() in (
+            "redis",
+            "",
+            "default",
+        )
+
     def register_callback(self, callback):
         self.callback = callback
         return 0
@@ -1284,10 +1297,16 @@ class BigQmtXtTrader:
         try:
             data = self.client.call("query_stock_asset", {"account_id": account_id}, account_id=account_id) or {}
         except Exception:
+            if not self._redis_cache_enabled():
+                raise
             data = self._cached_asset(account_id)
             if not data:
                 raise
-        if data.get("cash") is None and data.get("total_asset") is None:
+        if (
+            self._redis_cache_enabled()
+            and data.get("cash") is None
+            and data.get("total_asset") is None
+        ):
             data = self._cached_asset(account_id) or data
         cash = data.get("cash")
         total_asset = data.get("total_asset")
@@ -1307,6 +1326,8 @@ class BigQmtXtTrader:
         try:
             data = self.client.call("query_stock_positions", {"account_id": account_id}, account_id=account_id) or {}
         except Exception:
+            if not self._redis_cache_enabled():
+                raise
             data = self._cached_positions(account_id)
             if not data:
                 raise
@@ -1343,6 +1364,8 @@ class BigQmtXtTrader:
                 account_id=account_id,
             )
         except Exception:
+            if not self._redis_cache_enabled():
+                raise
             normalized = str(stock_code or "").strip().upper()
             data = None
             for code, item in self._cached_positions(account_id).items():
@@ -1400,6 +1423,34 @@ class BigQmtXtTrader:
         ) or []
         return [self._trade_from_dict(account_id, item) for item in _as_list(data)]
 
+    def query_execution_snapshot(
+        self,
+        account,
+        order_strategy_name="bigqmt_signal_trader",
+        trade_strategy_name="",
+    ):
+        """Query orders and account-wide trades in one RPC round trip."""
+        account_id = _account_id(account, self.client.account_id)
+        data = self.client.call(
+            "query_execution_snapshot",
+            {
+                "account_id": account_id,
+                "order_strategy_name": order_strategy_name,
+                "trade_strategy_name": trade_strategy_name,
+            },
+            account_id=account_id,
+        ) or {}
+        result = dict(data) if isinstance(data, dict) else {}
+        result["orders"] = [
+            self._order_from_dict(account_id, item)
+            for item in _as_list(result.get("orders"))
+        ]
+        result["trades"] = [
+            self._trade_from_dict(account_id, item)
+            for item in _as_list(result.get("trades"))
+        ]
+        return result
+
     def order_stock(
         self,
         account,
@@ -1411,8 +1462,18 @@ class BigQmtXtTrader:
         strategy_name,
         order_remark,
     ):
+        data = self.order_stock_result(
+            account, stock_code, order_type, order_volume, price_type,
+            price, strategy_name, order_remark,
+        )
+        return data.get("order_sys_id") or -1
+
+    def order_stock_result(
+        self, account, stock_code, order_type, order_volume, price_type,
+        price, strategy_name, order_remark,
+    ):
         account_id = _account_id(account, self.client.account_id)
-        data = self.client.call(
+        return self.client.call(
             "order_stock",
             {
                 "account_id": account_id,
@@ -1426,10 +1487,25 @@ class BigQmtXtTrader:
             },
             account_id=account_id,
         ) or {}
-        return data.get("order_sys_id") or data.get("user_order_id") or -1
 
     def order_stock_async(self, *args, **kwargs):
         return self.order_stock(*args, **kwargs)
+
+    def order_stock_batch(self, account, orders, batch_id=""):
+        account_id = _account_id(account, self.client.account_id)
+        payload = []
+        for item in orders or []:
+            entry = dict(item or {})
+            entry.setdefault("account_id", account_id)
+            payload.append(entry)
+        params = {"account_id": account_id, "orders": payload}
+        if batch_id:
+            params["batch_id"] = str(batch_id)
+        return self.client.call(
+            "order_stock_batch",
+            params,
+            account_id=account_id,
+        ) or []
 
     def cancel_order_stock_sysid(self, account, market, order_sysid):
         account_id = _account_id(account, self.client.account_id)
@@ -1626,6 +1702,7 @@ class BigQmtXtTrader:
             traded_volume=_safe_int(item.get("volume", item.get("traded_volume"))),
             traded_price=_safe_float(item.get("price", item.get("traded_price"))),
             traded_at=str(item.get("traded_at") or ""),
+            order_remark=str(item.get("user_order_id") or item.get("remark") or ""),
         )
 
 

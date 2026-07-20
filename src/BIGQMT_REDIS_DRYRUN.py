@@ -1,136 +1,241 @@
 #coding:gbk
-import importlib
+"""QMT bridge entry using the same file-loader pattern as qmt_realtime strategies.
+
+Broker QMT strategy sandboxes may reject local package names through their
+normal ``import`` allowlist.  The realtime QMT strategies in gupiao_ztfx load
+their colocated helpers through ``importlib.util.spec_from_file_location``.
+This entry applies path-based loading to the bridge package, including its
+internal relative imports, while leaving all standard-library and QMT imports
+untouched.  This terminal's spec loader ignores custom builtins for nested
+package imports, so local bridge files are compiled explicitly after resolving
+their path.
+"""
+import builtins as _builtins
+import importlib as _importlib
 import os
 import sys
+import types
+
+
+_LOCAL_ROOTS = (
+    "bigqmt_signal_trader",
+    "bigqmt_signal_trader_strategy",
+    "bigqmt_signal_trader_redis_rpc_runtime",
+    "bigqmt_signal_trader_local_config",
+)
+_ORIGINAL_IMPORT = _builtins.__import__
+_ORIGINAL_IMPORT_MODULE = _importlib.import_module
+_ORIGINAL_RELOAD = _importlib.reload
 
 
 def _known_qmt_python_dir():
-    # Best-effort fallback only; the real path comes from __file__ below. Uses the
-    # stock install name (no machine-specific suffix). Keep this file pure ASCII:
-    # it is declared #coding:gbk, so build the CJK dir name from code points.
-    root = "".join(chr(value) for value in (0x56fd, 0x91d1, 0x8bc1, 0x5238))
-    suffix = "".join(chr(value) for value in (0x4ea4, 0x6613, 0x7aef))
-    return "D:\\" + root + "QMT" + suffix + "\\python"
+    install = "".join(chr(value) for value in (
+        0x541b, 0x5f18, 0x541b, 0x667a, 0x4ea4, 0x6613, 0x7cfb, 0x7edf,
+    ))
+    return r"D:\君弘君智交易系统\python"
 
-
-_qmt_paths = []
-_file_name = globals().get("__file__", "")
-if _file_name:
-    _qmt_paths.append(os.path.dirname(os.path.abspath(_file_name)))
-_qmt_paths.append(_known_qmt_python_dir())
-
-for _qmt_path in _qmt_paths:
-    if _qmt_path and os.path.isdir(_qmt_path) and _qmt_path not in sys.path:
-        sys.path.insert(0, _qmt_path)
 
 try:
-    print("[bigqmt_shell] reload entry paths=%s" % _qmt_paths)
+    _SOURCE_ROOT = os.path.dirname(os.path.abspath(__file__))
 except Exception:
-    pass
+    _SOURCE_ROOT = _known_qmt_python_dir()
+if not _SOURCE_ROOT:
+    _SOURCE_ROOT = _known_qmt_python_dir()
+
+
+def _is_local_module(name):
+    return any(name == root or name.startswith(root + ".") for root in _LOCAL_ROOTS)
+
+
+def _resolve_name(name, module_globals, level):
+    if not level:
+        return name
+    package = (module_globals or {}).get("__package__") or (module_globals or {}).get("__name__", "")
+    if not package:
+        raise ImportError("relative import without package")
+    for unused in range(level - 1):
+        if "." not in package:
+            raise ImportError("relative import beyond top-level package")
+        package = package.rsplit(".", 1)[0]
+    return package + ("." + name if name else "")
+
+
+def _find_local_source(name):
+    relative = name.replace(".", os.sep)
+    package_init = os.path.join(_SOURCE_ROOT, relative, "__init__.py")
+    if os.path.isfile(package_init):
+        return package_init, True
+    module_file = os.path.join(_SOURCE_ROOT, relative + ".py")
+    if os.path.isfile(module_file):
+        return module_file, False
+    raise ModuleNotFoundError("local source not found: %s" % name, name=name)
+
+
+def _set_parent_attribute(name, module):
+    if "." not in name:
+        return
+    parent_name, child_name = name.rsplit(".", 1)
+    parent = _load_local_module(parent_name)
+    setattr(parent, child_name, module)
+
+
+def _load_local_module(name):
+    existing = sys.modules.get(name)
+    if existing is not None:
+        return existing
+    source_path, is_package = _find_local_source(name)
+    if "." in name:
+        _load_local_module(name.rsplit(".", 1)[0])
+    module = types.ModuleType(name)
+    module.__file__ = source_path
+    module.__package__ = name if is_package else name.rpartition(".")[0]
+    if is_package:
+        module.__path__ = [os.path.dirname(source_path)]
+    module_builtins = dict(_builtins.__dict__)
+    module_builtins["__import__"] = _local_import
+    module.__dict__["__builtins__"] = module_builtins
+    module.__dict__["__bigqmt_load_local_module"] = _load_local_module
+    sys.modules[name] = module
+    # QMT native allowlist rejects the root package eager exports.
+    if name == "bigqmt_signal_trader":
+        return module
+    try:
+        with open(source_path, "rb") as source_file:
+            source = source_file.read()
+        exec(compile(source, source_path, "exec"), module.__dict__)
+    except Exception:
+        sys.modules.pop(name, None)
+        raise
+    _set_parent_attribute(name, module)
+    return module
+
+
+def _local_import(name, module_globals=None, module_locals=None, fromlist=(), level=0):
+    absolute_name = _resolve_name(name, module_globals, level)
+    if not _is_local_module(absolute_name):
+        return _ORIGINAL_IMPORT(name, module_globals, module_locals, fromlist, level)
+    module = _load_local_module(absolute_name)
+    for child in fromlist or ():
+        if child != "*":
+            try:
+                _load_local_module(absolute_name + "." + child)
+            except ModuleNotFoundError:
+                pass
+    if fromlist:
+        return module
+    return _load_local_module(absolute_name.split(".", 1)[0])
+
+
+def _local_import_module(name, package=None):
+    if _is_local_module(name):
+        return _load_local_module(name)
+    return _ORIGINAL_IMPORT_MODULE(name, package)
+
+
+def _local_reload(module):
+    if _is_local_module(getattr(module, "__name__", "")):
+        # The shell clears these modules for every strategy start.  Do not hand
+        # their names back to QMT's normal import/reload allowlist afterwards.
+        return module
+    return _ORIGINAL_RELOAD(module)
+
+
+def _clear_local_modules():
+    names = [name for name in sys.modules if _is_local_module(name)]
+    for name in sorted(names, key=lambda item: item.count("."), reverse=True):
+        sys.modules.pop(name, None)
+
+
+def _stop_previous_rpc_service():
+    """Release the previous QMT strategy's socket before clearing its module.
+
+    QMT can re-execute this entry in the same Python process.  The old strategy
+    module owns the RPC service and its ZMQ ROUTER socket, so dropping that
+    module from ``sys.modules`` first would make the service unreachable and
+    leave its port bound for the next strategy start.
+    """
+    previous = sys.modules.get("bigqmt_signal_trader_strategy")
+    reset = getattr(previous, "reset_app", None)
+    if not callable(reset):
+        return
+    try:
+        reset()
+        print("[bigqmt_shell] previous rpc service stopped")
+    except Exception as exc:
+        # Continue the reload so a broken old instance does not prevent QMT
+        # from reporting its normal startup error.
+        print("[bigqmt_shell] previous rpc service stop failed: %s" % exc)
+
+
+_stop_previous_rpc_service()
+_clear_local_modules()
+_importlib.import_module = _local_import_module
+_importlib.reload = _local_reload
+print("[bigqmt_shell] importlib entry source_root=%s" % _SOURCE_ROOT)
 
 
 def _fallback_account_id():
-    for _name in ("BIGQMT_ACCOUNT_ID", "account", "account_id", "accountID"):
-        _value = globals().get(_name)
-        if _value:
-            return str(_value)
+    for name in ("BIGQMT_ACCOUNT_ID", "account", "account_id", "accountID"):
+        value = globals().get(name)
+        if value:
+            return str(value)
     return ""
 
-try:
-    import bigqmt_signal_trader.adapters.redis_common as _redis_common
-    _redis_common = importlib.reload(_redis_common)
-except Exception as _redis_common_err:
-    try:
-        print("[bigqmt_shell] redis_common reload failed: %s" % _redis_common_err)
-    except Exception:
-        pass
 
 try:
-    import bigqmt_signal_trader.redis_rpc as _redis_rpc
-    _redis_rpc = importlib.reload(_redis_rpc)
-except Exception as _redis_rpc_err:
-    try:
-        print("[bigqmt_shell] redis_rpc reload failed: %s" % _redis_rpc_err)
-    except Exception:
-        pass
+    _local_import("bigqmt_signal_trader.adapters.redis_common", globals(), fromlist=("*",))
+    _local_import("bigqmt_signal_trader.redis_rpc", globals(), fromlist=("*",))
+    _strategy = _local_import("bigqmt_signal_trader_strategy", globals(), fromlist=("*",))
+    _strategy.reset_app()
+except Exception as bridge_preload_error:
+    print("[bigqmt_shell] bridge preload failed: %s" % bridge_preload_error)
 
-try:
-    import bigqmt_signal_trader_strategy as _strategy
-    try:
-        _strategy.reset_app()
-    except Exception:
-        pass
-    _strategy = importlib.reload(_strategy)
-except Exception:
-    pass
+_runtime = _local_import("bigqmt_signal_trader_redis_rpc_runtime", globals(), fromlist=("*",))
 
-import bigqmt_signal_trader_redis_rpc_runtime as _runtime
-_runtime = importlib.reload(_runtime)
 
 def _load_local_config():
-    import bigqmt_signal_trader_local_config as _local_config
-    return importlib.reload(_local_config)
+    return _local_import("bigqmt_signal_trader_local_config", globals(), fromlist=("*",))
 
 
 try:
-    _local_config = _load_local_config()
-    BIGQMT_REDIS_CONFIG = getattr(_local_config, "BIGQMT_REDIS_CONFIG", {})
-    try:
-        print("[bigqmt_shell] local redis config loaded keys=%s" % sorted((BIGQMT_REDIS_CONFIG or {}).keys()))
-    except Exception:
-        pass
+    _config = _load_local_config()
+    BIGQMT_REDIS_CONFIG = getattr(_config, "BIGQMT_REDIS_CONFIG", {})
+    print("[bigqmt_shell] local redis config loaded keys=%s" % sorted((BIGQMT_REDIS_CONFIG or {}).keys()))
     _runtime.configure_runtime_redis(BIGQMT_REDIS_CONFIG)
-except Exception as _redis_cfg_err:
-    try:
-        print("[bigqmt_shell] local redis config load failed: %s" % _redis_cfg_err)
-    except Exception:
-        pass
+except Exception as redis_config_error:
+    print("[bigqmt_shell] local redis config load failed: %s" % redis_config_error)
 
 try:
-    _local_config = _load_local_config()
-    BIGQMT_ACCOUNT_ID = getattr(_local_config, "BIGQMT_ACCOUNT_ID", "")
-    try:
-        print("[bigqmt_shell] local account config loaded=%s" % bool(BIGQMT_ACCOUNT_ID))
-    except Exception:
-        pass
+    _config = _load_local_config()
+    BIGQMT_ACCOUNT_ID = getattr(_config, "BIGQMT_ACCOUNT_ID", "")
+    print("[bigqmt_shell] local account config loaded=%s" % bool(BIGQMT_ACCOUNT_ID))
     _runtime.configure_runtime_account(BIGQMT_ACCOUNT_ID)
-except Exception as _account_cfg_err:
-    try:
-        print("[bigqmt_shell] local account config load failed: %s" % _account_cfg_err)
-    except Exception:
-        pass
-    _account_id = _fallback_account_id()
-    if _account_id:
-        try:
-            print("[bigqmt_shell] fallback account loaded=True")
-        except Exception:
-            pass
-        _runtime.configure_runtime_account(_account_id)
+except Exception as account_config_error:
+    print("[bigqmt_shell] local account config load failed: %s" % account_config_error)
+    account_id = _fallback_account_id()
+    if account_id:
+        _runtime.configure_runtime_account(account_id)
 
-# Capture QMT runtime-injected globals (like passorder) not present in the
-# _PyContextInfo stub. Bind the official trade-query functions by name; skip any
-# that are missing (a plain account has no margin/credit permission).
 try:
-    _qmt_extra = {}
-    for _fn in (
+    qmt_extra = {}
+    for function_name in (
         "get_history_trade_detail_data", "get_value_by_order_id", "get_last_order_id",
-        "get_ipo_data", "get_new_purchase_limit",
-        "get_assure_contract", "get_enable_short_contract",
-        "get_unclosed_compacts", "get_closed_compacts", "get_debt_contract",
-        "get_option_subject_position", "get_comb_option", "get_hkt_exchange_rate",
+        "get_ipo_data", "get_new_purchase_limit", "get_assure_contract",
+        "get_enable_short_contract", "get_unclosed_compacts", "get_closed_compacts",
+        "get_debt_contract", "get_option_subject_position", "get_comb_option",
+        "get_hkt_exchange_rate",
     ):
-        try:
-            _qmt_extra[_fn] = globals()[_fn]
-        except KeyError:
-            pass
+        if function_name in globals():
+            qmt_extra[function_name] = globals()[function_name]
     _runtime.bind_runtime_api(
         passorder_func=passorder,
         cancel_func=cancel,
         get_trade_detail_data_func=get_trade_detail_data,
-        extra_funcs=_qmt_extra or None,
+        extra_funcs=qmt_extra or None,
     )
 except NameError:
     pass
+
 
 init = _runtime.init
 handlebar = _runtime.handlebar

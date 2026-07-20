@@ -2,6 +2,8 @@ import datetime
 import os
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -122,6 +124,31 @@ class BigQmtStrategyRunnerTest(unittest.TestCase):
 
         self.assertEqual(rpc_service.drained, [20])
         self.assertEqual(self.app.ticks, [])
+
+    def test_zmq_rpc_build_does_not_create_redis_clients(self):
+        config = {
+            "account_id": "acct",
+            "enable_rpc": True,
+            "rpc": {
+                "enabled": True,
+                "account_id": "acct",
+                "transport": "zmq",
+                "zmq": {"connect_address": "tcp://127.0.0.1:20146"},
+                "background_threads": True,
+            },
+            "qmt_api": {},
+        }
+        app = SimpleNamespace(order_gateway=None, position_sync_sink=None)
+
+        with mock.patch(
+            "bigqmt_signal_trader.adapters.redis_common.build_redis_client",
+            side_effect=AssertionError("ZMQ mode must not build Redis clients"),
+        ):
+            service = strategy_module._build_rpc_service(FakeContext(), app, config)
+
+        self.assertIsNone(service.listen_redis)
+        self.assertIsNone(service.redis)
+        self.assertEqual(service._transport.name, "zmq")
 
     def test_order_and_trade_callbacks_forward_to_app(self):
         strategy_module.init(FakeContext())

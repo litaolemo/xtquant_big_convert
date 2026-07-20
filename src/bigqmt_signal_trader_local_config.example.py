@@ -18,15 +18,13 @@ BIGQMT_REDIS_CONFIG = {
     "password": "",
     # Keep order RPC disabled unless you explicitly want remote order/cancel.
     "rpc_allow_order_methods": False,
-    # Big QMT may freeze custom daemon threads after init and its bundled Redis
-    # client rejects raw stock-code JSON read from Redis. The default production
-    # path therefore uses an encoded Redis list queue and drains it from QMT's
-    # official run_time("adjust", ...) callback.
+    # Redis and ZMQ can both drain requests through QMT's official
+    # run_time("adjust", ...) callback. This avoids GIL stalls in QMT's process.
     "rpc_process_in_listener": True,
     "rpc_listener_methods": ("*",),
     "rpc_background_threads": False,
     "schedule_adjust": True,
-    "schedule_adjust_interval": "500nMilliSecond",
+    "schedule_adjust_interval": "100nMilliSecond",
     # The default mode calls get_full_tick through RPC. Enable this cache only
     # if full-market payloads are too large for your latency/CPU budget.
     # When a client calls get_full_tick, it renews demand for 10 seconds.

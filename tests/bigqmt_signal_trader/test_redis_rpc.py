@@ -8,8 +8,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from bigqmt_signal_trader.adapters.order_dryrun import DryRunOrderGateway
-from bigqmt_signal_trader.models import AssetSnapshot, OrderSnapshot, PositionSnapshot
+from bigqmt_signal_trader.models import AssetSnapshot, OrderSnapshot, PositionSnapshot, TradeSnapshot
 from bigqmt_signal_trader.redis_rpc import (
+    RPC_REVISION,
     BigQmtRpcHandlers,
     RedisPubSubRpcService,
     decode_rpc_request_payload,
@@ -115,6 +116,59 @@ class FakeOrderGateway(DryRunOrderGateway):
         ]
 
 
+class CountingOrderGateway(DryRunOrderGateway):
+    def __init__(self, existing=None, query_error=None):
+        super().__init__()
+        self.existing = list(existing or [])
+        self.query_error = query_error
+        self.submit_count = 0
+        self.query_count = 0
+
+    def query_orders_strict(self, _account_id, _strategy_name):
+        self.query_count += 1
+        if self.query_error:
+            raise self.query_error
+        return list(self.existing)
+
+    def submit(self, request):
+        self.submit_count += 1
+        return super().submit(request)
+
+
+class CapturingTradeGateway(DryRunOrderGateway):
+    def __init__(self):
+        super().__init__()
+        self.strategy_names = []
+
+    def query_trades(self, account_id, strategy_name):
+        self.strategy_names.append((account_id, strategy_name))
+        return []
+
+
+class CapturingExecutionGateway(CapturingTradeGateway):
+    def __init__(self):
+        super().__init__()
+        self.order_strategy_names = []
+
+    def query_orders(self, account_id, strategy_name):
+        self.order_strategy_names.append((account_id, strategy_name))
+        return [
+            OrderSnapshot(
+                order_sys_id="order-1", user_order_id="tag-1", stock_code="600276.SH",
+                action="SELL", volume=100, traded_volume=0, status="50", price=55.0,
+            )
+        ]
+
+    def query_trades(self, account_id, strategy_name):
+        self.strategy_names.append((account_id, strategy_name))
+        return [
+            TradeSnapshot(
+                trade_id="trade-1", order_sys_id="order-1", stock_code="600276.SH",
+                action="SELL", volume=100, price=55.0,
+            )
+        ]
+
+
 def _service_with_order_gateway(order_gateway, allow_order_methods=False):
     redis_client = FakeRedis()
     handlers = BigQmtRpcHandlers(
@@ -128,6 +182,184 @@ def _service_with_order_gateway(order_gateway, allow_order_methods=False):
 
 
 class RedisRpcTest(unittest.TestCase):
+    def test_execution_snapshot_queries_orders_and_all_trades_once(self):
+        gateway = CapturingExecutionGateway()
+        handlers = BigQmtRpcHandlers(
+            account_id="acct",
+            market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(),
+            order_gateway=gateway,
+        )
+
+        snapshot = handlers.handle(
+            "query_execution_snapshot",
+            {
+                "account_id": "acct",
+                "order_strategy_name": "icestone_grid_600276",
+                "trade_strategy_name": "",
+            },
+        )
+
+        self.assertEqual(gateway.order_strategy_names, [("acct", "icestone_grid_600276")])
+        self.assertEqual(gateway.strategy_names, [("acct", "")])
+        self.assertEqual(snapshot["orders"][0].order_sys_id, "order-1")
+        self.assertEqual(snapshot["trades"][0].trade_id, "trade-1")
+        self.assertEqual(snapshot["account_id"], "acct")
+
+    def test_query_trades_preserves_explicit_empty_strategy_name(self):
+        gateway = CapturingTradeGateway()
+        handlers = BigQmtRpcHandlers(
+            account_id="acct",
+            market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(),
+            order_gateway=gateway,
+        )
+
+        handlers.handle(
+            "query_stock_trades",
+            {"account_id": "acct", "strategy_name": ""},
+        )
+
+        self.assertEqual(gateway.strategy_names, [("acct", "")])
+
+    def test_submit_orders_batch_returns_one_result_per_order(self):
+        handlers = BigQmtRpcHandlers(
+            account_id="acct",
+            market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(),
+            order_gateway=DryRunOrderGateway(),
+            allow_order_methods=True,
+        )
+
+        results = handlers.handle(
+            "order_stock_batch",
+            {
+                "orders": [
+                    {"account_id": "acct", "stock_code": "600000.SH", "order_type": 23,
+                     "order_volume": 100, "price": 10.0, "signal_id": "batch-1"},
+                    {"account_id": "acct", "stock_code": "600000.SH", "order_type": 24,
+                     "order_volume": 100, "price": 10.5, "signal_id": "batch-2"},
+                ]
+            },
+        )
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(item["success"] for item in results))
+        self.assertTrue(all(item["accepted"] for item in results))
+        self.assertTrue(all(item["user_order_id"] for item in results))
+        self.assertTrue(all(not item["order_sys_id"] for item in results))
+
+    def test_submit_orders_batch_reuses_order_tag_without_resubmitting(self):
+        gateway = CountingOrderGateway()
+        handlers = BigQmtRpcHandlers(
+            account_id="acct", market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(), order_gateway=gateway,
+            allow_order_methods=True,
+        )
+        params = {
+            "batch_id": "BATCH-1",
+            "orders": [{"account_id": "acct", "stock_code": "600000.SH",
+                        "order_type": 23, "order_volume": 100, "price": 10.0,
+                        "order_remark": "GRID-TAG-1"}],
+        }
+
+        first = handlers.handle("order_stock_batch", params)
+        second = handlers.handle("order_stock_batch", params)
+
+        self.assertEqual(gateway.submit_count, 1)
+        self.assertEqual(gateway.query_count, 0)
+        self.assertFalse(first[0]["idempotent"])
+        self.assertTrue(second[0]["idempotent"])
+
+    def test_submit_orders_batch_rejects_missing_order_tag(self):
+        gateway = CountingOrderGateway()
+        handlers = BigQmtRpcHandlers(
+            account_id="acct", market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(), order_gateway=gateway,
+            allow_order_methods=True,
+        )
+
+        result = handlers.handle("order_stock_batch", {
+            "orders": [{"account_id": "acct", "stock_code": "600000.SH",
+                        "order_type": 23, "order_volume": 100, "price": 10.0}],
+        })[0]
+
+        self.assertEqual(gateway.submit_count, 0)
+        self.assertTrue(result["explicit_failure"])
+        self.assertEqual(result["error"], "ORDER_TAG_REQUIRED")
+
+    def test_submit_orders_batch_recognizes_existing_qmt_order(self):
+        existing = OrderSnapshot(
+            order_sys_id="SYS-EXISTING", user_order_id="GRID-TAG-2",
+            stock_code="600000.SH", action="BUY", volume=100,
+            traded_volume=0, status="50",
+        )
+        gateway = CountingOrderGateway(existing=[existing])
+        handlers = BigQmtRpcHandlers(
+            account_id="acct", market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(), order_gateway=gateway,
+            allow_order_methods=True,
+        )
+
+        result = handlers.handle("order_stock_batch", {
+            "batch_id": "BATCH-2",
+            "orders": [{"account_id": "acct", "stock_code": "600000.SH",
+                        "order_type": 23, "order_volume": 100, "price": 10.0,
+                        "order_remark": "GRID-TAG-2",
+                        "require_idempotency_check": True}],
+        })[0]
+
+        self.assertEqual(gateway.submit_count, 0)
+        self.assertTrue(result["confirmed"])
+        self.assertTrue(result["idempotent"])
+        self.assertEqual(result["order_sys_id"], "SYS-EXISTING")
+
+    def test_submit_orders_batch_recognizes_already_filled_trade(self):
+        class FilledGateway(CountingOrderGateway):
+            def query_submission_identities_strict(self, _account_id, _strategy_name):
+                trade = type("Trade", (), {
+                    "user_order_id": "GRID-TAG-FILLED",
+                    "order_sys_id": "SYS-FILLED",
+                })()
+                return [], [trade]
+
+        gateway = FilledGateway()
+        handlers = BigQmtRpcHandlers(
+            account_id="acct", market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(), order_gateway=gateway,
+            allow_order_methods=True,
+        )
+
+        result = handlers.handle("order_stock_batch", {
+            "orders": [{"account_id": "acct", "stock_code": "600000.SH",
+                        "order_type": 23, "order_volume": 100, "price": 10.0,
+                        "order_remark": "GRID-TAG-FILLED",
+                        "require_idempotency_check": True}],
+        })[0]
+
+        self.assertEqual(gateway.submit_count, 0)
+        self.assertTrue(result["confirmed"])
+        self.assertEqual(result["order_sys_id"], "SYS-FILLED")
+
+    def test_submit_orders_batch_refuses_retry_when_lookup_is_unavailable(self):
+        gateway = CountingOrderGateway(query_error=RuntimeError("qmt offline"))
+        handlers = BigQmtRpcHandlers(
+            account_id="acct", market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(), order_gateway=gateway,
+            allow_order_methods=True,
+        )
+
+        result = handlers.handle("order_stock_batch", {
+            "orders": [{"account_id": "acct", "stock_code": "600000.SH",
+                        "order_type": 23, "order_volume": 100, "price": 10.0,
+                        "order_remark": "GRID-TAG-3",
+                        "require_idempotency_check": True}],
+        })[0]
+
+        self.assertEqual(gateway.submit_count, 0)
+        self.assertFalse(result["explicit_failure"])
+        self.assertEqual(result["error"], "IDEMPOTENCY_CHECK_UNAVAILABLE")
+
     def test_encoded_request_payload_hides_stock_codes_from_qmt_redis_guard(self):
         request = {
             "request_id": "encoded",
@@ -179,6 +411,8 @@ class RedisRpcTest(unittest.TestCase):
         response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:listener-req"])
         self.assertTrue(response["ok"], response["error"])
         self.assertTrue(response["data"]["pong"])
+        self.assertFalse(response["data"]["allow_order_methods"])
+        self.assertEqual(response["data"]["rpc_revision"], RPC_REVISION)
         self.assertEqual(service.drain_pending(), 0)
 
     def test_process_in_listener_leaves_non_listener_methods_queued(self):
@@ -198,7 +432,7 @@ class RedisRpcTest(unittest.TestCase):
         response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:queued-tick"])
         self.assertTrue(response["ok"], response["error"])
 
-    def test_process_in_listener_wildcard_handles_read_methods_but_queues_stateful_methods(self):
+    def test_process_in_listener_wildcard_only_handles_ping_inline(self):
         redis_client, service = _service_with_listener_methods(
             allow_order_methods=True,
             process_in_listener=True,
@@ -214,10 +448,11 @@ class RedisRpcTest(unittest.TestCase):
             }
         )
 
+        self.assertNotIn("bigqmt:rpc:resp:acct:direct-tick", redis_client.kv)
+        self.assertEqual(service.drain_pending(), 1)
         response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:direct-tick"])
         self.assertTrue(response["ok"], response["error"])
         self.assertEqual(response["data"]["600000.SH"]["lastPrice"], 10.5)
-        self.assertEqual(service.drain_pending(), 0)
 
         service.enqueue_payload(
             {
@@ -253,6 +488,26 @@ class RedisRpcTest(unittest.TestCase):
         self.assertEqual(service.drain_pending(), 1)
         order_response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:queued-order"])
         self.assertTrue(order_response["ok"], order_response["error"])
+
+    def test_listener_wildcard_defers_asset_query_to_strategy_thread(self):
+        redis_client, service = _service_with_listener_methods(
+            process_in_listener=True,
+            listener_methods=("*",),
+        )
+
+        service.enqueue_payload(
+            {
+                "request_id": "queued-asset",
+                "account_id": "acct",
+                "method": "query_stock_asset",
+                "params": {},
+            }
+        )
+
+        self.assertNotIn("bigqmt:rpc:resp:acct:queued-asset", redis_client.kv)
+        self.assertEqual(service.drain_pending(), 1)
+        response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:queued-asset"])
+        self.assertTrue(response["ok"], response["error"])
 
     def test_account_mismatch_is_rejected(self):
         redis_client, service = _service()
