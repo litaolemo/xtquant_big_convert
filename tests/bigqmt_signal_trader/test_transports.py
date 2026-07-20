@@ -220,6 +220,24 @@ class ZmqTransportTest(unittest.TestCase):
             client.stop()
             server.stop()
 
+    def test_duplicate_server_address_fails_without_port_fallback(self):
+        from bigqmt_signal_trader.transports.zmq_transport import ZmqTransport
+
+        first = ZmqTransport(bind_address=self.address, account_id="acct")
+        duplicate = ZmqTransport(
+            bind_address=self.address, account_id="acct", port_scan_range=50
+        )
+        first.start_receiving(lambda _request: {}, background_threads=False)
+        try:
+            with self.assertRaisesRegex(TransportError, "ZMQ_BIND_CONFLICT"):
+                duplicate.start_receiving(
+                    lambda _request: {}, background_threads=False
+                )
+            self.assertIsNone(duplicate._actual_bind_address)
+        finally:
+            duplicate.stop()
+            first.stop()
+
     def test_deferred_response_returns_through_router_thread(self):
         from bigqmt_signal_trader.transports.zmq_transport import ZmqTransport
 

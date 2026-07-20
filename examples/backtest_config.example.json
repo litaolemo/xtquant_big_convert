@@ -1,0 +1,22 @@
+{
+  "initial_cash": 1000000,
+  "initial_positions": {},
+  "buy_commission_rate": 0.0003,
+  "sell_commission_rate": 0.0003,
+  "min_commission": 5,
+  "stamp_tax_rate": 0.0005,
+  "transfer_fee_rate": 0.00001,
+  "slippage_bps": 0,
+  "max_volume_participation": 0.1,
+  "price_limit_rate": 0.1,
+  "lot_size": 100,
+  "time_in_force": "NEXT_BAR",
+  "seed": 0,
+  "fee_schedule": "a_share_2023_08_28",
+  "market_rules_version": "a_share_v1",
+  "strategy_name": "ma_example",
+  "parameters": {
+    "fast": 2,
+    "slow": 3
+  }
+}

@@ -113,10 +113,9 @@ class ZmqTransport(RpcTransport):
         self.recv_timeout_seconds = float(recv_timeout_seconds)
         self.server_hwm = int(server_hwm)
         self.client_linger_ms = int(client_linger_ms)
-        # Service discovery: when the derived port is taken, the server scans
-        # upward for a free port and publishes the real address to Redis so the
-        # client can find it. Without a discovery client this falls back to the
-        # static derived address (and bind conflicts surface as errors).
+        # Discovery remains available for clients, but a server must bind the
+        # configured address exactly. ``port_scan_range`` is retained only for
+        # backward-compatible config loading and is intentionally not used.
         self.discovery_redis_client = discovery_redis_client
         self.discovery_key_template = discovery_key_template
         self.discovery_ttl_seconds = int(discovery_ttl_seconds)
@@ -175,51 +174,29 @@ class ZmqTransport(RpcTransport):
         return self._zmq, self._ctx
 
     # -- server side ------------------------------------------------------
-    def _bind_with_fallback(self):
-        """Bind the ROUTER socket, scanning ports if the default is taken.
-
-        Tries ``self.bind_address`` first. On ZMQ EADDRINUSE, walks upward
-        from the base port for up to ``port_scan_range`` ports. The actually
-        bound address is recorded on ``self._actual_bind_address`` and, when a
-        discovery client is configured, published to Redis so clients can find
-        it. Re-raises the original error if no port in the range is free.
-        """
+    def _bind_configured_address(self):
+        """Bind exactly one configured address and reject duplicate servers."""
         zmq, ctx = self._ensure_zmq()
-        attempts = [self.bind_address]
-        # Build fallback ports from the base port upward. We always scan so a
-        # collision (e.g. a stale server on the derived port) is recovered
-        # automatically; an explicit bind_address just sets the scan origin.
+        sock = ctx.socket(zmq.ROUTER)
+        sock.setsockopt(zmq.RCVHWM, self.server_hwm)
+        sock.setsockopt(zmq.SNDHWM, self.server_hwm)
+        sock.setsockopt(zmq.RCVTIMEO, int(self.recv_timeout_seconds * 1000))
         try:
-            base = int(self.bind_address.rsplit(":", 1)[1])
-            host_part = self.bind_address.rsplit(":", 1)[0]
-            for offset in range(1, self.port_scan_range + 1):
-                attempts.append("%s:%d" % (host_part, base + offset))
-        except (ValueError, IndexError):
-            pass
-
-        last_error = None
-        for addr in attempts:
-            sock = ctx.socket(zmq.ROUTER)
-            sock.setsockopt(zmq.RCVHWM, self.server_hwm)
-            sock.setsockopt(zmq.SNDHWM, self.server_hwm)
-            sock.setsockopt(zmq.RCVTIMEO, int(self.recv_timeout_seconds * 1000))
+            sock.bind(self.bind_address)
+        except self._zmq.ZMQError as exc:
             try:
-                sock.bind(addr)
-                self._router = sock
-                self._actual_bind_address = addr
-                self._publish_discovery(addr)
-                return
-            except self._zmq.ZMQError as exc:
-                last_error = exc
-                try:
-                    sock.close(linger=0)
-                except Exception:
-                    pass
-                # Only EADDRINUSE is retriable; other errors (e.g. bad host) abort.
-                if getattr(exc, "errno", None) != zmq.EADDRINUSE:
-                    raise
-        # Exhausted the scan range.
-        raise last_error
+                sock.close(linger=0)
+            except Exception:
+                pass
+            if getattr(exc, "errno", None) == zmq.EADDRINUSE:
+                raise TransportError(
+                    "ZMQ_BIND_CONFLICT address=%s; another bridge instance "
+                    "already owns the configured endpoint" % self.bind_address
+                )
+            raise
+        self._router = sock
+        self._actual_bind_address = self.bind_address
+        self._publish_discovery(self.bind_address)
 
     def _publish_discovery(self, address):
         if self.discovery_redis_client is None:
@@ -244,7 +221,7 @@ class ZmqTransport(RpcTransport):
     def start_receiving(self, on_request, background_threads=True):
         super(ZmqTransport, self).start_receiving(on_request)
         zmq, ctx = self._ensure_zmq()
-        self._bind_with_fallback()
+        self._bind_configured_address()
         bound = self._actual_bind_address or self.bind_address
         if not background_threads:
             print(

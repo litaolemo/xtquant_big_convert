@@ -18,6 +18,7 @@ dev = []
 [tool.setuptools]
 package-dir = {"" = "src"}
 py-modules = [
+    "BIGQMT_ZMQ_BACKTEST",
     "bigqmt_signal_trader_strategy",
     "bigqmt_signal_trader_redis_rpc_runtime",
     "bigqmt_signal_trader_redis_dryrun",
