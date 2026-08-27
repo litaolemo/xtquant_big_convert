@@ -252,6 +252,37 @@ class BigQmtAdaptersTest(unittest.TestCase):
         self.assertEqual(calls[0][9], result.user_order_id)
         self.assertIs(calls[0][10], context)
 
+    def test_order_gateway_submit_preserves_credit_operation_types(self):
+        cases = (
+            (27, "BUY"),
+            (31, "SELL"),
+            (32, "REPAY"),
+            (33, "BUY"),
+            (34, "SELL"),
+        )
+        for order_type, action in cases:
+            with self.subTest(order_type=order_type):
+                calls = []
+                gateway = BigQmtOrderGateway(
+                    context_info=object(),
+                    passorder_func=lambda *args: calls.append(args),
+                )
+                request = OrderRequest(
+                    signal_id="sig-%s" % order_type,
+                    account_id="acct",
+                    action=action,
+                    stock_code="600000.SH",
+                    volume=100,
+                    price=10.0,
+                    price_type=11,
+                    strategy_name="credit-strategy",
+                    order_type=order_type,
+                )
+
+                gateway.submit(request)
+
+                self.assertEqual(calls[0][0], order_type)
+
     def test_order_gateway_cancel_and_query_orders(self):
         cancel_calls = []
 
@@ -267,7 +298,8 @@ class BigQmtAdaptersTest(unittest.TestCase):
                     m_strRemark="remark1",
                     m_strInstrumentID="000001",
                     m_strExchangeID="SZ",
-                    m_nOffsetFlag=49,
+                    m_nOffsetFlag=48,
+                    m_nOpType=31,
                     m_nVolumeTotalOriginal=1000,
                     m_nVolumeTraded=200,
                     m_nOrderStatus=50,
@@ -291,6 +323,7 @@ class BigQmtAdaptersTest(unittest.TestCase):
         self.assertEqual(cancel_calls, [("ord1", "acct", "STOCK", context)])
         self.assertEqual(orders[0].stock_code, "000001.SZ")
         self.assertEqual(orders[0].action, "SELL")
+        self.assertEqual(orders[0].order_type, 31)
         self.assertEqual(orders[0].traded_volume, 200)
         self.assertEqual(orders[0].price, 10.12)
         self.assertEqual(orders[0].traded_price, 10.05)

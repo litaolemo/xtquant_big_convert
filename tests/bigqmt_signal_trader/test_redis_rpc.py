@@ -66,6 +66,33 @@ class FakePositionProvider:
         return AssetSnapshot(account_id=account_id, cash=100.0, total_asset=1000.0)
 
 
+class CreditOrderTypeRpcTest(unittest.TestCase):
+    def test_submit_order_forwards_explicit_credit_operation_type(self):
+        gateway = DryRunOrderGateway()
+        handlers = BigQmtRpcHandlers(
+            account_id="acct",
+            market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(),
+            order_gateway=gateway,
+            allow_order_methods=True,
+        )
+
+        handlers._handle_submit_order(
+            {
+                "stock_code": "600000.SH",
+                "order_type": 31,
+                "order_volume": 100,
+                "price": 10.0,
+                "price_type": 11,
+                "signal_id": "credit-sell-repay",
+                "wait_settlement": False,
+            }
+        )
+
+        self.assertEqual(gateway.submitted[0].action, "SELL")
+        self.assertEqual(gateway.submitted[0].order_type, 31)
+
+
 def _service(allow_order_methods=False, process_in_listener=False):
     return _service_with_listener_methods(
         allow_order_methods=allow_order_methods,

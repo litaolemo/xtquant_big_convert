@@ -176,8 +176,17 @@ METHOD_ALIASES = {
     "cancel_order_stock_sysid": "cancel_order",
 }
 
-BUY_ORDER_TYPES = {"23", "STOCK_BUY", "BUY", "B"}
-SELL_ORDER_TYPES = {"24", "STOCK_SELL", "SELL", "S"}
+ORDER_TYPE_ACTIONS = {
+    "23": "BUY",
+    "24": "SELL",
+    "27": "BUY",
+    "31": "SELL",
+    "32": "REPAY",
+    "33": "BUY",
+    "34": "SELL",
+}
+BUY_ORDER_TYPES = {"23", "27", "33", "STOCK_BUY", "BUY", "B"}
+SELL_ORDER_TYPES = {"24", "31", "34", "STOCK_SELL", "SELL", "S"}
 CANCELABLE_ORDER_STATUSES = {"50", "55"}
 SAFE_B64_PREFIX = "b64s:"
 SAFE_B64_DIGIT_ENCODE = str.maketrans("0123456789", "!#$%&()*~?")
@@ -886,14 +895,30 @@ class BigQmtRpcHandlers:
 
     def _order_action_from_params(self, params):
         action = str(params.get("action") or "").upper()
-        if action:
-            return action
         order_type = str(params.get("order_type") or "").upper()
+        if action:
+            expected_action = ORDER_TYPE_ACTIONS.get(order_type)
+            if expected_action is not None and expected_action != action:
+                raise ValueError("order_type does not match action")
+            return action
         if order_type in BUY_ORDER_TYPES:
             return "BUY"
         if order_type in SELL_ORDER_TYPES:
             return "SELL"
+        if order_type == "32":
+            return "REPAY"
         raise ValueError("action or order_type is required")
+
+    def _explicit_order_type_from_params(self, params):
+        value = params.get("order_type")
+        if value is None or value == "":
+            return None
+        text = str(value).strip().upper()
+        if text in ("STOCK_BUY", "BUY", "B", "STOCK_SELL", "SELL", "S"):
+            return None
+        if text not in ORDER_TYPE_ACTIONS:
+            raise ValueError("unsupported order_type: %s" % value)
+        return int(text)
 
     def _handle_submit_order(self, params):
         if self.order_gateway is None:
@@ -913,9 +938,10 @@ class BigQmtRpcHandlers:
             price_type=params.get("price_type") or "LIMIT",
             strategy_name=str(params.get("strategy_name") or "bigqmt_rpc"),
             remark=order_tag,
+            order_type=self._explicit_order_type_from_params(params),
         )
-        if request.action not in ("BUY", "SELL"):
-            raise ValueError("action must be BUY or SELL")
+        if request.action not in ("BUY", "SELL", "REPAY"):
+            raise ValueError("action must be BUY, SELL or REPAY")
         if not request.stock_code:
             raise ValueError("stock_code is required")
         if request.volume <= 0:

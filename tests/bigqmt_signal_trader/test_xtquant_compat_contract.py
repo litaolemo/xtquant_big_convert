@@ -348,12 +348,14 @@ class QueryPathSerializationContractTest(unittest.TestCase):
             remark="rmk-9",
             order_time=1755655200,
             traded_price=10.05,
+            order_type=31,
         )
         item = to_jsonable(snapshot)
         order = self._trader()._order_from_dict("acct", item)
         self.assertEqual(order.order_id, "sys-9")
         self.assertEqual(order.order_time, 1755655200)
         self.assertEqual(order.traded_price, 10.05)
+        self.assertEqual(order.order_type, 31)
         self.assertEqual(order.strategy_name, "strat-a")
         self.assertEqual(order.order_remark, "rmk-9")
 

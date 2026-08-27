@@ -2947,7 +2947,7 @@ class BigQmtXtTrader:
 
     def _order_from_dict(self, account_id, item):
         action = item.get("action")
-        order_type = _action_to_order_type(action)
+        order_type = _safe_int(item.get("order_type"), _action_to_order_type(action))
         order_sysid = str(item.get("order_sys_id") or item.get("order_sysid") or item.get("order_id") or "")
         return CompatObject(
             account_id=account_id,

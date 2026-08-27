@@ -329,6 +329,7 @@ class OrderRequest:
         price_type,
         strategy_name,
         remark="",
+        order_type=None,
     ):
         self.signal_id = signal_id
         self.account_id = account_id
@@ -339,6 +340,7 @@ class OrderRequest:
         self.price_type = price_type
         self.strategy_name = strategy_name
         self.remark = remark
+        self.order_type = order_type
 
 
 class OrderSubmitResult:
@@ -365,6 +367,7 @@ class OrderSnapshot:
         order_time=0,
         status_msg="",
         traded_price=0.0,
+        order_type=None,
     ):
         self.order_sys_id = order_sys_id
         self.user_order_id = user_order_id
@@ -375,6 +378,7 @@ class OrderSnapshot:
         self.status = status
         self.price = price
         self.traded_price = traded_price
+        self.order_type = order_type
         self.strategy_name = strategy_name
         self.remark = remark
         # 报单时间, Unix 秒 -- MiniQMT XtOrder.order_time 的语义。0 = 未上报。

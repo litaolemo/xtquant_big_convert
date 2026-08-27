@@ -20,6 +20,16 @@ PRICE_TYPE_ALIASES = {
     "MARKET_SZ_CONVERT_5_CANCEL": 47,
 }
 
+ORDER_TYPE_ACTIONS = {
+    23: "BUY",
+    24: "SELL",
+    27: "BUY",
+    31: "SELL",
+    32: "REPAY",
+    33: "BUY",
+    34: "SELL",
+}
+
 
 def _action_from_offset_flag(offset_flag):
     return SignalAction.BUY.value if int(offset_flag or 0) == 48 else SignalAction.SELL.value
@@ -166,7 +176,12 @@ class BigQmtOrderGateway:
     def submit(self, request):
         passorder = self._require_passorder()
         action = str(request.action).upper()
-        if action == SignalAction.BUY.value:
+        explicit_order_type = getattr(request, "order_type", None)
+        if explicit_order_type is not None:
+            op_type = int(explicit_order_type)
+            if ORDER_TYPE_ACTIONS.get(op_type) != action:
+                raise ValueError("unsupported order_type or action mismatch: %s/%s" % (op_type, action))
+        elif action == SignalAction.BUY.value:
             op_type = 23
         elif action == SignalAction.SELL.value:
             op_type = 24
@@ -216,6 +231,15 @@ class BigQmtOrderGateway:
                     _attr(row, ("m_strInstrumentID", "instrument_id", "stock_code")),
                     _attr(row, ("m_strExchangeID", "exchange_id", "market")),
                 )
+                order_type = int(
+                    _attr(row, ("m_nOpType", "op_type", "order_type"), 0) or 0
+                )
+                action = ORDER_TYPE_ACTIONS.get(
+                    order_type,
+                    _action_from_offset_flag(
+                        _attr(row, ("m_nOffsetFlag", "offset_flag"), 0)
+                    ),
+                )
             except Exception as exc:
                 skip_unparsable_row("ORDER", row, exc)
                 continue
@@ -224,7 +248,7 @@ class BigQmtOrderGateway:
                     order_sys_id=str(_attr(row, ("m_strOrderSysID", "order_sys_id"), "") or ""),
                     user_order_id=str(_attr(row, ("m_strRemark", "user_order_id", "remark"), "") or ""),
                     stock_code=stock_code,
-                    action=_action_from_offset_flag(_attr(row, ("m_nOffsetFlag", "offset_flag"), 0)),
+                    action=action,
                     volume=int(_attr(row, ("m_nVolumeTotalOriginal", "volume"), 0) or 0),
                     traded_volume=int(_attr(row, ("m_nVolumeTraded", "traded_volume"), 0) or 0),
                     status=str(_attr(row, ("m_nOrderStatus", "status"), "") or ""),
@@ -236,6 +260,7 @@ class BigQmtOrderGateway:
                     traded_price=float(
                         _attr(row, ("m_dTradedPrice", "traded_price", "avg_traded_price"), 0.0) or 0.0
                     ),
+                    order_type=order_type or None,
                 )
             )
         return result
