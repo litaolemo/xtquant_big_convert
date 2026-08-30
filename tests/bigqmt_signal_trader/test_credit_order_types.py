@@ -190,13 +190,17 @@ class RpcAcceptanceTest(unittest.TestCase):
         self.assertIsNone(handlers._credit_order_type_from_params(
             {"order_type": xtconstant.STOCK_BUY}))
 
-    def test_unknown_types_still_raise_the_original_error(self):
+    def test_an_unknown_type_still_raises(self):
+        """It must not be guessed at. The message changed in #92 -- it now
+        names the value and the deployed version instead of claiming no
+        order_type was given, which is what a reporter who had given one saw.
+        Covered in detail by test_unknown_order_type_message.py."""
         handlers = self._handlers()
 
         with self.assertRaises(ValueError) as caught:
             handlers._order_action_from_params({"order_type": 9999})
 
-        self.assertIn("action or order_type is required", str(caught.exception))
+        self.assertIn("9999", str(caught.exception))
 
 
 if __name__ == "__main__":
