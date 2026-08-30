@@ -321,8 +321,12 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(trades[0].order_type, STOCK_BUY)
         self.assertEqual(trades[0].traded_price, 10.0)
         self.assertEqual(trades[0].order_remark, "remark-1")
-        self.assertEqual(order_id, "sys-2")
-        self.assertTrue(cancelled)
+        # MiniQMT hands back an int 委托编号; Big QMT only has the broker's
+        # string 合同编号, so the id is both (issue #113).
+        self.assertEqual(str(order_id), "sys-2")
+        self.assertIsInstance(order_id, int)
+        self.assertGreater(order_id, 0)
+        self.assertEqual(cancelled, 0)      # 0 == success, not True
         self.assertEqual(trader.client.calls[-2][1]["price_type"], MARKET_PEER_PRICE_FIRST)
         # strategy_name 默认 ""（返回全部委托），与服务端一致（strategy_name 陷阱）。
         self.assertEqual(trader.client.calls[-4][1]["strategy_name"], "")

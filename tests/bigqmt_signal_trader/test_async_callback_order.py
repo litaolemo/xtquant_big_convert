@@ -128,7 +128,7 @@ class AsyncCallbackOrderTest(unittest.TestCase):
 
         self.assertEqual(rec.names(), ["response", "order"])
         resp = rec.seen[0][1]
-        self.assertEqual(resp.order_id, "xt-real-1")
+        self.assertEqual(str(resp.order_id), "xt-real-1")
         self.assertEqual(resp.order_sysid, "xt-real-1")
 
     def test_response_falls_back_to_remark_when_no_id_learned(self):
@@ -143,7 +143,7 @@ class AsyncCallbackOrderTest(unittest.TestCase):
 
         resp = rec.seen[0][1]
         self.assertEqual(rec.names(), ["response"])
-        self.assertEqual(resp.order_id, "TAG-1")
+        self.assertEqual(str(resp.order_id), "TAG-1")
         self.assertEqual(resp.order_sysid, "")
 
 

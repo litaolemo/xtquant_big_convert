@@ -625,6 +625,67 @@ credit_positions = credit_trader.query_stock_positions(credit_acc)
 
 ---
 
+## 与 MiniQMT 的兼容性对照
+
+本项目的目标是让照着 MiniQMT (`xtquant`) 写的代码不改就能跑。下表列出**返回值契约**——类型不对不会报错，只会让判断悄悄反过来，所以单独列出来。
+
+### 返回值：与 MiniQMT 一致
+
+| 接口 | 返回 | 说明 |
+|---|---|---|
+| `order_stock()` | `int` | 成功为正数，失败 `-1` |
+| `order_stock_async()` | `int` | 请求序号 seq，结果走 `on_order_stock_async_response` |
+| `cancel_order_stock()` | `int` | **`0` 成功，`-1` 失败**（不是 True/False） |
+| `cancel_order_stock_sysid()` | `int` | 同上 |
+| `cancel_order_stock_async()` | `int` | seq |
+| `connect()` / `start()` | `int` | `0` 成功 |
+| `subscribe()` / `unsubscribe()` | `int` | `0` 成功 |
+| `query_stock_asset()` | 对象 | `.cash` / `.total_asset` 等属性 |
+| `query_stock_positions()` | `list[对象]` | |
+| `query_stock_orders()` / `query_stock_trades()` | `list[对象]` | |
+| `subscribe_quote()` / `subscribe_whole_quote()` | `int` | 订阅号，传给 `unsubscribe_quote()` |
+| `get_full_tick()` | `dict` | `{code: {...}}` |
+| `get_market_data_ex()` | `dict[str, DataFrame]` | |
+
+### 订单号：既是 int 也是 str
+
+MiniQMT 的 `order_id` 是 int（委托编号），`order_sysid` 是 str（柜台合同编号）。大 QMT **没有前者**——`get_trade_detail_data` 只给 `m_strOrderSysID` 这个字符串。
+
+所以这里的 `order_id` 是一个 int 子类，两种形态同时成立：
+
+```python
+order_id = xt_trader.order_stock(acc, "600000.SH", 23, 100, 11, 10.0, "s", "")
+
+isinstance(order_id, int)   # True —— MiniQMT 写法照常
+order_id > 0                # True
+order_id == -1              # 失败时才 True
+
+str(order_id)               # '合同编号' —— 券商给的原始字符串
+xt_trader.cancel_order_stock(acc, order_id)   # 撤单送回的是原始字符串
+```
+
+合同编号是纯数字时（多数券商），int 值就是那个数字，两种形态完全一致；不是纯数字时 int 是一个稳定的正数替身，而撤单、打印用的仍是真实编号。
+
+把 order_id 存进数据库再取出来（变成普通 int）也能撤单——客户端记着最近 4096 个的对应关系。想要字符串就用 `.order_sysid`，它一直是 str。
+
+同样的规则适用于 `XtOrder.order_id`、`XtTrade.order_id`，以及回调对象 `XtOrderError` / `XtCancelError` / `XtOrderResponse` 里的 `order_id`。
+
+### 行为差异（不是返回值，但会咬人）
+
+| 项目 | MiniQMT | 本项目 |
+|---|---|---|
+| `get_full_tick(["SH"])` | 全市场 | **默认只取股票**（1.08s）；要全部传 `types=["all"]`（7.4s，含地方债等 26744 只） |
+| `get_instrument_detail()` 查不到 | `None` | `{}`（两者都是 falsy，`if not detail` 通用） |
+| `download_history_data()` | 无返回 | 返回 `{"finished": n, "total": n}`（多给的信息，可忽略） |
+| 账户类型 | `StockAccount(id, "CREDIT")` 即可 | 还需服务端 `BIGQMT_ACCOUNT_TYPE = "CREDIT"`，**客户端的类型不会传到服务端** |
+| 委托类型常量 | `xtconstant.order_type` | 内部会翻译成 `passorder` 的 opType（两套编号，专项两融 40–45 → 70–75） |
+
+### 本项目的扩展（MiniQMT 没有）
+
+这些不是兼容项，是多出来的：`order_stock_result()`（返回完整 dict 而非单个 id）、`order_stock_batch()`、`wait_async_orders()`、`ipo_subscribe_all()`、`sync_deployment()`、`get_deployment_info()`、`query_execution_snapshot()`、`local_cache_stats()`。
+
+---
+
 ## 环境要求与依赖安装
 
 本系统分两部分，各自需要自己的 Python 环境和依赖：

@@ -602,7 +602,7 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
 
         self.assertEqual(len(cb.order_errors), 1)
         err = cb.order_errors[0]
-        self.assertEqual(err.order_id, "sys-err-1")
+        self.assertEqual(str(err.order_id), "sys-err-1")
         self.assertEqual(err.error_id, 2147483647)
         self.assertEqual(err.error_msg, "废单")
         self.assertEqual(err.stock_code, "600654.SH")
@@ -621,7 +621,7 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
 
         self.assertEqual(len(cb.cancel_errors), 1)
         err = cb.cancel_errors[0]
-        self.assertEqual(err.order_id, "sys-cancel-1")
+        self.assertEqual(str(err.order_id), "sys-cancel-1")
         self.assertEqual(err.error_id, 99)
         self.assertEqual(err.error_msg, "撤单失败")
 
@@ -642,7 +642,7 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
         err = cb.order_errors[0]
         self.assertEqual(err.order_sysid, "sys-err-1")
         self.assertEqual(err.order_sys_id, "sys-err-1")
-        self.assertEqual(err.order_id, "sys-err-1")
+        self.assertEqual(str(err.order_id), "sys-err-1")
         cerr = cb.cancel_errors[0]
         self.assertEqual(cerr.order_sysid, "sys-cancel-1")
         self.assertEqual(cerr.order_sys_id, "sys-cancel-1")
@@ -717,7 +717,7 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
         self.assertGreater(seq, 0)
         self.assertEqual(len(cb.async_responses), 1)
         resp = cb.async_responses[0]
-        self.assertEqual(resp.order_id, "sys-ok-1")
+        self.assertEqual(str(resp.order_id), "sys-ok-1")
         self.assertEqual(resp.account_id, "acct")
         self.assertEqual(resp.seq, seq)
 
@@ -765,7 +765,7 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
         self.assertEqual(len(cb.order_errors), 0)
         self.assertEqual(len(cb.async_responses), 1)
         resp = cb.async_responses[0]
-        self.assertEqual(resp.order_id, "u-1")  # 委托号未知时回退到 user_order_id
+        self.assertEqual(str(resp.order_id), "u-1")  # 委托号未知时回退到 user_order_id
         self.assertEqual(resp.order_sys_id, "")
 
     def test_order_stock_async_server_error_fires_order_error_with_reason(self):
@@ -800,7 +800,7 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
         finally:
             trader.order_stock_result = original
 
-        self.assertEqual([r.order_id for r in cb.async_responses],
+        self.assertEqual([str(r.order_id) for r in cb.async_responses],
                          ["sys-A.SH", "sys-B.SH", "sys-C.SH"])
         self.assertEqual([r.seq for r in cb.async_responses],
                          sorted(r.seq for r in cb.async_responses))
@@ -810,7 +810,7 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
         original = trader.cancel_order_stock_sysid
 
         def fake_cancel(account, market, sysid):
-            return True
+            return 0        # MiniQMT: 0 == success (issue #113)
 
         trader.cancel_order_stock_sysid = fake_cancel
         try:
