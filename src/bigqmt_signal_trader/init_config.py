@@ -144,7 +144,7 @@ def render_client_config(answers):
         '"""',
         "",
         "BIGQMT_ACCOUNT_ID = %r" % str(answers["account_id"]),
-        "BIGQMT_RPC_TIMEOUT_SECONDS = 6.0",
+        "BIGQMT_RPC_TIMEOUT_SECONDS = 30.0",
         "",
         "BIGQMT_REDIS_CONFIG = {",
         '    "transport": %r,' % transport,
