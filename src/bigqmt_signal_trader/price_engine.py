@@ -1,10 +1,18 @@
 """订单价格生成逻辑。"""
 
-from .code_utils import normalize_stock_code
+from .code_utils import is_bond_code, normalize_stock_code
 
 
 def _price_precision(stock_code):
-    pure = normalize_stock_code(stock_code).split(".")[0]
+    """报价小数位。基金和债券都是 3 位，股票 2 位。
+
+    债券这一条原来漏了：转债报价精度是 0.001，按 2 位取整会把 128.456 变成
+    128.46，交易所直接拒单。
+    """
+    code = normalize_stock_code(stock_code)
+    if is_bond_code(code):
+        return 3
+    pure = code.split(".")[0]
     return 3 if pure.startswith(("15", "16", "51", "52")) else 2
 
 
