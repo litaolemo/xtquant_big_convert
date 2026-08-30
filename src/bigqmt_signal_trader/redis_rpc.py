@@ -341,6 +341,29 @@ def to_jsonable(value):
             }
         except Exception:
             return str(value)
+    # pandas Panel (3-D). QMT ships pandas 0.22, where get_financial_data with
+    # several stocks AND several dates still returns one. A Panel has no
+    # .columns and no .index, so it falls past the DataFrame and Series
+    # branches all the way to the __dict__ fallback -- and vars(panel) is
+    # {'_data': ..., 'is_copy': None}, which the underscore filter reduces to
+    # {'is_copy': None}. That is exactly what callers got back (issue #115):
+    # not an error, just the one public attribute the object happened to have.
+    #
+    # pandas removed Panel in 1.0, so the client cannot rebuild one even if we
+    # sent the axes. Send a DataFrame per item instead; it arrives as a dict.
+    if (hasattr(value, "major_axis") and hasattr(value, "minor_axis")
+            and hasattr(value, "items") and not isinstance(value, dict)):
+        try:
+            labels = [str(item) for item in value.items]
+            return {
+                "__bigqmt_type__": "Panel",
+                "items": labels,
+                "major_axis": [str(item) for item in value.major_axis],
+                "minor_axis": [str(item) for item in value.minor_axis],
+                "data": {str(item): to_jsonable(value[item]) for item in value.items},
+            }
+        except Exception:
+            return str(value)
     if hasattr(value, "tolist") and not isinstance(value, (str, bytes, bytearray)):
         try:
             return to_jsonable(value.tolist())

@@ -364,6 +364,13 @@ def _restore_jsonable(value):
                 return pd.DataFrame(value.get("records") or [], columns=value.get("columns") or None)
             except Exception:
                 return value.get("records") or []
+        if marker == "Panel":
+            # pandas dropped Panel in 1.0, so a 3-D object cannot be rebuilt on
+            # a modern client. It comes back as what a caller can actually use:
+            # {item: DataFrame} (issue #115). The axis labels ride along for
+            # anyone who needs to know how the cube was sliced.
+            return {key: _restore_jsonable(item)
+                    for key, item in (value.get("data") or {}).items()}
         if marker == "Series":
             try:
                 import pandas as pd

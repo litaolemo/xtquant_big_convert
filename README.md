@@ -426,10 +426,15 @@ python -m bigqmt_signal_trader.qmt_launcher restart --dir "D:\国金证券QMT交
 | `exe` | 直接起 `XtItClient.exe`，靠终端自身恢复会话 | 否 |
 | `login` | 起 exe 后向登录框输入账号密码 | 是，需 pywin32 |
 
-**关于「pywinauto/pyautogui 要求 Windows 处于登录状态」**：`login` 模式用的是
-`win32api.SendMessage` 直接投递到窗口句柄，不是 pyautogui 那种按屏幕坐标重放物理输入。
-前者不要求窗口置于前台，锁屏下也能工作（会话还在即可，完全注销则不行）。密码从
-环境变量 `BIGQMT_LOGIN_USER` / `BIGQMT_LOGIN_PASSWORD` 读，不走命令行参数——argv
+**`login` 模式需要未锁屏的交互式桌面。** 它用的是 `keybd_event` / `mouse_event`
+物理输入（经 ctypes），不是 `SendMessage`——消息式输入投不到 Qt 对话框的焦点控件上，
+当别的窗口在前台时会静默失败，什么也不输入。物理输入要求对话框在最前，所以启动前会
+先把它置顶并核验；锁屏或 RDP 注销的会话直接抛 `QmtLauncherError` 而不是打一半密码。
+
+> 需要**无人值守定时重启**的话，用 `linkmini` / `bat` / `exe` 三种模式，它们不碰登录框，
+> 锁屏也能跑。只有 `login` 受这条限制。
+
+密码从环境变量 `BIGQMT_LOGIN_USER` / `BIGQMT_LOGIN_PASSWORD` 读，不走命令行参数——argv
 对同机任何进程可见。
 
 两个设计要点：
