@@ -36,8 +36,26 @@ class FakeQmtContext(object):
         value = dt.datetime(2026, 1, 5, 9, 30)
         return int(value.timestamp() * 1000)
 
+    # Real QMT serves exactly open/high/low/close/quoter here and writes an
+    # ERROR line to its own log for anything else (issue #109). The fake used
+    # to answer preClose, which no QMT build does -- so the test passed while
+    # the code was spamming the terminal log for every bar.
+    HISTORY_FIELDS = ("open", "high", "low", "close", "quoter")
+
+    def __init__(self):
+        self.history_fields_asked = []
+
     def get_history_data(self, count, period, field):
+        self.history_fields_asked.append(field)
+        if field not in self.HISTORY_FIELDS:
+            return {}
         return {"600000.SH": self.values.get(field, [])}
+
+    def get_market_data_ex(self, fields, stock_code, period="follow", count=-1, **kwargs):
+        field = fields[0]
+        if field not in self.values:
+            return {}
+        return {stock_code[0]: {field: self.values[field]}}
 
     def set_account(self, account_id):
         self.account_id = account_id
@@ -51,6 +69,16 @@ class QmtBarExtractorTest(unittest.TestCase):
         self.assertEqual(row["datetime"], "2026-01-05 09:30:00")
         self.assertEqual(row["open"], 10.0)
         self.assertEqual(row["prev_close"], 9.8)
+
+    def test_it_never_asks_get_history_data_for_a_field_it_lacks(self):
+        """Every such ask is an ERROR line in QMT's log, not a quiet miss."""
+        context = FakeQmtContext()
+
+        QmtBarExtractor().extract(context)
+
+        unsupported = [f for f in context.history_fields_asked
+                       if f not in FakeQmtContext.HISTORY_FIELDS]
+        self.assertEqual(unsupported, [])
 
     def test_qmt_entry_is_isolated_and_binds_native_order_callbacks(self):
         path = os.path.join(SRC, "BIGQMT_ZMQ_BACKTEST.py")

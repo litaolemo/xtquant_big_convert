@@ -12,10 +12,21 @@ class ZmqBacktestServer(object):
         self.poll_ms = int(poll_ms)
         self._stop_event = threading.Event()
         self._ready_event = threading.Event()
+        self._stopped_event = threading.Event()
         self.actual_endpoint = None
+        self.bind_error = None
 
     def wait_until_ready(self, timeout_seconds=None):
         return self._ready_event.wait(timeout_seconds)
+
+    def wait_until_stopped(self, timeout_seconds=None):
+        """True once the socket is closed and the port is free again.
+
+        stop() only sets a flag; the serving thread notices up to poll_ms
+        later and closes the socket after that. A re-run that binds in
+        between gets EADDRINUSE (issue #109).
+        """
+        return self._stopped_event.wait(timeout_seconds)
 
     def stop(self):
         self._stop_event.set()
@@ -29,13 +40,21 @@ class ZmqBacktestServer(object):
         socket.setsockopt(zmq.RCVHWM, 1000)
         socket.setsockopt(zmq.SNDHWM, 1000)
         try:
-            if self.endpoint.endswith(":0"):
-                base = self.endpoint.rsplit(":", 1)[0]
-                port = socket.bind_to_random_port(base)
-                self.actual_endpoint = "%s:%d" % (base, port)
-            else:
-                socket.bind(self.endpoint)
-                self.actual_endpoint = self.endpoint
+            try:
+                if self.endpoint.endswith(":0"):
+                    base = self.endpoint.rsplit(":", 1)[0]
+                    port = socket.bind_to_random_port(base)
+                    self.actual_endpoint = "%s:%d" % (base, port)
+                else:
+                    socket.bind(self.endpoint)
+                    self.actual_endpoint = self.endpoint
+            except Exception as exc:
+                # Keep the reason: the caller only sees "failed to bind"
+                # otherwise, and the reason is nearly always a previous run
+                # still holding the port (issue #109). Raising it on this
+                # daemon thread would only print a traceback nobody reads.
+                self.bind_error = exc
+                return
             self._ready_event.set()
             poller = zmq.Poller()
             poller.register(socket, zmq.POLLIN)
@@ -63,3 +82,5 @@ class ZmqBacktestServer(object):
         finally:
             self._ready_event.set()
             socket.close(linger=0)
+            # Only now is the endpoint actually free.
+            self._stopped_event.set()
