@@ -1147,20 +1147,42 @@ class BigQmtXtData:
             rpc_timeout = timeout_seconds
         else:
             rpc_timeout = 30 if upper_codes & {"SH", "SZ", "BJ", "HK"} else None
+        failure = None
         try:
             data = self.client.call(
                 "get_full_tick", _full_tick_params(codes, types),
                 timeout_seconds=rpc_timeout) or {}
-        except Exception:
+        except Exception as exc:
             data = None
+            failure = exc
             if not self._can_fall_back_to_markets(codes, upper_codes):
                 raise
         if self._should_fall_back(codes, upper_codes, data):
-            recovered = self._full_tick_via_markets(codes, rpc_timeout, types)
+            fallback_errors = []
+            recovered = self._full_tick_via_markets(
+                codes, rpc_timeout, types, errors=fallback_errors)
             if recovered is not None:
                 return recovered
-            if data is None:
-                raise
+            if failure is not None:
+                # A bare `raise` here has no active exception -- the except
+                # block above has already exited -- so it produced
+                # "RuntimeError: No active exception to reraise" and buried
+                # the real timeout (reported on issue #104). Re-raise the
+                # actual failure, and say why the recovery did not help.
+                if fallback_errors:
+                    log.warning(
+                        "get_full_tick: %d codes failed directly (%s) and the "
+                        "market re-read failed too (%s: %s); raising the "
+                        "original failure.",
+                        len(codes), failure,
+                        fallback_errors[-1].__class__.__name__,
+                        fallback_errors[-1])
+                else:
+                    log.warning(
+                        "get_full_tick: %d codes failed directly (%s) and "
+                        "could not be recovered from a market read.",
+                        len(codes), failure)
+                raise failure
         return data or {}
 
     def _can_fall_back_to_markets(self, codes, upper_codes):
@@ -1181,7 +1203,7 @@ class BigQmtXtData:
         # than was asked for (issue #104).
         return len(data) < len(set(str(c) for c in codes))
 
-    def _full_tick_via_markets(self, codes, rpc_timeout, types=None):
+    def _full_tick_via_markets(self, codes, rpc_timeout, types=None, errors=None):
         """Read the exchange(s) these codes live on, then filter to them.
 
         A long explicit list is one RPC carrying one timeout, so it either fits
@@ -1213,7 +1235,11 @@ class BigQmtXtData:
                     for key, value in snapshot.items():
                         if str(key) in wanted:
                             merged[key] = value
-            except Exception:
+            except Exception as exc:
+                # Swallowing the reason here left the caller with nothing to
+                # report; hand it back so the raise can name it (issue #104).
+                if errors is not None:
+                    errors.append(exc)
                 return None
             if len(merged) >= len(wanted):
                 break          # everything asked for; no need to widen
