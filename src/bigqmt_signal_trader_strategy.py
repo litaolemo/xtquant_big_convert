@@ -805,6 +805,10 @@ def init(ContextInfo):
 
     # 启动时自动诊断：检测服务状态 + 关键函数绑定，方便发现问题
     _diag_startup(ContextInfo, config)
+    try:
+        _start_context_warmup(ContextInfo, config)
+    except Exception as exc:
+        _log_startup_error("context warmup failed to start: %s" % exc)
     return app
 
 
@@ -918,6 +922,66 @@ def _diag_startup(ContextInfo, config):
 
     print("[bigqmt_diag] diagnostics complete")
     print("=" * 60)
+
+
+# ContextInfo families whose FIRST call after a restart can cost minutes.
+#
+# get_full_tick is already exercised by _diag_startup, on the main thread, and
+# comes back in milliseconds. get_financial_data is not, and it was measured at
+# 346 SECONDS on its first call after a restart -- while QMT itself was healthy
+# (whole-quote data flowing, threadpool alive) and the main strategy thread was
+# idle. Every later call that day took under a second, including codes and
+# tables never asked for before, so it is a one-time cost and not a per-code
+# cache miss.
+#
+# That block lands on the RPC listener thread, which serves one request at a
+# time, so it takes the whole bridge down with it: every queued request times
+# out and the client sees a dead bridge.
+#
+# Warming does not make the cost cheaper. It moves it to a known moment, onto a
+# thread nobody is waiting on, with a log line saying what is happening --
+# instead of arriving as an unexplained freeze the first time a caller asks.
+#
+# Deliberately NOT on the main thread: _diag_startup runs there during init, and
+# a 346-second call in init would freeze startup before the adjust timer is even
+# scheduled -- worse than the problem.
+CONTEXT_WARMUP_PROBES = (
+    ("get_financial_data",
+     lambda ctx: ctx.get_financial_data(
+         ["CAPITALSTRUCTURE.total_capital"], ["000001.SZ"], "", "", "report_time")),
+)
+
+
+def _context_warmup_loop(context_info):
+    for name, probe in CONTEXT_WARMUP_PROBES:
+        started = time.time()
+        print("[bigqmt_warmup] %s: first call after a restart can take "
+              "minutes; running it now so a caller does not have to wait" % name)
+        try:
+            probe(context_info)
+            elapsed = time.time() - started
+        except Exception as exc:
+            print("[bigqmt_warmup] %s failed after %.1fs: %s"
+                  % (name, time.time() - started, str(exc)[:120]))
+            continue
+        if elapsed > 10.0:
+            print("[bigqmt_warmup] %s warm after %.1fs -- that wait is now "
+                  "paid; callers should see sub-second responses" % (name, elapsed))
+        else:
+            print("[bigqmt_warmup] %s warm in %.2fs" % (name, elapsed))
+
+
+def _start_context_warmup(context_info, config):
+    """Kick the warmup onto a daemon thread. Never blocks init."""
+    flag = dict(config.get("rpc") or {}).get("warm_context_data", True)
+    if isinstance(flag, str):
+        flag = flag.strip().lower() not in ("0", "false", "no", "off", "")
+    if not flag:
+        return
+    thread = threading.Thread(
+        target=_context_warmup_loop, args=(context_info,),
+        name="bigqmt-context-warmup", daemon=True)
+    thread.start()
 
 
 def _pump_download_jobs(context_info, config):
