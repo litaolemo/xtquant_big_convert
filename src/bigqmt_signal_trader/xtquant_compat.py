@@ -933,8 +933,9 @@ def _notice_field_list_cost(field_list):
     """Say once that naming fields is what enables the fast path.
 
     Not a warning about a mistake: an empty field_list correctly returns all 11
-    columns and only RPC can do that. But the 30x is invisible unless someone
-    tells you it exists (issue #104)."""
+    columns and only RPC can do that. But the speedup is invisible unless
+    someone tells you it exists (issue #104). Asking for a field the direct
+    path lacks is safe -- it falls back to RPC rather than returning NaN."""
     if field_list or _FIELD_LIST_NOTICE["shown"]:
         return
     _FIELD_LIST_NOTICE["shown"] = True
@@ -942,8 +943,10 @@ def _notice_field_list_cost(field_list):
         log.info(
             "get_market_data_ex with an empty field_list returns all 11 columns "
             "and must go over RPC. If the six OHLCV columns %s are enough, pass "
-            "them as field_list -- that path is served by FormulaServer, ~30x "
-            "faster (0.03s vs 0.97s measured).", ", ".join(DIRECT_PATH_FIELDS))
+            "them as field_list -- that path is served by FormulaServer, 0.015s "
+            "against 5.8s measured. Naming preClose / suspendFlag / "
+            "settelementPrice / openInterest falls back to RPC, so a wider "
+            "field_list is safe, just not faster.", ", ".join(DIRECT_PATH_FIELDS))
     except Exception:
         pass
 
@@ -1347,11 +1350,15 @@ class BigQmtXtData:
         ``chunk_size=0`` restores the old single-request behaviour.
 
         An empty ``field_list`` means "every field", which only the RPC path can
-        answer -- FormulaServer serves the six OHLCV columns and returns NaN for
-        settelementPrice / openInterest / preClose / suspendFlag, where RPC has
-        real values (preClose 9.07 against nan, measured). So the default stays
-        on RPC rather than quietly handing back NaN; naming the six fields you
-        actually want is what unlocks the ~30x direct path (issue #104).
+        answer: FormulaServer has the six bar columns plus time, and not the
+        four daily ones (settelementPrice, openInterest, preClose,
+        suspendFlag). Naming the fields you actually want is what unlocks the
+        direct path -- 0.015s against 5.8s, measured (issue #104).
+
+        Asking it for a field it lacks is now refused at the router and served
+        by RPC instead. It used to answer with a column of NaN, so naming all
+        eleven columns looked like a free speedup and quietly cost four of them
+        (see formula_server.SERVED_FIELDS).
         """
         _notice_field_list_cost(field_list)
         codes = list(stock_list or [])

@@ -486,11 +486,38 @@ def _weight_in_index_params(params):
     return {"indexCode": str(index_code), "stockCode": str(stock_code)}
 
 
+# What FormulaServer actually answers with data, measured against a live
+# terminal. It accepts ANY field name and returns a column either way -- the
+# ones outside this set come back as all-NaN, which looks like an answer and
+# is not:
+#
+#     field_list=[...11 names...]  0.015s  preClose=nan   suspendFlag=nan
+#     field_list=[]                (RPC)   preClose=9.0   suspendFlag=0
+#
+# Same shape, same column count, twelve times faster, silently wrong. The four
+# it cannot serve are daily metadata (settelementPrice, openInterest, preClose,
+# suspendFlag) rather than bar data, which is why they are missing here.
+#
+# A whitelist, not a blacklist: an unfamiliar field name goes to RPC and is
+# merely slow. Guessing that it might be served risks being quietly wrong,
+# which is the failure this guard exists to remove.
+SERVED_FIELDS = frozenset((
+    "open", "high", "low", "close", "volume", "amount", "time", "stime",
+))
+
+
 def _market_data_params(params):
     fields = _as_list(_first(params, ("field_list", "fields"), None))
     codes = _as_list(_first(params, ("stock_list", "stock_code", "stockCodes"), None))
     if not fields or not codes:
         raise ValueError("field_list and stock_list are required")
+    unservable = sorted(set(str(field) for field in fields) - SERVED_FIELDS)
+    if unservable:
+        # Same rule as the dividend_type guard below: a request this path
+        # cannot answer honestly goes to RPC instead of coming back as NaN.
+        raise ValueError(
+            "field(s) %s come back as NaN here; RPC has the real values"
+            % ", ".join(unservable))
     dividend_type = str(params.get("dividend_type") or "none").lower()
     # FormulaServer returns byte-identical bars for dividendType none/front, so
     # adjustment is not applied here. Serving an adjusted request from this path
