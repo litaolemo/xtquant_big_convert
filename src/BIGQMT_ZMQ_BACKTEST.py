@@ -78,6 +78,39 @@ def _find_source(name):
     raise ModuleNotFoundError("local source not found: %s" % name, name=name)
 
 
+# A file that arrived corrupted fails with a bare NameError naming a long
+# token, which says nothing about the file being broken (issue #102). Python
+# read line 1 as a variable name because that is all it was: the file had been
+# saved from something other than the source -- a download page, or a mirror
+# that served a token instead of the file. Every version behaves the same way,
+# so "try a different version" sends people in the wrong direction.
+_TOKEN_CHARS = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_=+/")
+
+
+def _looks_like_a_token_not_python(source):
+    """True when the first real line cannot be Python at all.
+
+    Deliberately narrow. A Python line this long with no whitespace and
+    nothing outside the base64 alphabet would have to be a bare identifier,
+    which is already broken -- so a false positive costs a clearer message on
+    code that was going to fail anyway.
+    """
+    try:
+        if isinstance(source, bytes):
+            source = source.decode("utf-8", "replace")
+        for line in source.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            return (len(line) >= 40
+                    and not any(char.isspace() for char in line)
+                    and all(char in _TOKEN_CHARS for char in line))
+    except Exception:
+        pass
+    return False
+
+
 def _load_local_module(name):
     existing = sys.modules.get(name)
     if existing is not None:
@@ -102,6 +135,13 @@ def _load_local_module(name):
         exec(compile(source, source_path, "exec"), module.__dict__)
     except Exception:
         sys.modules.pop(name, None)
+        if _looks_like_a_token_not_python(source):
+            raise RuntimeError(
+                "%s is not Python source -- its first line is one long token, "
+                "so the file was saved from something other than the code (a "
+                "download page, or a mirror that served a token). Fetch the "
+                "file again. A different version will not help; every version "
+                "fails the same way on this file." % source_path)
         raise
     if "." in name:
         parent_name, child_name = name.rsplit(".", 1)
