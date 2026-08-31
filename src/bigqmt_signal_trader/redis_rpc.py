@@ -181,6 +181,22 @@ METHOD_ALIASES = {
 
 BUY_ORDER_TYPES = {"23", "STOCK_BUY", "BUY", "B"}
 SELL_ORDER_TYPES = {"24", "STOCK_SELL", "SELL", "S"}
+
+# Futures op_types (0-22): direction is embedded in the type itself.
+# BUY-side: open long (0), close short today-first (2), close short
+# history-first (5), close short (6), open (8), close today-first (10),
+# close history-first (12), close (13), open long (14), close short
+# today-first (16), close short history-first (19), close short (20).
+FUTURE_BUY_OP_TYPES = {0, 2, 5, 6, 8, 10, 12, 13, 14, 16, 19, 20}
+# SELL-side: open short (1), close long today-first (3), close long
+# history-first (4), close long (7), open short (9), close long
+# today-first (11), close long history-first (15), open short (17),
+# close long today-first (18), close long history-first (21), close (22).
+FUTURE_SELL_OP_TYPES = {1, 3, 4, 7, 9, 11, 15, 17, 18, 21, 22}
+
+# ETF/stock option op_types (48-57).
+ETF_OPTION_BUY_OP_TYPES = {48, 50, 52, 54, 56}
+ETF_OPTION_SELL_OP_TYPES = {49, 51, 53, 55, 57}
 CANCELABLE_ORDER_STATUSES = {"50", "55"}
 SAFE_B64_PREFIX = "b64s:"
 SAFE_B64_DIGIT_ENCODE = str.maketrans("0123456789", "!#$%&()*~?")
@@ -896,16 +912,40 @@ class BigQmtRpcHandlers:
         Official strDatatype values: ACCOUNT / POSITION / POSITION_STATISTICS /
         ORDER / DEAL / TASK. Other strings (CREDIT etc.) are NOT supported by
         this API — use the dedicated functions below for margin queries.
+
+        account_type is resolved per-request: when the gateway's account_type
+        differs from the request's account (e.g. a single gateway serving
+        both STOCK and FUTURE accounts), the request's account_id determines
+        the correct account_type to pass to get_trade_detail_data.
         """
         account_id = self._request_account_id(params)
         gateway = self.order_gateway
         if gateway is None or gateway.get_trade_detail_data is None:
             return []
+        account_type = self._resolve_account_type(gateway, account_id)
         try:
-            rows = gateway.get_trade_detail_data(account_id, gateway.account_type, detail_type, strategy_name)
+            rows = gateway.get_trade_detail_data(account_id, account_type, detail_type, strategy_name)
             return _normalize_detail_rows(rows)
         except Exception:
             return []
+
+    def _resolve_account_type(self, gateway, account_id):
+        """Resolve account_type for a request.
+
+        When the request's account_id matches the gateway's account_id, use
+        the gateway's account_type directly. Otherwise, infer from the
+        account_id — if it looks like a futures/options account (by exchange
+        suffix on recent positions or by account_type_map when available),
+        return "FUTURE"; default to the gateway's account_type.
+        """
+        if str(account_id) == str(gateway.account_id):
+            return gateway.account_type
+        # Different account_id: check for an account_type_map attribute
+        # (set by dual-account deployments) or fall back to gateway default.
+        type_map = getattr(self, "_account_type_map", None)
+        if type_map and str(account_id) in type_map:
+            return type_map[str(account_id)]
+        return gateway.account_type
 
     def _handle_query_account_infos(self, params):
         # 账户信息 — get_trade_detail_data(ACCOUNT)
@@ -1117,6 +1157,26 @@ class BigQmtRpcHandlers:
             raise ValueError(
                 "order_type %s has no implicit buy/sell side; pass action "
                 "explicitly" % raw)
+        # Futures op_types (0-22) and ETF option op_types (48-57) carry
+        # direction in the type itself. Map to BUY/SELL and store the raw
+        # value for passorder forwarding (order_bigqmt.submit uses
+        # request.order_type to pass it through).
+        try:
+            op_int = int(raw)
+            if op_int in FUTURE_BUY_OP_TYPES:
+                params["_raw_order_type"] = op_int
+                return "BUY"
+            if op_int in FUTURE_SELL_OP_TYPES:
+                params["_raw_order_type"] = op_int
+                return "SELL"
+            if op_int in ETF_OPTION_BUY_OP_TYPES:
+                params["_raw_order_type"] = op_int
+                return "BUY"
+            if op_int in ETF_OPTION_SELL_OP_TYPES:
+                params["_raw_order_type"] = op_int
+                return "SELL"
+        except (TypeError, ValueError):
+            pass
         if raw in (None, ""):
             raise ValueError("action or order_type is required")
         # An order_type WAS supplied and was not recognised. Saying "required"
@@ -1145,9 +1205,21 @@ class BigQmtRpcHandlers:
             return "unknown version"
 
     def _credit_order_type_from_params(self, params):
-        """The MiniQMT order_type to forward, when it is a credit operation."""
+        """The MiniQMT order_type to forward, when it is a credit or
+        futures/option operation.
+
+        For credit operations, returns the raw value so submit() maps it
+        through credit_optype_of. For futures/options, returns the raw
+        integer op_type stored by _order_action_from_params so submit()
+        can forward it directly to passorder.
+        """
         raw = params.get("order_type")
-        return raw if _credit_optype_of(raw) is not None else None
+        if _credit_optype_of(raw) is not None:
+            return raw
+        raw_ot = params.get("_raw_order_type")
+        if raw_ot is not None:
+            return raw_ot
+        return None
 
     def _handle_submit_order(self, params):
         if self.order_gateway is None:

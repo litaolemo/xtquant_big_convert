@@ -244,6 +244,19 @@ class BigQmtOrderGateway:
             # bug behind issue #103 -- worse than the rejection it replaced,
             # because it places a real but different order.
             op_type = credit_optype
+        elif self.account_type and self.account_type.upper() in ("FUTURE", "STOCK_OPTION", "OPTION"):
+            # Futures/options carry open/close direction in the op_type
+            # (0-22 for futures, 48-57 for ETF options). When order_type
+            # is supplied (e.g. via RPC), forward it directly; otherwise
+            # fall back to BUY=14 / SELL=15 (futures open).
+            raw_op_type = getattr(request, "order_type", None)
+            if raw_op_type is not None:
+                try:
+                    op_type = int(raw_op_type)
+                except (TypeError, ValueError):
+                    op_type = 14 if action == SignalAction.BUY.value else 15
+            else:
+                op_type = 14 if action == SignalAction.BUY.value else 15
         elif action == SignalAction.BUY.value:
             op_type = 23
         elif action == SignalAction.SELL.value:
