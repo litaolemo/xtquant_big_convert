@@ -170,6 +170,8 @@ class ZmqTransport(RpcTransport):
             ),
             discovery_ttl_seconds=int(config.get("discovery_ttl_seconds", 300)),
             port_scan_range=int(config.get("port_scan_range", 50)),
+            stall_warn_seconds=float(config.get("stall_warn_seconds", 20.0)),
+            stall_check_seconds=float(config.get("stall_check_seconds", 5.0)),
         )
 
     # -- shared zmq context -----------------------------------------------
