@@ -15,6 +15,7 @@ must NOT be on the main thread: _diag_startup runs there during init, and a
 scheduled -- worse than the problem it set out to fix.
 """
 
+import datetime
 import io
 import os
 import re
@@ -39,26 +40,111 @@ def _strategy_namespace():
     """
     with io.open(STRATEGY, encoding="utf-8") as handle:
         source = handle.read()
-    start = source.index("CONTEXT_WARMUP_PROBES = (")
+    start = source.index("def _warm_financial_data(")
     end = source.index("def _pump_download_jobs(", start)
-    namespace = {"time": time, "threading": threading}
+    namespace = {"time": time, "threading": threading, "datetime": datetime}
     exec(compile(source[start:end], STRATEGY, "exec"), namespace)
     return namespace
 
 
 class FakeContext(object):
-    def __init__(self, delay=0.0, blow_up=False):
+    """Mirrors what the live terminal does: an empty date range returns None."""
+
+    def __init__(self, delay=0.0, blow_up=False, rows=159):
         self.calls = []
         self._delay = delay
         self._blow_up = blow_up
+        self._rows = rows
 
-    def get_financial_data(self, *args, **kwargs):
-        self.calls.append(args)
+    def get_financial_data(self, fields, codes, start_time, end_time, report_type):
+        self.calls.append((fields, codes, start_time, end_time, report_type))
         if self._delay:
             time.sleep(self._delay)
         if self._blow_up:
             raise RuntimeError("QMT said no")
-        return {}
+        if not start_time or not end_time:
+            return None            # measured: empty range fetches nothing
+        return list(range(self._rows))
+
+
+class RealRangeTest(unittest.TestCase):
+    """The first version passed "" for both dates and warmed nothing."""
+
+    def test_the_probe_asks_for_a_real_date_range(self):
+        namespace = _strategy_namespace()
+        context = FakeContext()
+
+        namespace["_warm_financial_data"](context)
+
+        _fields, _codes, start, end, _report = context.calls[0]
+        self.assertTrue(start, "start_time was empty -- fetches nothing")
+        self.assertTrue(end, "end_time was empty -- fetches nothing")
+
+    def test_the_range_is_eight_digit_dates(self):
+        namespace = _strategy_namespace()
+        context = FakeContext()
+
+        namespace["_warm_financial_data"](context)
+
+        _fields, _codes, start, end, _report = context.calls[0]
+        self.assertRegex(start, r"^\d{8}$")
+        self.assertRegex(end, r"^\d{8}$")
+
+    def test_the_range_is_not_empty(self):
+        namespace = _strategy_namespace()
+        context = FakeContext()
+
+        namespace["_warm_financial_data"](context)
+
+        _fields, _codes, start, end, _report = context.calls[0]
+        self.assertLess(start, end)
+
+    def test_it_actually_brings_rows_back(self):
+        namespace = _strategy_namespace()
+        context = FakeContext()
+
+        result = namespace["_warm_financial_data"](context)
+
+        self.assertEqual(namespace["_warmup_row_count"](result), 159)
+
+
+class EmptyResultIsReportedTest(unittest.TestCase):
+    """A warmup that warms nothing must not report success."""
+
+    def _run(self, context):
+        namespace = _strategy_namespace()
+        recorder = []
+        import builtins
+        saved = builtins.print
+        try:
+            builtins.print = lambda *a: recorder.append(" ".join(str(x) for x in a))
+            namespace["_context_warmup_loop"](context)
+        finally:
+            builtins.print = saved
+        return recorder
+
+    def test_nothing_fetched_says_so(self):
+        class Empty(FakeContext):
+            def get_financial_data(self, *args):
+                self.calls.append(args)
+                return None
+
+        lines = self._run(Empty())
+
+        self.assertTrue([l for l in lines if "returned NOTHING" in l], lines)
+
+    def test_a_real_fetch_reports_the_row_count(self):
+        lines = self._run(FakeContext())
+
+        warm = [l for l in lines if "warm in" in l or "warm after" in l]
+        self.assertTrue(warm, lines)
+        self.assertIn("159", warm[0])
+
+    def test_row_count_survives_an_object_without_len(self):
+        namespace = _strategy_namespace()
+
+        self.assertEqual(namespace["_warmup_row_count"](object()), -1)
+        self.assertEqual(namespace["_warmup_row_count"](None), 0)
 
 
 class ProbeTest(unittest.TestCase):
