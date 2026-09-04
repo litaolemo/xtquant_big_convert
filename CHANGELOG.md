@@ -3,6 +3,26 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [未发布]
+
+### 性能
+
+- **zmq 客户端不再把并发请求排成一队**（#186）：`send_request` 此前在**整个** send/poll/recv 周期内持 `_client_lock`，因为客户端只有一个 DEALER socket 而 zmq socket 不是线程安全的。于是多线程调用只能轮流来。实盘 4 并发实测：zmq 的 ping 从 2.4 只到 2.7 次每秒（drain 模式 10.2 到 10.2，纹丝不动），而没有这把锁的 redis 从 20.7 到 **143.3**。线程数在 zmq 上买不到任何东西。
+
+  改成 zmq 自己的答案 —— **每个调用线程一个 socket**，各自随机 IDENTITY，服务端 ROUTER 把回复路由回发起的那个线程 —— 而不是给共享 socket 加锁。`_client_lock` 现在只保护注册表。
+
+  一个线程一个 socket 的风险是泄漏：按请求开线程的调用方会给每个线程留一条到 ROUTER 的 TCP 连接。所以建新 socket 时顺带回收已退出线程的（它们的 owner 已经消失，不可能有人正在其中收发，这正是可以从别的线程关掉它们的理由），`stop()` 关掉全部。
+
+  **实盘未验证**：这是纯客户端改动，而当前部署跑的是 redis transport，根本不经过这段代码；要验它得把终端换成 zmq 再重启。离线用假 socket 钉住了真正的回归 —— 4 个并发调用在一次 0.3 秒往返里必须重叠而不是排队（修复前 4 例红）。
+
+### 修复
+
+- **redis transport 停止时不再甩完整 traceback**（#189）：`stop()` 在监听线程正停在 `get_message(timeout=1.0)` 时把 pubsub 关掉，socket 在它脚下失效 —— Windows 上是 `WinError 10038` 包在 `redis.exceptions.ConnectionError` 里，而循环的裸 `except Exception` 把整个栈打出来，实盘一次重启三条。
+
+  纯噪声，但代价是真的：**正常关闭和真故障长得一模一样**，读的人学会忽略这个 traceback 之后，真出问题那次也会被忽略。现在 `except` 里先看 `self._running`，已经在停就安静退出；队列循环同样处理。
+
+  **实盘前后对照**：同一台桥、同一个 reload 操作，只换代码 —— 拆旧代码的那次 **3 个 traceback**（正是报告里的数量），拆新代码的那次 **0 个**。离线四例覆盖两个循环的安静退出，以及**运行中仍然大声报错**的负面对照 —— 让关闭安静下来不能顺带让故障也安静。
+
 ## [0.3.21] - 2026-09-04
 
 ### 性能
