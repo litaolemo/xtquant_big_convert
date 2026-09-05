@@ -97,6 +97,31 @@ class MultiAccountRpcServiceManager:
                 s.stop()
             except Exception:
                 pass
+            # Close secondary's transport listen_redis so zombie brpop/pubsub
+            # threads exit immediately instead of surviving the join timeout
+            # and competing for requests after reload.  The primary's
+            # listen_redis is shared with the service-level attribute and
+            # must NOT be closed here — it is managed by the primary's own
+            # stop() lifecycle.
+            if s is not self._primary:
+                transport = getattr(s, "_transport", None)
+                if transport is not None:
+                    lr = getattr(transport, "listen_redis", None)
+                    if lr is not None:
+                        try:
+                            lr.close()
+                        except Exception:
+                            pass
+                # Also close the service-level listen_redis if it is a
+                # separate connection (not shared with primary).
+                slr = getattr(s, "listen_redis", None)
+                if slr is not None and slr is not getattr(
+                    self._primary, "listen_redis", None
+                ):
+                    try:
+                        slr.close()
+                    except Exception:
+                        pass
 
     def drain_request_queue(self, max_items=20):
         return sum(
