@@ -3,7 +3,7 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
-## [未发布]
+## [0.3.22] - 2026-09-05
 
 ### 新增
 
@@ -26,6 +26,22 @@
   **实盘未验证**：这是纯客户端改动，而当前部署跑的是 redis transport，根本不经过这段代码；要验它得把终端换成 zmq 再重启。离线用假 socket 钉住了真正的回归 —— 4 个并发调用在一次 0.3 秒往返里必须重叠而不是排队（修复前 4 例红）。
 
 ### 修复
+
+- **批量 RPC 超时后不再回退重提 —— 双倍下单（#195，实盘 100 单变 200 单）**：`order_stock_async` 的积压走一个批量 RPC，服务端在 adjust 线程上串行执行（柜台断连时 ~300ms/项，100 项 >30s 默认超时）。客户端超时放弃后，旧兜底「逐笔重提」启动 —— 但**服务端的批量还在跑而且会跑完**，于是 100 + 100 = 200 单。超时不等于没执行。
+
+  现在 `call()` 对**服务端已应答**的错误改抛 `RpcServerRepliedError`（`RuntimeError` 子类，向后兼容）：批量 handler 只在逐项循环之前抛错，所以「被拒绝 = 一笔没跑」，只有它和「返回空结果」允许回退逐笔。超时/断连一律视为**生死未知**：逐项回调 `on_order_error`，信息明说「orders MAY BE LIVE -- query orders before retrying」，**不再自动重提**。
+
+  `order_stock_batch` 的等待时长随 N 缩放（`max(客户端默认, 15s + 0.5s×N)`，显式 `timeout_seconds` 优先）——让客户端比服务端最慢的合法批量活得久，而不是中途放弃它。服务端新增每个批量一行日志（items/placed/failed/耗时）：超时后仍跑完的批量此前在服务端无迹可寻。
+
+  **实盘 A/B 复现**（周六，废单场景，200 笔逆回购）：0.3.21 旧客户端 → 身份库铁证 **400/200**（双倍原样复现）；修复版客户端同场景 → **零重提**（200 个 MAY-BE-LIVE 错误），服务端最终只执行了原始的 200。顺带修了三个 #185 时期测试 fake 缺 `idempotent` 形参的间歇性失败。
+
+- **多账户 `stop()` 时关闭辅助 listen_redis 连接**（#194）：`MultiAccountRpcServiceManager.stop()` 此前漏关多账户管理器为监听建的第二个 redis 连接，进程退出时可能挂住。
+
+- **runtime 入口转发 quote_push 配置**（#198）：`BIGQMT_REDIS_CONFIG` 里的 `quote_push` 块此前被 runtime 丢弃，策略端永远拿到默认值。
+
+### 测试
+
+- **#190 报告场景固化为端到端回归**（#192）：20 笔无 remark 的 `order_stock_async` 紧凑循环，经真实 worker/批量/回调分发 + 真实服务端 handler（dry-run 网关），钉住 20/20 进入提交路径、回调按 seq 序、自动补的 tag 不塌缩。已验证对修复前代码为红。
 
 - **redis transport 停止时不再甩完整 traceback**（#189）：`stop()` 在监听线程正停在 `get_message(timeout=1.0)` 时把 pubsub 关掉，socket 在它脚下失效 —— Windows 上是 `WinError 10038` 包在 `redis.exceptions.ConnectionError` 里，而循环的裸 `except Exception` 把整个栈打出来，实盘一次重启三条。
 
