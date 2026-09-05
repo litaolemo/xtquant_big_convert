@@ -193,13 +193,18 @@ class DeadlineTest(_Service):
 
     def test_the_client_turns_that_into_an_exception_not_a_minus_one(self):
         """xtquant_compat raises on server_error, which is the whole reason
-        the deadline path sets one."""
+        the deadline path sets one. RpcServerRepliedError is a RuntimeError
+        subclass, so callers catching RuntimeError see no change; the distinct
+        type is what lets the batch path tell a refused batch (nothing ran)
+        from a timed-out one (may be running)."""
         import inspect
 
         from bigqmt_signal_trader import xtquant_compat
 
         source = inspect.getsource(xtquant_compat)
-        self.assertIn('raise RuntimeError("Big QMT %s server_error: %s"', source)
+        self.assertIn('raise RpcServerRepliedError(', source)
+        self.assertIn('"Big QMT %s server_error: %s"', source)
+        self.assertTrue(issubclass(xtquant_compat.RpcServerRepliedError, RuntimeError))
 
 
 class MissingOrderIsStillMissingTest(_Service):

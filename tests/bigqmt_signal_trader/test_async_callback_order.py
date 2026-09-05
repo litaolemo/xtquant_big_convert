@@ -79,7 +79,7 @@ class AsyncCallbackOrderTest(unittest.TestCase):
 
         trader.order_stock_result = submit or default_submit
 
-        def default_batch(account, orders, batch_id=""):
+        def default_batch(account, orders, batch_id="", idempotent=True):
             # The worker batches a backlog of >=2 into one order_stock_batch
             # (issue #181); route each item through the same stub the single
             # path uses so both paths behave identically under test.

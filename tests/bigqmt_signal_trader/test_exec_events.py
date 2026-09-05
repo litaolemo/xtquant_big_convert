@@ -794,7 +794,7 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
         def fake(*args, **kwargs):
             return {"order_sys_id": "sys-%s" % args[1]}
 
-        def fake_batch(account, orders, batch_id=""):
+        def fake_batch(account, orders, batch_id="", idempotent=True):
             # Same per-item answer as fake, via the batch seam the worker
             # picks for a backlog of >=2.
             return [{
