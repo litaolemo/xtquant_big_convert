@@ -27,6 +27,14 @@
 
 提 bug 和功能请求请走 [issue](https://github.com/litaolemo/xtquant_big_convert/issues)：群里的讨论不会被检索到，而 issue 会 —— 下一个遇到同样问题的人能搜到。
 
+### 赞赏
+
+如果这个项目帮到了你，欢迎给开发者买杯咖啡（完全自愿，不影响任何功能）：
+
+<img src="docs/assets/appreciation-qr.png" alt="LEMO 的微信赞赏码" width="260">
+
+> 微信扫码赞赏。
+
 ---
 
 ### 配置向导：`bigqmt-init`
