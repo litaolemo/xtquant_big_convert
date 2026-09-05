@@ -568,6 +568,70 @@ class BigQmtOrderGateway:
             message="passorder submitted",
         )
 
+    def passorder_passthrough(
+        self,
+        op_type,
+        order_type,
+        account_id,
+        order_code,
+        price_type,
+        price,
+        volume,
+        strategy_name,
+        quick_trade,
+        user_order_id,
+        dry_run=False,
+    ):
+        """Call QMT's native passorder with the 11-arg signature untouched.
+
+        The deliberate escape hatch (route 2): the caller controls every
+        argument, including orderType (股/手 vs 金额 vs 比例 vs 组合) and
+        quickTrade, which submit()/order_stock do not expose. NONE of submit()'s
+        safety nets run here -- no opType validation (a credit or futures opType
+        that submit() would guard becomes the caller's responsibility, see
+        #103), no code case-normalization (#95), no settlement read-back. The
+        caller asked for the native API, so they own its contract.
+
+        ContextInfo is supplied here, not by the caller: passorder reads
+        internals off the raw QMT ContextInfo (e.g. .request_id) and it only
+        exists inside QMT, so it can never travel over RPC.
+
+        ``dry_run`` resolves everything and returns the exact 11-tuple that
+        WOULD be sent, without calling passorder. It is how this path is
+        verified against the live terminal without placing an order, and it
+        lets a caller confirm their own argument mapping the same way.
+
+        passorder itself is async and returns None (QMT assigns the 合同编号
+        later, on the order_callback push), so there is no order id to return
+        synchronously -- exactly as with order_stock_async.
+        """
+        passorder = self._require_passorder()
+        args = [
+            int(op_type),
+            int(order_type),
+            str(account_id or self.account_id),
+            str(order_code),                 # RAW: no normalization (#95)
+            int(price_type),
+            float(price),
+            int(volume),
+            str(strategy_name or ""),
+            int(quick_trade),
+            str(user_order_id or ""),
+        ]
+        if dry_run:
+            return {
+                "dry_run": True,
+                "would_call": "passorder",
+                "args": list(args),
+                "context_info_supplied": self.context_info is not None,
+            }
+        passorder(*(args + [self.context_info]))
+        return {
+            "dry_run": False,
+            "submitted": True,
+            "user_order_id": args[9],
+        }
+
     def cancel(self, order_ref, account_id=None):
         cancel_func = self._require_cancel()
         aid = account_id or self.account_id

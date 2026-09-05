@@ -4263,6 +4263,48 @@ class BigQmtXtTrader:
             timeout_seconds=timeout_seconds,
         ) or []
 
+    def passorder(self, op_type, order_type, account, order_code, price_type,
+                  price, volume, strategy_name="", quick_trade=None,
+                  user_order_id="", dry_run=False):
+        """Call QMT's native passorder straight through (route 2).
+
+        The argument order matches QMT's own signature -- opType, orderType,
+        accountid, orderCode, prType, price, volume, strategyName, quickTrade,
+        userOrderId -- with ContextInfo supplied server-side (it only exists
+        inside QMT). Unlike order_stock this exposes orderType and quickTrade,
+        and runs NONE of order_stock's safety nets: no opType validation, no
+        code case-normalization (#95), no settlement read-back. You own the
+        native contract.
+
+        order_type / quick_trade default to the server config (1101 / 2) when
+        left None, so the common case still reads like order_stock.
+
+        passorder is async and returns no order id (QMT assigns the 合同编号
+        later on the order_callback push), same as order_stock_async. This
+        returns the server's ack dict.
+
+        dry_run=True returns the exact 11-tuple the server WOULD pass to
+        passorder without placing an order -- use it to check your mapping.
+        """
+        account_id = _account_id(account, self.client.account_id)
+        params = {
+            "account_id": account_id,
+            "op_type": op_type,
+            "order_code": order_code,
+            "price_type": price_type,
+            "price": price,
+            "volume": volume,
+            "strategy_name": strategy_name,
+            "user_order_id": user_order_id,
+        }
+        if order_type is not None:
+            params["order_type"] = order_type
+        if quick_trade is not None:
+            params["quick_trade"] = quick_trade
+        if dry_run:
+            params["dry_run"] = True
+        return self.client.call("passorder", params, account_id=account_id)
+
     def cancel_order_stock_sysid(self, account, market, order_sysid):
         """MiniQMT contract: 0 on success, -1 on failure (issue #113).
 
