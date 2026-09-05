@@ -189,6 +189,14 @@ class RedisTransport(RpcTransport):
                         continue
                     self._handle_received_payload(message.get("data"), "pubsub")
             except Exception:
+                if not self._running:
+                    # stop() closes the pubsub while this thread is parked in
+                    # get_message, so the socket dies under it -- WinError
+                    # 10038 wrapped in a redis ConnectionError. That is the
+                    # normal shutdown path, and printing a full traceback for
+                    # it made every restart look like a failure and taught
+                    # readers to skip the one that is not (#189).
+                    break
                 print(
                     "%s listener failed:\n%s" % (self.print_prefix, traceback.format_exc())
                 )
@@ -221,6 +229,8 @@ class RedisTransport(RpcTransport):
                     )
                     self._handle_received_payload(raw, "queue")
             except Exception:
+                if not self._running:
+                    break          # shutdown, same as the pubsub loop (#189)
                 print(
                     "%s queue listener failed:\n%s"
                     % (self.print_prefix, traceback.format_exc())

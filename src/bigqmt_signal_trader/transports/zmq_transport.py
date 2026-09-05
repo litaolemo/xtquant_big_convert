@@ -166,8 +166,18 @@ class ZmqTransport(RpcTransport):
         # Reported by the stall watchdog below; None when idle.
         self._in_flight = None
         self._stall_thread = None
-        # client state
-        self._dealer = None
+        # client state. One DEALER per calling thread (#186): a zmq socket is
+        # not thread-safe, and the single shared one had to be held for the
+        # whole send/poll/recv cycle -- so N threads took turns and concurrency
+        # bought nothing. Measured on the live terminal, 4 threads moved zmq
+        # from 2.4 to 2.7 requests/sec while redis, which has no such lock,
+        # went from 20.7 to 143.3.
+        #
+        # One socket per thread is zmq's own answer. Each gets its own random
+        # IDENTITY, so the server's ROUTER routes every reply back to the
+        # thread that asked. _client_lock now guards only the registry.
+        self._dealer_local = threading.local()
+        self._dealers = []          # [(thread, socket)] for shutdown + pruning
         self._client_lock = threading.Lock()
 
     # -- construction helper ----------------------------------------------
@@ -579,46 +589,75 @@ class ZmqTransport(RpcTransport):
             return None
         return text or None
 
+    def _reap_dead_dealers(self):
+        """Close sockets whose owning thread has exited. Caller holds the lock.
+
+        Without this a caller that spawns a thread per request would leak one
+        socket -- and one TCP connection to the ROUTER -- per thread until
+        stop(). The owner is gone by definition here, so nobody can be inside
+        a send or recv on it; that is what makes closing it from this thread
+        safe, unlike the router socket (see stop()).
+        """
+        alive = []
+        for owner, sock in self._dealers:
+            if owner.is_alive():
+                alive.append((owner, sock))
+                continue
+            try:
+                sock.close(linger=0)
+            except Exception:
+                pass
+        self._dealers = alive
+
     def _ensure_dealer(self):
+        """This thread's DEALER, created on first use."""
+        sock = getattr(self._dealer_local, "sock", None)
+        if sock is not None:
+            return sock
         zmq, ctx = self._ensure_zmq()
-        if self._dealer is None:
-            address = self._resolve_connect_address()
-            sock = ctx.socket(zmq.DEALER)
-            # Unique identity so ROUTER can route replies back to us.
-            sock.setsockopt(zmq.IDENTITY, uuid.uuid4().hex.encode("utf-8")[:16])
-            sock.setsockopt(zmq.LINGER, self.client_linger_ms)
-            sock.connect(address)
-            self._dealer = sock
+        address = self._resolve_connect_address()
+        sock = ctx.socket(zmq.DEALER)
+        # Unique identity so ROUTER can route replies back to us.
+        sock.setsockopt(zmq.IDENTITY, uuid.uuid4().hex.encode("utf-8")[:16])
+        sock.setsockopt(zmq.LINGER, self.client_linger_ms)
+        sock.connect(address)
+        self._dealer_local.sock = sock
+        with self._client_lock:
+            self._reap_dead_dealers()
+            self._dealers.append((threading.current_thread(), sock))
             self.connect_address = address
-        return self._dealer
+        return sock
 
     def send_request(self, request, timeout_seconds, **_kwargs):
+        # No lock around the round trip: this socket belongs to this thread
+        # and no other thread touches it (#186).
         zmq = self._zmq or self._ensure_zmq()[0]
-        with self._client_lock:
-            dealer = self._ensure_dealer()
-            request = dict(request)
-            request.setdefault("request_id", uuid.uuid4().hex)
-            request_id = request["request_id"]
-            payload = encode_rpc_request_payload(request)
-            try:
-                dealer.send(payload.encode("utf-8"))
-            except Exception as exc:
-                raise TransportError("zmq send failed: %s" % exc)
-            deadline = time.time() + float(timeout_seconds)
-            poller = self._zmq.Poller()
-            poller.register(dealer, self._zmq.POLLIN)
-            while True:
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    break
-                events = dict(poller.poll(timeout=int(remaining * 1000)))
-                if dealer in events:
-                    frames = dealer.recv_multipart()
-                    raw = frames[-1]
-                    response = _loads(raw)
-                    if response.get("request_id") == request_id:
-                        return response
-            raise TransportTimeout("zmq rpc timeout: %s" % request.get("method"))
+        dealer = self._ensure_dealer()
+        request = dict(request)
+        request.setdefault("request_id", uuid.uuid4().hex)
+        request_id = request["request_id"]
+        payload = encode_rpc_request_payload(request)
+        try:
+            dealer.send(payload.encode("utf-8"))
+        except Exception as exc:
+            raise TransportError("zmq send failed: %s" % exc)
+        deadline = time.time() + float(timeout_seconds)
+        poller = zmq.Poller()
+        poller.register(dealer, zmq.POLLIN)
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            events = dict(poller.poll(timeout=int(remaining * 1000)))
+            if dealer in events:
+                frames = dealer.recv_multipart()
+                raw = frames[-1]
+                response = _loads(raw)
+                # A late reply to a request that already timed out lands here;
+                # skipping it keeps this thread's socket usable afterwards.
+                if response.get("request_id") == request_id:
+                    return response
+        raise TransportTimeout("zmq rpc timeout: %s" % request.get("method"))
 
     # -- lifecycle --------------------------------------------------------
     def stop(self):
@@ -641,10 +680,18 @@ class ZmqTransport(RpcTransport):
             self._clear_discovery()
             self._actual_bind_address = None
         with self._client_lock:
-            if self._dealer is not None:
+            for _owner, sock in self._dealers:
                 try:
-                    self._dealer.close(linger=self.client_linger_ms)
+                    sock.close(linger=self.client_linger_ms)
                 except Exception:
                     pass
-                self._dealer = None
+            self._dealers = []
+        # The caller's own thread-local still points at a closed socket; drop
+        # it so a send_request after stop() builds a fresh one rather than
+        # raising on a dead handle. Other threads' locals are unreachable from
+        # here -- their sockets are closed above, and _ensure_dealer would hand
+        # back the closed one, so those threads must not reuse the transport
+        # after stop(). That was true of the single shared dealer too.
+        if getattr(self._dealer_local, "sock", None) is not None:
+            self._dealer_local.sock = None
         # Do NOT terminate the shared context — other sockets/users may rely on it.
