@@ -114,6 +114,10 @@ ORDER_METHODS = {
     "submit_order",
     "submit_orders_batch",
     "cancel_order",
+    # Raw native-passorder passthrough (route 2). Gated behind
+    # allow_order_methods like every other write, and deferred to the adjust
+    # thread by virtue of not being in READ_METHODS.
+    "passorder",
 }
 
 # Whole-quote push subscription control methods. These drive a server-side
@@ -2021,6 +2025,65 @@ class BigQmtRpcHandlers:
         except Exception:
             pass
         return results
+
+    def _handle_passorder(self, params):
+        """Raw native-passorder passthrough (route 2).
+
+        Forwards the 11-arg passorder signature straight through to QMT, with
+        ContextInfo supplied server-side. No opType validation, no code
+        normalization, no settlement read-back -- the caller owns the native
+        contract. See BigQmtOrderGateway.passorder_passthrough.
+
+        Accepts both the native argument names (op_type/order_type/price_type/
+        prType...) and passorder's own spellings, so a caller can paste the
+        signature they know. account defaults to the request/gateway account.
+        """
+        if self.order_gateway is None:
+            raise RuntimeError("order_gateway is not configured")
+        passthrough = getattr(self.order_gateway, "passorder_passthrough", None)
+        if not callable(passthrough):
+            raise RuntimeError("this deployment predates the passorder passthrough")
+
+        def pick(*names, **kw):
+            for name in names:
+                if name in params and params[name] is not None:
+                    return params[name]
+            return kw.get("default")
+
+        op_type = pick("op_type", "opType", "optype")
+        order_type = pick("order_type", "orderType", "ordertype",
+                          default=self.order_gateway.combo_type)
+        account_id = self._request_account_id(params)
+        order_code = pick("order_code", "orderCode", "stock_code", "code")
+        price_type = pick("price_type", "prType", "prtype",
+                          default=self.order_gateway.price_type)
+        price = pick("price", default=-1)
+        volume = pick("volume", "order_volume", "vol")
+        strategy_name = pick("strategy_name", "strategyName",
+                             default=self.default_strategy_name)
+        quick_trade = pick("quick_trade", "quickTrade",
+                           default=self.order_gateway.quick_trade)
+        user_order_id = pick("user_order_id", "userOrderId", "order_remark",
+                             "remark", default="")
+        if op_type is None:
+            raise ValueError("op_type is required")
+        if not order_code:
+            raise ValueError("order_code is required")
+        if volume is None:
+            raise ValueError("volume is required")
+        return passthrough(
+            op_type=op_type,
+            order_type=order_type,
+            account_id=account_id,
+            order_code=order_code,
+            price_type=price_type,
+            price=price,
+            volume=volume,
+            strategy_name=strategy_name,
+            quick_trade=quick_trade,
+            user_order_id=user_order_id,
+            dry_run=bool(pick("dry_run", "dryRun", default=False)),
+        )
 
     def _handle_cancel_order(self, params):
         if self.order_gateway is None:

@@ -5,6 +5,16 @@
 
 ## [未发布]
 
+### 新增
+
+- **`passorder` 原生透传（路 2）**：新增客户端 `xt.passorder(opType, orderType, account, orderCode, prType, price, volume, strategyName, quickTrade, userOrderId)`，参数顺序与 QMT 原生 `passorder` 一致，ContextInfo 由服务端补（它只在 QMT 里存在，过不了 RPC）。和 `order_stock` 的区别是**暴露了 `orderType` 和 `quickTrade`**，并且**不跑任何安全网** —— 无 opType 校验（融资/期货 opType 由调用方负责，见 #103）、无代码大小写归一化（#95）、无结算回读。要的就是裸 API，契约归调用方。
+
+  `orderType` / `quickTrade` 留空时回落到服务端配置（1101 / 2），所以常见情形写起来仍和 `order_stock` 一样。passorder 异步、不返回委托号（QMT 稍后在 order_callback 推送里给），同 `order_stock_async`。
+
+  `dry_run=True` 返回服务端**将要**传给 passorder 的 11 元组而不下单 —— 用来核对参数映射，也是本条的实盘验证方式（不下真单）。
+
+  服务端 `passorder` 走 `ORDER_METHODS`：和其它下单一样受 `rpc_allow_order_methods` 门禁、并 defer 到 adjust 主线程。新增 `tests/bigqmt_signal_trader/test_passorder_passthrough.py`（11 例，下单类放文件最前，修复前 8 例红）。实盘 dry_run 四项验证通过，未下任何单。
+
 ### 性能
 
 - **zmq 客户端不再把并发请求排成一队**（#186）：`send_request` 此前在**整个** send/poll/recv 周期内持 `_client_lock`，因为客户端只有一个 DEALER socket 而 zmq socket 不是线程安全的。于是多线程调用只能轮流来。实盘 4 并发实测：zmq 的 ping 从 2.4 只到 2.7 次每秒（drain 模式 10.2 到 10.2，纹丝不动），而没有这把锁的 redis 从 20.7 到 **143.3**。线程数在 zmq 上买不到任何东西。
