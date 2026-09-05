@@ -17,7 +17,9 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
-from bigqmt_signal_trader.xtquant_compat import BigQmtXtTrader, XtQuantTraderCallback
+from bigqmt_signal_trader.xtquant_compat import (
+    BigQmtXtTrader, RpcServerRepliedError, XtQuantTraderCallback,
+)
 
 
 class Recorder(XtQuantTraderCallback):
@@ -90,13 +92,15 @@ class BatchSelectionTest(unittest.TestCase):
         self.assertEqual(calls["batch"], [])
         self.assertEqual(len(rec.responses), 1)
 
-    def test_a_failing_batch_falls_back_to_single_submits(self):
+    def test_a_server_refused_batch_falls_back_to_single_submits(self):
+        """The server answered with an error: the handler raises before its
+        per-item loop, so nothing ran and resubmitting is safe."""
         trader, rec, calls = self._trader()
         calls_log = []
-        def raising_batch(account, orders, batch_id="", idempotent=True):
+        def refused_batch(account, orders, batch_id="", idempotent=True):
             calls_log.append(len(orders))
-            raise RuntimeError("network gone")
-        trader.order_stock_batch = raising_batch
+            raise RpcServerRepliedError("order_gateway is not configured")
+        trader.order_stock_batch = refused_batch
         seqs = [trader.order_stock_async("acct", "60%04d.SH" % i, 23, 100, 11,
                                          10.0, "s", "r-%d" % i)
                 for i in range(3)]
@@ -106,6 +110,31 @@ class BatchSelectionTest(unittest.TestCase):
         self.assertEqual(calls_log, [3])
         self.assertEqual(len(calls["single"]), 3, "batch loss must not lose orders")
         self.assertEqual([r.seq for r in rec.responses], seqs)
+
+    def test_a_timed_out_batch_is_never_resubmitted(self):
+        """A timeout means the batch may STILL BE RUNNING on the server.
+        Resubmitting doubles the orders (live: a 100-item batch outlived the
+        timeout, the fallback resubmitted, 200 orders landed). Report each
+        item as unknown-outcome instead, and say the orders may be live."""
+        trader, rec, calls = self._trader()
+
+        def slow_batch(account, orders, batch_id="", idempotent=True):
+            raise TimeoutError("redis rpc timeout: order_stock_batch")
+
+        trader.order_stock_batch = slow_batch
+        seqs = [trader.order_stock_async("acct", "60%04d.SH" % i, 23, 100, 11,
+                                         10.0, "s", "r-%d" % i)
+                for i in range(3)]
+
+        self.assertTrue(trader.wait_async_orders(timeout=5.0))
+
+        self.assertEqual(calls["single"], [],
+                         "a timed-out batch must NOT be resubmitted")
+        self.assertEqual(len(rec.errors), 3)
+        self.assertEqual([e.seq for e in rec.errors], seqs)
+        for err in rec.errors:
+            self.assertIn("MAY BE LIVE", err.error_msg)
+            self.assertNotIn("not found", err.error_msg.lower())
 
     def test_an_empty_batch_result_falls_back_to_single_submits(self):
         trader, rec, calls = self._trader()
@@ -173,6 +202,58 @@ class BatchSelectionTest(unittest.TestCase):
                                 "an order landed in another account's batch")
         self.assertEqual(singles, [])
         self.assertEqual(len(rec.responses), 4)
+
+
+class BatchTimeoutScalingTest(unittest.TestCase):
+    """The batch RPC's wait must scale with N: the server runs items serially
+    and per-item cost swings from ~ms to ~300ms (counter disconnected), so a
+    flat 30s default turns a slow-but-alive 100-item batch into a client
+    timeout -- and a retried batch doubles orders."""
+
+    def _trader_with_capturing_client(self):
+        trader = BigQmtXtTrader(account_id="acct")
+        captured = []
+
+        class StubClient:
+            account_id = "acct"
+            timeout_seconds = 30.0
+
+            def call(self, method, params=None, account_id=None, timeout_seconds=None):
+                captured.append((method, params, timeout_seconds))
+                return []
+
+        trader.client = StubClient()
+        return trader, captured
+
+    def test_timeout_scales_with_item_count(self):
+        trader, captured = self._trader_with_capturing_client()
+        orders = [{"stock_code": "60%04d.SH" % i, "order_type": 23,
+                   "order_volume": 100, "price_type": 11, "price": 10.0,
+                   "order_remark": "t-%d" % i} for i in range(100)]
+        trader.order_stock_batch("acct", orders)
+
+        _method, _params, timeout = captured[-1]
+        self.assertGreaterEqual(timeout, 15.0 + 0.5 * 100)
+
+    def test_small_batches_keep_the_plain_default(self):
+        trader, captured = self._trader_with_capturing_client()
+        orders = [{"stock_code": "600000.SH", "order_type": 23,
+                   "order_volume": 100, "price_type": 11, "price": 10.0,
+                   "order_remark": "t"}]
+        trader.order_stock_batch("acct", orders)
+
+        _method, _params, timeout = captured[-1]
+        self.assertEqual(timeout, 30.0)
+
+    def test_an_explicit_timeout_wins_over_the_scaling(self):
+        trader, captured = self._trader_with_capturing_client()
+        orders = [{"stock_code": "600000.SH", "order_type": 23,
+                   "order_volume": 100, "price_type": 11, "price": 10.0,
+                   "order_remark": "t"}]
+        trader.order_stock_batch("acct", orders, timeout_seconds=7.0)
+
+        _method, _params, timeout = captured[-1]
+        self.assertEqual(timeout, 7.0)
 
 
 class CallbackOffTheSubmitPathTest(unittest.TestCase):

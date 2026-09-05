@@ -947,13 +947,15 @@ class BigQmtRpcClient:
                 timeout_seconds=wait_seconds,
             )
         if not response.get("ok"):
-            raise RuntimeError(response.get("error") or "Big QMT RPC failed: %s" % method)
+            raise RpcServerRepliedError(
+                response.get("error") or "Big QMT RPC failed: %s" % method)
         # server_error 携带 QMT 端诊断（如 passorder 提交但委托没进系统）。
         # 只在交易类方法上设置（读取类恒为空），转成异常让调用方看到真实原因，
         # 而不是把「无委托号」误判为 -1 失败（issue #38）。
         server_error = str(response.get("server_error") or "")
         if server_error:
-            raise RuntimeError("Big QMT %s server_error: %s" % (method, server_error))
+            raise RpcServerRepliedError(
+                "Big QMT %s server_error: %s" % (method, server_error))
         # The transport already scanned the raw text for a typed envelope; when
         # it found none there is provably nothing to rebuild, and skipping the
         # walk turns 345.9ms into 3.7ms on a 51285-instrument snapshot. A None
@@ -1111,6 +1113,28 @@ MARKET_TOKENS = frozenset({"SH", "SZ", "BJ", "HK"})
 # 30s is also what the whole-market snapshot path already used, so there is
 # one number rather than two.
 DEFAULT_RPC_TIMEOUT_SECONDS = 30.0
+
+# Batch timeout scaling: the server runs batch items serially on the adjust
+# thread. Per-item cost is milliseconds in market hours but ~300ms with the
+# counter disconnected -- a 100-item batch then outlives even the 30s default
+# (live 2026-09-05: the client gave up, fell back to singles, and the still
+# running batch completed too, doubling 100 orders into 200). Scale the wait
+# with N so the client outlives the server.
+BATCH_TIMEOUT_FLOOR_SECONDS = 15.0
+BATCH_TIMEOUT_PER_ITEM_SECONDS = 0.5
+
+
+class RpcServerRepliedError(RuntimeError):
+    """The server answered with an error -- as opposed to a timeout/transport
+    failure, where the request's fate is unknown.
+
+    The distinction matters for writes: a batch submit handler raises only
+    before its per-item loop, so a replied error means no item ran and a retry
+    is safe. A timeout means the batch may still be running and retrying
+    doubles orders."""
+
+
+
 
 LARGE_CODE_LIST = 1000
 # What the fallback reads first. Stocks are 8.7% of an exchange listing, so
@@ -3931,8 +3955,14 @@ class BigQmtXtTrader:
         parks each item's settlement in the single _pending_settlement slot, so
         only the last item of a batch would ever get its order id backfilled.
 
-        A batch that fails as a whole falls back to submitting one at a time.
-        Losing a network round trip must not lose the orders in it (#156).
+        Fallbacks, and when they are allowed: a batch whose outcome is UNKNOWN
+        (timeout, connection drop) must NOT be resubmitted -- the server may
+        still be running it, and the resubmit doubles the orders (live: a
+        100-item batch outlived the 30s timeout, the fallback resubmitted, and
+        200 orders landed). Only two failure shapes may fall back to
+        one-at-a-time: the server REPLIED with an error (the handler raises
+        before its per-item loop, so nothing ran), and an empty result list
+        (the handler appends one entry per item, so empty means it never ran).
         """
         payload = []
         for (seq, args, kwargs), fields in group:
@@ -3956,10 +3986,25 @@ class BigQmtXtTrader:
         try:
             results = self.order_stock_batch(account_id, payload,
                                              idempotent=False) or []
-        except Exception:
-            log.exception("async batch of %d failed; submitting one at a time",
-                          len(group))
+        except RpcServerRepliedError as exc:
+            log.warning("async batch of %d refused by the server (%s); "
+                        "submitting one at a time", len(group), exc)
             results = None
+        except Exception as exc:
+            # Timeout / transport failure: the batch's fate is unknown. Do NOT
+            # resubmit -- report each item as unknown-outcome instead. The
+            # message must say the orders may be live, because they may be:
+            # a caller that retries on failure double-orders.
+            log.exception("async batch of %d outcome unknown; NOT resubmitting",
+                          len(group))
+            for (seq, args, kwargs), fields in group:
+                self._enqueue_batch_outcome(seq, fields, {
+                    "success": False, "code": -4,
+                    "error": ("batch outcome unknown (%s: %s); the orders MAY "
+                              "BE LIVE -- query orders before retrying"
+                              % (exc.__class__.__name__, exc)),
+                })
+            return
         if not results:
             if results is not None:
                 # The server appends one result per item, so nothing back means
@@ -4178,7 +4223,8 @@ class BigQmtXtTrader:
                 time.sleep(0.005)
         return True
 
-    def order_stock_batch(self, account, orders, batch_id="", idempotent=True):
+    def order_stock_batch(self, account, orders, batch_id="", idempotent=True,
+                          timeout_seconds=None):
         """Submit N orders in one RPC.
 
         ``idempotent`` (default True, unchanged) is the batch contract: every
@@ -4186,6 +4232,11 @@ class BigQmtXtTrader:
         placing again, so a retried batch cannot double-order. Pass False for
         callers that never agreed to that -- order_stock_async routes its
         backlog through here (#181) and lost orders to it (#190).
+
+        The wait scales with N when not given: the server runs items serially
+        and per-item cost swings from ~ms (market hours) to ~300ms (counter
+        disconnected), so a flat default turns a slow-but-alive batch into a
+        client-side timeout -- and a retried batch doubles orders.
         """
         account_id = _account_id(account, self.client.account_id)
         payload = []
@@ -4198,10 +4249,18 @@ class BigQmtXtTrader:
             params["idempotent"] = False
         if batch_id:
             params["batch_id"] = str(batch_id)
+        if timeout_seconds is None:
+            timeout_seconds = max(
+                float(getattr(self.client, "timeout_seconds",
+                              DEFAULT_RPC_TIMEOUT_SECONDS)),
+                BATCH_TIMEOUT_FLOOR_SECONDS
+                + BATCH_TIMEOUT_PER_ITEM_SECONDS * len(payload),
+            )
         return self.client.call(
             "order_stock_batch",
             params,
             account_id=account_id,
+            timeout_seconds=timeout_seconds,
         ) or []
 
     def cancel_order_stock_sysid(self, account, market, order_sysid):

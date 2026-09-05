@@ -1858,6 +1858,7 @@ class BigQmtRpcHandlers:
             raise ValueError("orders must be a non-empty list")
         if len(orders) > 500:
             raise ValueError("orders exceeds batch limit 500")
+        batch_started = time.time()
         batch_id = str(params.get("batch_id") or uuid.uuid4().hex)
         account_id = self._request_account_id(params)
         strategy_name = str(
@@ -2006,6 +2007,19 @@ class BigQmtRpcHandlers:
                     "error": "%s: %s" % (exc.__class__.__name__, exc),
                     "user_order_id": order_tag,
                 })
+        # One line per batch, always: a batch that outlives the client's
+        # timeout keeps running to completion here, and without this line the
+        # doubled orders that follow have no server-side trace.
+        try:
+            from .logging_setup import get_logger
+            get_logger("rpc").info(
+                "batch submit account=%s items=%d placed=%d failed=%d %.0fms",
+                account_id, len(orders),
+                sum(1 for r in results if r.get("success") and not r.get("idempotent")),
+                sum(1 for r in results if not r.get("success")),
+                (time.time() - batch_started) * 1000.0)
+        except Exception:
+            pass
         return results
 
     def _handle_cancel_order(self, params):

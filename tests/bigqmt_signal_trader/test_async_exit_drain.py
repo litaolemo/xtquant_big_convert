@@ -37,7 +37,7 @@ def _queue_three(trader, slow_seconds=0.25, prefix="drain"):
 
     trader.order_stock_result = slow_order
 
-    def slow_batch(account, orders, batch_id=""):
+    def slow_batch(account, orders, batch_id="", idempotent=True):
         # The worker batches a backlog of >=2 into one order_stock_batch
         # (issue #181); route each item through the same slow stub so the
         # drain contract is exercised whichever path the worker took.
