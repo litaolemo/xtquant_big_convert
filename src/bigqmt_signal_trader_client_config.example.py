@@ -14,6 +14,13 @@ BIGQMT_DOWNLOAD_WAIT_SECONDS = 1800
 BIGQMT_DOWNLOAD_POLL_INTERVAL_SECONDS = 0.5
 
 BIGQMT_REDIS_CONFIG = {
+    # 账户查询（持仓/资产）失败时，是否用 redis 里的上一份快照作答。
+    # 默认 False —— 查询失败就抛给调用方，和 zmq/pipe 一致。打开它等于接受
+    # 「拿旧持仓当当前持仓」，策略据此算仓位是会出事的（#243）。
+    # 打开后仍要求快照带 updated_at 且在时限内，否则照样抛。
+    # "account_cache_fallback": False,
+    # "account_cache_max_age_seconds": 30,
+
     "host": "YOUR_REDIS_HOST",
     "port": 6379,
     "db": 5,

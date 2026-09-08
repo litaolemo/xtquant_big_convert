@@ -3143,6 +3143,82 @@ class BigQmtXtTrader:
         # ping reports, fall back to what the caller declared.
         self._server_account_type = ""
         self._declared_account_type = ""
+        # Account-query cache fallback (#243). OFF by default: a failed
+        # POSITION/ASSET query must reach the caller, the way it already does
+        # on every non-redis transport. Serving the last redis snapshot
+        # instead turns "the query failed" into "here is what you own",
+        # which is the one answer a strategy must never be given wrongly.
+        #
+        # Deliberately NOT tied to local_cache_enabled: that key is the
+        # client-side *market data* cache. Two different caches, two
+        # switches -- conflating them is what made local_cache_enabled=False
+        # look like it should have disabled this and it did not.
+        # Read the config as handed to us: BigQmtRpcClient normalises its own
+        # copy and drops keys it does not know, so self.client.redis_config
+        # cannot be the source here.
+        cache_config = dict((load_client_config() or {}).get("redis_config") or {})
+        cache_config.update(dict(redis_config or {}))
+        self.account_cache_fallback = _bool_value(
+            cache_config.get("account_cache_fallback"),
+            _env_bool("BIGQMT_ACCOUNT_CACHE_FALLBACK", False),
+        )
+        try:
+            self.account_cache_max_age_seconds = float(
+                cache_config.get("account_cache_max_age_seconds")
+                or os.environ.get("BIGQMT_ACCOUNT_CACHE_MAX_AGE") or 30.0)
+        except (TypeError, ValueError):
+            self.account_cache_max_age_seconds = 30.0
+
+    def _snapshot_age_seconds(self, snapshot):
+        """How old the cached snapshot is, or None when it does not say.
+
+        A snapshot that carries no ``updated_at`` is treated as unusable
+        rather than fresh: the whole point of the bound is refusing to answer
+        with facts we cannot date.
+        """
+        stamp = (snapshot or {}).get("updated_at")
+        if not stamp:
+            return None
+        text = str(stamp).strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+            try:
+                parsed = _dt.datetime.strptime(text.split("+")[0].strip(), fmt)
+            except ValueError:
+                continue
+            return max(0.0, (_dt.datetime.now() - parsed).total_seconds())
+        try:  # epoch seconds
+            return max(0.0, time.time() - float(text))
+        except (TypeError, ValueError):
+            return None
+
+    def _account_cache_usable(self, account_id, what):
+        """May we answer `what` from the cached snapshot at all?
+
+        Returns the snapshot when the fallback is switched on AND the data is
+        dated AND it is inside the age bound. Anything else -> None, and the
+        caller re-raises the original error.
+        """
+        if not self.account_cache_fallback:
+            return None
+        if not self._redis_cache_enabled():
+            return None
+        snapshot = self._cached_position_snapshot(account_id)
+        if not snapshot:
+            return None
+        age = self._snapshot_age_seconds(snapshot)
+        if age is None:
+            log.warning(
+                "%s: 拒绝用缓存回答 —— 快照没有 updated_at，无法判断新旧", what)
+            return None
+        if age > self.account_cache_max_age_seconds:
+            log.warning(
+                "%s: 拒绝用缓存回答 —— 快照已 %.1fs 前（上限 %.1fs）",
+                what, age, self.account_cache_max_age_seconds)
+            return None
+        log.warning(
+            "%s: 原生查询失败，改用 %.1fs 前的 redis 缓存作答（"
+            "account_cache_fallback=True 打开的行为）", what, age)
+        return snapshot
 
     def _cached_position_snapshot(self, account_id):
         key = "bigqmt:positions:%s" % str(account_id or self.client.account_id or "")
@@ -3533,15 +3609,18 @@ class BigQmtXtTrader:
         try:
             data = self.client.call("query_stock_asset", {"account_id": account_id}, account_id=account_id) or {}
         except Exception:
-            if not self._redis_cache_enabled():
+            # #243: default is to let the failure through. Only an explicit
+            # account_cache_fallback, with a dated and fresh snapshot, answers
+            # from cache -- and it says so in the log when it does.
+            if self._account_cache_usable(account_id, "query_stock_asset") is None:
                 raise
             data = self._cached_asset(account_id)
             if not data:
                 raise
         if (
-            self._redis_cache_enabled()
-            and data.get("cash") is None
+            data.get("cash") is None
             and data.get("total_asset") is None
+            and self._account_cache_usable(account_id, "query_stock_asset(empty)") is not None
         ):
             data = self._cached_asset(account_id) or data
         cash = data.get("cash")
@@ -3633,7 +3712,7 @@ class BigQmtXtTrader:
         try:
             data = self.client.call("query_stock_positions", {"account_id": account_id}, account_id=account_id) or {}
         except Exception:
-            if not self._redis_cache_enabled():
+            if self._account_cache_usable(account_id, "query_stock_positions") is None:
                 raise
             data = self._cached_positions(account_id)
             if not data:
@@ -3762,7 +3841,7 @@ class BigQmtXtTrader:
                 account_id=account_id,
             )
         except Exception:
-            if not self._redis_cache_enabled():
+            if self._account_cache_usable(account_id, "query_stock_position") is None:
                 raise
             normalized = str(stock_code or "").strip().upper()
             data = None

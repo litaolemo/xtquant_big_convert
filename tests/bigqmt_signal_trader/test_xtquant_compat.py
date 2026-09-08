@@ -25,6 +25,12 @@ from bigqmt_signal_trader.xtquant_compat import (
 from bigqmt_signal_trader.full_tick_cache import full_tick_demand_key, full_tick_request_id, write_full_tick_cache
 
 
+
+def _now_stamp():
+    import datetime as _d
+    return _d.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 class FakeRpcClient:
     def __init__(self):
         self.account_id = "acct"
@@ -588,7 +594,7 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(client.redis_config["password"], "")
         self.assertEqual(client.timeout_seconds, 3)
 
-    def test_trader_falls_back_to_cached_positions_when_rpc_fails(self):
+    def _failing_client_with_cache(self, updated_at):
         class FailingRpcClient(FakeRpcClient):
             def call(self, method, params=None, account_id=None, timeout_seconds=None):
                 if method in ("query_stock_asset", "query_stock_positions", "query_stock_position"):
@@ -596,7 +602,7 @@ class XtquantCompatTest(unittest.TestCase):
                 return super().call(method, params, account_id, timeout_seconds)
 
         client = FailingRpcClient()
-        client.redis.hashes["bigqmt:positions:acct"] = {
+        snapshot = {
             "account_id": "acct",
             "asset": {"cash": 123.0, "total_asset": 456.0},
             "positions": {
@@ -609,8 +615,33 @@ class XtquantCompatTest(unittest.TestCase):
                 }
             },
         }
+        if updated_at is not None:
+            snapshot["updated_at"] = updated_at
+        client.redis.hashes["bigqmt:positions:acct"] = snapshot
+        return client
+
+    def test_a_failed_account_query_is_not_answered_from_cache_by_default(self):
+        """#243：以前只要缓存非空就当查询成功，把原生异常吞掉了。
+
+        对交易系统来说这是最坏的一种错——策略拿旧持仓去算仓位，而调用看起来
+        完全正常。默认改为传播，要回退得显式打开 account_cache_fallback。
+        """
         trader = BigQmtXtTrader(account_id="acct")
-        trader.client = client
+        trader.client = self._failing_client_with_cache(_now_stamp())
+        acc = StockAccount("acct")
+
+        for call in (lambda: trader.query_stock_asset(acc),
+                     lambda: trader.query_stock_positions(acc),
+                     lambda: trader.query_stock_position(acc, "600000")):
+            with self.assertRaises(RuntimeError):
+                call()
+
+    def test_opting_in_serves_a_fresh_snapshot(self):
+        trader = BigQmtXtTrader(
+            account_id="acct",
+            redis_config={"transport": "redis", "account_cache_fallback": True},
+        )
+        trader.client = self._failing_client_with_cache(_now_stamp())
         acc = StockAccount("acct")
 
         asset = trader.query_stock_asset(acc)
@@ -622,6 +653,15 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(positions[0].stock_code, "600000.SH")
         self.assertEqual(positions[0].can_use_volume, 80)
         self.assertEqual(single.stock_name, "cached")
+
+    def test_opting_in_still_refuses_a_stale_snapshot(self):
+        trader = BigQmtXtTrader(
+            account_id="acct",
+            redis_config={"transport": "redis", "account_cache_fallback": True},
+        )
+        trader.client = self._failing_client_with_cache("2000-01-01 00:00:00")
+        with self.assertRaises(RuntimeError):
+            trader.query_stock_positions(StockAccount("acct"))
 
     def test_zmq_query_failure_never_falls_back_to_redis_cache(self):
         class FailingZmqClient(FakeRpcClient):
