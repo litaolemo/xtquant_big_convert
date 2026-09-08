@@ -57,6 +57,7 @@ DEFAULT_READY_PORT = 58600
 
 __all__ = [
     "QmtLauncherError",
+    "classify_qmt_window",
     "close_qmt",
     "find_qmt_processes",
     "is_qmt_running",
