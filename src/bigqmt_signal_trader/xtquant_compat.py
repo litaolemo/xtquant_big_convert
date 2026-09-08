@@ -2499,7 +2499,7 @@ class BigQmtXtData:
         if not markets:
             return self.get_full_tick(codes, types=["all"]) or {}
         wanted = {c.upper() for c in codes}
-        full = self.get_full_tick(markets, types=["all"]) or {}
+        full = self.get_full_tick(markets) or {}
         return {k: v for k, v in full.items() if str(k).upper() in wanted}
 
     def unsubscribe_quote(self, seq):
@@ -3272,6 +3272,7 @@ class BigQmtXtTrader:
         # to the account's channels within ~1s if the account changed.
         self._start_event_listener()
         self._fire_account_status()
+        time.sleep(1)
         return 0
 
     def stop(self):
