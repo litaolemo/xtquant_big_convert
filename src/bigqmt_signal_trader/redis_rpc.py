@@ -3086,6 +3086,10 @@ class RedisPubSubRpcService:
         self.debug_log_limit = int(debug_log_limit)
         self._received_count = 0
         self._processed_count = 0
+        # (account_id, request_id) -> {"at", "response"} for write methods,
+        # so a transparently retried RPUSH cannot dispatch a second order (#245).
+        self._order_requests = collections.OrderedDict()
+        self._duplicate_order_requests = 0
         self._published_count = 0
         self._deferred_count = 0
         self.print_prefix = print_prefix
@@ -3382,11 +3386,79 @@ class RedisPubSubRpcService:
             processed += 1
         return processed
 
+    ORDER_DEDUP_MAX = 512
+    ORDER_DEDUP_TTL_SECONDS = 600
+
+    def _canonical(self, method):
+        resolve = getattr(self.handlers, "_canonical_method", None)
+        return resolve(method) if callable(resolve) else method
+
+    def _claim_order_request(self, key):
+        """Claim (account_id, request_id) for a write. None == first time.
+
+        Returns the existing entry when this id has already been seen, so the
+        caller can answer without dispatching a second native order.
+        """
+        store = getattr(self, "_order_requests", None)
+        if store is None:
+            store = self._order_requests = collections.OrderedDict()
+        now = time.time()
+        # Prune by age, then by size. Both are bounded on purpose: this runs
+        # on the adjust thread and must not grow with uptime.
+        for stale in [k for k, v in store.items()
+                      if now - v.get("at", now) > self.ORDER_DEDUP_TTL_SECONDS]:
+            store.pop(stale, None)
+        while len(store) > self.ORDER_DEDUP_MAX:
+            store.popitem(last=False)
+        existing = store.get(key)
+        if existing is not None:
+            return existing
+        store[key] = {"at": now, "response": None}
+        return None
+
+    def _remember_order_response(self, key, response):
+        store = getattr(self, "_order_requests", None)
+        if store is not None and key in store:
+            store[key]["response"] = response
+
     def process_request(self, request):
         request = dict(request or {})
         request_id = str(request.get("request_id") or request.get("id") or uuid.uuid4().hex)
         account_id = str(request.get("account_id") or self.account_id or "")
         method = str(request.get("method") or "")
+
+        # At-most-once for writes (#245). The client's redis-py connection
+        # retries transparently on ConnectionError/TimeoutError, and the retry
+        # re-sends the whole command -- conn.retry wraps send AND parse, so an
+        # RPUSH the server already accepted is sent again when the reply is
+        # lost. Nothing downstream deduped: order_stock / order_stock_async
+        # both alias to submit_order, and _handle_submit_order has no
+        # idempotency check (only submit_orders_batch does). So one
+        # client.call could dispatch two native passorders.
+        #
+        # The retry re-sends the identical payload, request_id included, which
+        # is what makes this fixable here: the second copy is recognisable.
+        # Answer it with the first one's response instead of dispatching --
+        # both copies name the same reply key, so it lands where the client is
+        # already waiting.
+        order_key = None
+        if request_id and self._canonical(method) in ORDER_METHODS:
+            order_key = (account_id, request_id)
+            seen = self._claim_order_request(order_key)
+            if seen is not None:
+                self._duplicate_order_requests += 1
+                remembered = seen.get("response")
+                print("%s duplicate order request suppressed method=%s request_id=%s"
+                      % (self.print_prefix, method, request_id))
+                if remembered is None:
+                    # Still in flight: the first copy publishes to the same
+                    # reply key when it settles. Nothing to do but not dispatch.
+                    return None
+                try:
+                    self._publish_response(request, remembered)
+                except Exception:
+                    pass
+                return remembered
         response = {
             "schema_version": 1,
             "request_id": request_id,
@@ -3430,10 +3502,14 @@ class RedisPubSubRpcService:
                 settlement.response = response
                 self._pending_settlements.put(settlement)
                 self._deferred_count += 1
+                if order_key is not None:
+                    self._remember_order_response(order_key, response)
                 return response
         except Exception as exc:
             response["error"] = "%s: %s" % (exc.__class__.__name__, exc)
         response["_t_reply"] = time.time()
+        if order_key is not None:
+            self._remember_order_response(order_key, response)
         _t_pub0 = time.perf_counter() if method == "ping" else 0.0
         try:
             self._publish_response(request, response)
