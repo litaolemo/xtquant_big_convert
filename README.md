@@ -62,7 +62,7 @@ python -m bigqmt_signal_trader.init_config
 
 几个不问、直接定死的选项：
 
-- **`rpc_background_threads` 恒为 `False`** —— `get_trade_detail_data` 离开主策略线程返回空，这不是可选项
+- **`rpc_background_threads` 按传输选**（redis `True`、zmq/pipe `False`）—— 选反了差 4~37 倍，向导按你选的传输定，不问
 - **`rpc_allow_order_methods` 默认 `False`** —— 打开前会明确提示：任何能连上这条通道的程序都可以下单
 - 选了**无 redis 单文件**会自动把传输改成 zmq，不会留下一份声称用 redis 的配置
 
@@ -1121,16 +1121,20 @@ BIGQMT_REDIS_CONFIG = {
     "rpc_allow_order_methods": False,    # 下单默认关闭
     "rpc_process_in_listener": True,     # 只读请求在收包线程直接处理（低延迟）
     "rpc_listener_methods": ("*",),      # * = 所有只读方法
-    "rpc_background_threads": False,     # redis 用 QMT adjust 线程 drain
+    "rpc_background_threads": True,      # redis 用后台收包线程（最快）
     "schedule_adjust": True,
-    "schedule_adjust_interval": "500nMilliSecond",
+    "schedule_adjust_interval": "100nMilliSecond",
 }
 ```
 
-> **`rpc_background_threads` 保持 `False`**，包括 zmq 和 mysql。0.3.21 起这两种传输
-> 也支持 adjust 线程 drain（#183），实测把 zmq 的 ping 从 405ms 降到 95ms、交易查询从
-> 607ms 降到 95ms。0.3.21 之前它们必须设 `True`，现在设 `True` 等于主动放弃这段提速。
-> 不写这个键则沿用历史默认（开后台线程）。
+> **这个开关按传输选，没有一个值对所有传输都最好**（实测见上面的传输对比表）：
+> redis 用 `True`（3.4ms，`brpop` 唤醒是即时的）；zmq / pipe / mysql 用 `False`
+> 走 adjust drain（zmq 15.8ms），因为它们的后台线程每次都要付跨线程 GIL 交接，
+> 约一个 adjust tick。zmq 配 `True` 是 592.9ms，慢 37 倍。不写这个键则沿用历史
+> 默认（开后台线程）—— 对 redis 正好是对的，对 zmq / pipe 不是。
+>
+> 安全性不依赖这个开关：碰交易上下文的方法（`LISTENER_DEFERRED_METHODS`）在展开
+> listener 名单时被无条件剔除，任何配置都无法把它们排到后台线程上（#244）。
 
 ### 第 3 步：在 QMT 里运行策略
 

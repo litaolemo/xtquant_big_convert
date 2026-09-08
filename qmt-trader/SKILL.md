@@ -58,18 +58,26 @@ BIGQMT_REDIS_CONFIG = {
     "rpc_allow_order_methods": False,     # 下单开关，默认关闭；确认风控后改 True
     "rpc_process_in_listener": True,
     "rpc_listener_methods": ("*",),
-    "rpc_background_threads": False,      # 若切 zmq/mysql 传输必须改 True
+    "rpc_background_threads": True,       # redis 用后台收包线程最快；zmq/pipe 要改 False
     "schedule_adjust": True,
-    "schedule_adjust_interval": "500nMilliSecond",
+    "schedule_adjust_interval": "100nMilliSecond",
 }
 ```
 
-> 切 zmq：配置里加 `"transport": "zmq"` 并把 `rpc_background_threads` 改 `True`（QMT 端需装 pyzmq 19.0.2，Python 3.6 最后支持的版本）。
+> **这个开关按传输选，选反了差几十倍**（实测见 README 的传输对比表）：
+> redis 用 `True`（3.4ms），zmq / pipe 用 `False` 走 adjust drain（zmq 15.8ms）。
+> zmq 配 `True` 是 592.9ms —— 慢 37 倍。原因是 zmq / pipe 的后台线程每次都要付
+> 跨线程 GIL 交接（约一个 adjust tick），redis 的 `brpop` 唤醒没有这一步。
+>
+> 切 zmq：配置里加 `"transport": "zmq"` 并把 `rpc_background_threads` 改 `False`
+> （QMT 端需装 pyzmq 19.0.2，Python 3.6 最后支持的版本）。
 
 ### 第 4 步：在 QMT 策略编辑器运行入口
 
 QMT 策略编辑器里**只加载运行 `BIGQMT_REDIS_DRYRUN.py` 一个文件**（它自动 import 其余模块）。
-若 QMT 装在非默认路径且用 exec 方式加载，需改文件里 `_known_qmt_python_dir()` 的 fallback 路径。
+装在非默认路径不用改任何代码：入口先用自己 `__file__` 所在目录，取不到才回落
+到扫 `sys.path`。（旧版文档教人改 `_known_qmt_python_dir()` 的写死路径，
+那会让你多背一个源码补丁，现在不需要了。）
 
 启动成功标志（QMT 输出面板）：
 
@@ -90,7 +98,7 @@ $env:BIGQMT_REDIS_HOST="Redis地址"; $env:BIGQMT_REDIS_PORT="6379"
 $env:BIGQMT_REDIS_DB="5"; $env:BIGQMT_REDIS_PASSWORD="Redis密码"
 ```
 
-然后验证（redis ~13ms / zmq ~0.7ms 为正常）：
+然后验证（redis ~3ms / zmq+drain ~16ms 为正常，实测口径见 README 传输对比表）：
 
 ```bash
 python scripts/qmt.py ping
@@ -114,7 +122,7 @@ python scripts/qmt.py ping
 python scripts/qmt.py ping
 ```
 
-返回 `ok: true` 且 `latency_ms` 合理（redis ~13ms / zmq ~0.7ms）即表示服务端就绪。
+返回 `ok: true` 且 `latency_ms` 合理（redis ~3ms / zmq+drain ~16ms）即表示服务端就绪。
 
 ### 第 1 步：一键快照（资产+持仓+委托+成交）
 

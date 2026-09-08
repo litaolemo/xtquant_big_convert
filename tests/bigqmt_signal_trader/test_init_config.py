@@ -107,14 +107,31 @@ class RenderedConfigTest(unittest.TestCase):
             _answers(allow_order_methods=True)), "s.py")
         self.assertIs(on["BIGQMT_REDIS_CONFIG"]["rpc_allow_order_methods"], True)
 
-    def test_background_threads_stay_off_whatever_was_answered(self):
-        """get_trade_detail_data returns empty off the main strategy thread, so
-        this is not a user-facing choice."""
-        for answers in (_answers(), _answers(allow_order_methods=True),
-                        _answers(transport="zmq")):
-            loaded = _load(init_config.render_server_config(answers), "s.py")
-            self.assertIs(loaded["BIGQMT_REDIS_CONFIG"]["rpc_background_threads"], False)
+    def test_background_threads_follow_the_transport(self):
+        """Not a safety choice, a latency one -- and it differs per transport.
+
+        This test used to pin False for everything, matching a blanket rule
+        that was protecting the wrong thing: safety comes from
+        LISTENER_DEFERRED_METHODS being excluded when the listener list is
+        expanded (test_listener_methods_never_leak_deferred), not from this
+        flag. Pinning one value shipped zmq 37x slower than it needed to be
+        (592.9ms vs 15.8ms) and redis 9x (30.7ms vs 3.4ms) -- see #244 and
+        docs/LATENCY_REPORT.md.
+        """
+        wants_background = {"redis": True, "zmq": False,
+                            "pipe": False, "mysql": False}
+        for transport, expected in sorted(wants_background.items()):
+            loaded = _load(init_config.render_server_config(
+                _answers(transport=transport)), "s.py")
+            self.assertIs(
+                loaded["BIGQMT_REDIS_CONFIG"]["rpc_background_threads"], expected,
+                "transport=%s 应该是 %s" % (transport, expected))
             self.assertIs(loaded["BIGQMT_REDIS_CONFIG"]["rpc_process_in_listener"], True)
+
+    def test_the_order_switch_does_not_change_the_threading_mode(self):
+        for answers in (_answers(), _answers(allow_order_methods=True)):
+            loaded = _load(init_config.render_server_config(answers), "s.py")
+            self.assertIs(loaded["BIGQMT_REDIS_CONFIG"]["rpc_background_threads"], True)
 
     def test_zmq_client_gets_a_concrete_connect_address(self):
         loaded = _load(init_config.render_client_config(

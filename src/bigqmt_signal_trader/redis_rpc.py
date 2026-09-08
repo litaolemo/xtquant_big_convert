@@ -3276,16 +3276,33 @@ class RedisPubSubRpcService:
         return canonical in self.listener_methods
 
     def _expand_listener_methods(self, listener_methods):
+        """Which methods may run inline on the receive thread.
+
+        The deferred set is subtracted **last**, over the whole result, not
+        only inside the ``"*"`` branch. Naming a method explicitly used to
+        bypass the subtraction entirely, so
+        ``rpc_listener_methods=("get_asset",)`` put a trade-context method
+        back on the receive thread. That is harmless while the receive thread
+        IS the adjust thread (rpc_background_threads False), and silently
+        wrong the moment it is not: off the main strategy thread these answer
+        with the right row count and every field None -- which reads as "this
+        account has no money", not as a failed call.
+
+        Making it depend on two unrelated keys agreeing is what kept
+        ``rpc_background_threads`` pinned to False as a blanket rule. Enforce
+        it here instead: no configuration can route a trade-context method to
+        a background thread, so the flag is free to be chosen on latency.
+        """
         methods = set()
         for method in listener_methods or ():
             method = str(method)
             if method in ("*", "all", "read", "readonly"):
-                methods.update(READ_METHODS - LISTENER_DEFERRED_METHODS)
+                methods.update(READ_METHODS)
             else:
                 methods.add(method)
                 canonical = getattr(self.handlers, "_canonical_method", lambda value: value)(method)
                 methods.add(canonical)
-        return methods
+        return methods - LISTENER_DEFERRED_METHODS
 
     def _loads(self, raw_payload):
         if isinstance(raw_payload, dict):

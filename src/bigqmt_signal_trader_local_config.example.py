@@ -42,11 +42,22 @@ BIGQMT_REDIS_CONFIG = {
     # （issue #154），任何看那个界面的人都能看到。设成自己的名字，或者设成
     # "" 让该列留空 —— 和手动下单一样。单次调用传 strategy_name= 始终优先。
     # "rpc_default_strategy_name": "",
-    # Redis and ZMQ can both drain requests through QMT's official
-    # run_time("adjust", ...) callback. This avoids GIL stalls in QMT's process.
+    # Trade-context methods (LISTENER_DEFERRED_METHODS) always run on QMT's
+    # run_time("adjust", ...) callback -- get_trade_detail_data returns EMPTY
+    # off the main strategy thread. That is enforced when the listener list is
+    # expanded, so no value below can move them (#244).
+    #
+    # rpc_background_threads is therefore a pure latency choice, and it differs
+    # per transport (100 read methods, live terminal -- docs/LATENCY_REPORT.md):
+    #     redis  True 3.4ms   / False 30.7ms   <- this file ships redis
+    #     zmq    True 592.9ms / False 15.8ms
+    #     pipe   True 189.0ms / False 94.4ms
+    # Only redis wants True: its brpop wake is immediate, while zmq/pipe
+    # background threads pay a cross-thread GIL handoff (~1 adjust tick) per
+    # round trip. Switching transport? Switch this too.
     "rpc_process_in_listener": True,
     "rpc_listener_methods": ("*",),
-    "rpc_background_threads": False,
+    "rpc_background_threads": True,
     "schedule_adjust": True,
     "schedule_adjust_interval": "100nMilliSecond",
     # The default mode calls get_full_tick through RPC. Enable this cache only

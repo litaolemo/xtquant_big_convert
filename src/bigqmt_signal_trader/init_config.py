@@ -95,6 +95,25 @@ def _zmq_server_bind_host(client_host):
     return "0.0.0.0"
 
 
+def _background_threads_for(transport):
+    """Which rpc_background_threads value this transport wants.
+
+    Not a safety choice -- trade-context methods are excluded from listener
+    processing no matter what this says (#244) -- purely latency. Measured on
+    the live terminal over 100 read methods (docs/LATENCY_REPORT.md):
+
+        redis  True 3.4ms   / False 30.7ms
+        zmq    True 592.9ms / False 15.8ms
+        pipe   True 189.0ms / False 94.4ms
+
+    redis is the only one that wants True: its brpop wake is immediate, while
+    zmq/pipe background threads pay a cross-thread GIL handoff (~1 adjust
+    tick) on every round trip. One blanket value here is what shipped zmq
+    configs 37x slower than they needed to be.
+    """
+    return str(transport or "redis").lower() in ("redis", "", "default")
+
+
 def render_server_config(answers):
     """bigqmt_signal_trader_local_config.py -- read by the QMT-side strategy."""
     lines = [
@@ -131,12 +150,14 @@ def render_server_config(answers):
         lines.append("    # Remote order/cancel stays off until you explicitly want it.")
     lines.extend([
         '    "rpc_allow_order_methods": %r,' % bool(answers["allow_order_methods"]),
-        "    # Requests drain through QMT's run_time(\"adjust\", ...) callback, on the",
-        "    # main strategy thread. get_trade_detail_data returns EMPTY off that",
-        "    # thread, so order/query methods must not move to a background thread.",
+        "    # get_trade_detail_data returns EMPTY off the main strategy thread, so",
+        "    # order/query methods always run on QMT's adjust callback -- enforced",
+        "    # in code, not by the flag below (#244). rpc_background_threads is a",
+        "    # latency choice and it differs per transport: redis wants True,",
+        "    # zmq/pipe want False (adjust drain).",
         '    "rpc_process_in_listener": True,',
         '    "rpc_listener_methods": ("*",),',
-        '    "rpc_background_threads": False,',
+        '    "rpc_background_threads": %r,' % _background_threads_for(answers["transport"]),
         '    "schedule_adjust": True,',
         '    "schedule_adjust_interval": "100nMilliSecond",',
         '    "full_tick_cache_enabled": False,',
@@ -262,7 +283,7 @@ def render_single_file_config_block(answers):
         '    "rpc_allow_order_methods": %r,' % bool(answers["allow_order_methods"]),
         '    "rpc_process_in_listener": True,',
         '    "rpc_listener_methods": ("*",),',
-        '    "rpc_background_threads": False,',
+        '    "rpc_background_threads": %r,' % _background_threads_for(answers["transport"]),
         '    "schedule_adjust": True,',
         '    "schedule_adjust_interval": "100nMilliSecond",',
         '    "full_tick_cache_enabled": False,',
