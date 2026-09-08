@@ -3,6 +3,69 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [0.3.29] - 2026-09-08
+
+三个由 @shengyy 报告的问题，都带隔离复现，逐条核实后修复。
+
+### 修复
+
+- **下单请求可能被重复派发**（#245）。客户端的 redis-py 连接默认带透明重试，
+  而 `Redis._execute_command` 里 `conn.retry.call_with_retry(...)` 包的是
+  **send + parse** —— 服务端已经接受的 RPUSH，若应答阶段出错会重发整条命令。
+  RPUSH 不幂等，于是一次 `call('passorder', ...)` 可能派发两次原生下单。
+  暴露面比报告更大：`order_stock` / `order_stock_async` 都别名到
+  `submit_order`，而 `_handle_submit_order` 没有去重（幂等日志只在
+  `submit_orders_batch` 里），主流下单口全都没有保护。
+
+  服务端按 `(account_id, request_id)` 对 `ORDER_METHODS` 记账：重复到达不再
+  派发，改为重发第一份的答案 —— 重试用的是同一个 request_id、同一个应答键，
+  所以答案正好落在客户端等待的位置，客户端拿到成功而不是错误。表按 512 条 /
+  600s 双重封顶。只读方法不去重（重发只读无害，去重反而会返回陈旧数据）。
+  未改客户端重试行为。
+
+- **账户查询失败会伪装成成功**（#243）。`query_stock_positions` /
+  `query_stock_asset` / `query_stock_position` 在 RPC 抛异常后会去读
+  `bigqmt:positions:<account>`，只要非空就当查询结果返回 —— #229/#230 让原生
+  查询异常上抛，在 redis 客户端这条路上又被吞回去，**同一个输入 zmq 抛错、
+  redis 返回旧持仓**。缓存也不校 `updated_at`。
+
+  新增 `account_cache_fallback`，**默认 False**：失败就是失败，和 zmq/pipe
+  一致。打开后仍要求快照带 `updated_at` 且在
+  `account_cache_max_age_seconds`（默认 30s）以内，日期认不出来当「不知道
+  多旧」拒绝采信；真的用缓存作答时打 WARNING。判定不再借用
+  `local_cache_enabled` —— 那个键是**客户端行情缓存**的开关，两回事。
+
+- **`rpc_background_threads` 的建议是反的，且没有配置能保证安全**（#244）。
+  `qmt-trader/SKILL.md` 教人切 zmq 时改 `True`，而实测 zmq+后台线程 592.9ms、
+  zmq+drain 15.8ms —— 照着装慢 37 倍；延迟数字还停在被推翻的
+  「redis ~13ms / zmq ~0.7ms」。
+
+  根因是 `_expand_listener_methods` 只在 `"*"` 分支里减掉
+  `LISTENER_DEFERRED_METHODS`，**显式点名的方法绕过减法**，所以
+  `rpc_listener_methods=("get_asset",)` 会把 trade-context 方法放回收包线程
+  （离开主线程后它返回行数对、字段全 None 的对象，客户端读成「这账户没钱」）。
+  安全性依赖两个不相干的配置键碰巧一致，这才是那条「一刀切 False」的由来。
+
+  减法改为作用于整个展开结果，任何配置都无法把 trade-context 方法排到后台
+  线程；`"*"` 的展开结果一字未变，现有配置零影响。此后开关纯按延迟选：
+  `init_config` 新增 `_background_threads_for(transport)`，向导按所选传输生成
+  （redis `True` / 其余 `False`）。示例配置、README、SKILL.md 同步到实测口径。
+
+### 文档
+
+- `docs/LATENCY_REPORT.md` 用 0.3.28 实测数据重写，并纠正三处沿用旧反表的
+  说法（zmq 尖峰不是 GIL 固有代价，换 drain 就从 592.9ms 到 15.8ms）。
+- README 第 65 行原写 `rpc_background_threads` 「恒为 False……不是可选项」，
+  与同文件的实测结论直接打架，一并修掉。
+
+### 升级说明
+
+**这是行为变更**：升级后原本被静默掩盖的账户查询故障会开始抛错。这正是意图，
+需要旧行为的显式设 `account_cache_fallback=True`。
+
+修复分布在服务端（#245、#244）和客户端（#243），**两侧都要升**。服务端升级后
+需 `sync_deployment()` + `reload_deployment()`。
+
 ## [0.3.28] - 2026-09-08
 
 ### 文档
