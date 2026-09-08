@@ -358,44 +358,45 @@ def open_qmt(install_dir, mode="auto", bat_path=None, exe_name=None,
     return wait_until_ready(ready_port, timeout_seconds=ready_timeout_seconds)
 
 
-def _looks_like_login_window(rect, screen_width, screen_height):
-    """Return whether a QMT top-level window has login-dialog proportions.
+def classify_qmt_window(style):
+    """Classify a selected QMT Qt window as ``login``, ``main`` or ``unknown``.
 
-    Absolute pixel cut-offs are not stable on Windows: the exact same 国金
-    login window is reported as 832x591 to a DPI-virtualised process and
-    1248x886 after a library makes the process DPI-aware (150% scaling).  The
-    full terminal is normally maximised or close to the work-area size, while
-    the login shell occupies roughly half the screen in both coordinate
-    systems.  Ratios therefore survive DPI scaling and broker UI revisions.
+    国金 QMT uses 0x96000000 for login and 0x960b0000 for its main window
+    (issue #232). Both lack WS_THICKFRAME; the distinguishing bits are
+    WS_SYSMENU, WS_MINIMIZEBOX and WS_MAXIMIZEBOX. Require the observed Qt
+    popup/clipping structure, and reject unsupported frame/button patterns.
+    Geometry and DPI are deliberately irrelevant. Callers must first select
+    the intended terminal's visible Qt window by title; this is not a generic
+    Windows dialog classifier.
     """
-    try:
-        width = max(int(rect[2]) - int(rect[0]), 0)
-        height = max(int(rect[3]) - int(rect[1]), 0)
-        screen_width = max(int(screen_width), 1)
-        screen_height = max(int(screen_height), 1)
-    except (TypeError, ValueError, IndexError):
-        return False
-    return width < screen_width * 0.65 and height < screen_height * 0.65
+    if not isinstance(style, int):
+        return "unknown"
+    style &= 0xffffffff  # GetWindowLong can return a signed 32-bit value.
+    if style & 0x96000000 != 0x96000000 or style & 0x40000000:  # WS_CHILD
+        return "unknown"
+    frame = style & 0x00cf0000  # caption, thick frame, system menu and buttons
+    if frame == 0:
+        return "login"
+    if frame == 0x000b0000:
+        return "main"
+    return "unknown"
 
 
 def _wait_for_main_window(
-        find_window, get_rect, screen_width, screen_height,
+        find_window, window_kind,
         timeout_seconds=90.0, poll_interval=1.0):
     """Wait until the QMT login shell is replaced by the main terminal.
 
     FormulaServer port 58600 already listens while the login dialog is still
     open, so a port-only readiness check can report success after the broker
     has rejected or timed out the login.  Require the visible QMT window to
-    transition to main-window proportions before declaring login complete.
+    become a positively identified main window before declaring login complete.
     """
     deadline = time.monotonic() + max(float(timeout_seconds), 0.0)
     while True:
         handle = find_window()
-        if handle:
-            rect = get_rect(handle)
-            if not _looks_like_login_window(
-                    rect, screen_width, screen_height):
-                return handle
+        if handle and window_kind(handle) == "main":
+            return handle
         if time.monotonic() >= deadline:
             return None
         time.sleep(max(float(poll_interval), 0.0))
@@ -462,19 +463,24 @@ def _login_via_window(credentials, window_title_prefix=None, appear_timeout_seco
         win32gui.EnumWindows(_collect, matches)
         return matches[0] if matches else None
 
+    def _kind(hwnd):
+        try:
+            return classify_qmt_window(win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE))
+        except Exception:
+            return "unknown"  # A disappearing/unreadable window is not logged in.
+
     deadline = time.time() + appear_timeout_seconds
     handle = None
     while time.time() < deadline:
         candidate = _find()
         if candidate:
-            r = win32gui.GetWindowRect(candidate)
-            if _looks_like_login_window(
-                    r, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)):
+            kind = _kind(candidate)
+            if kind == "login":
                 handle = candidate
                 break
-            # 大窗 = 主界面已出现：终端自动登录了，无需输入凭据，直接跳过。
-            log.info("main window already up (auto-login); skipping credentials")
-            return
+            if kind == "main":
+                log.info("main window already up (auto-login); skipping credentials")
+                return
         time.sleep(2.0)
     if not handle:
         raise QmtLauncherError(
@@ -498,17 +504,12 @@ def _login_via_window(credentials, window_title_prefix=None, appear_timeout_seco
             "could not foreground the login dialog (another window may hold focus); "
             "proceeding with topmost + verified clicks anyway")
 
-    def _looks_like_login_dialog():
-        # 登录框约占屏幕一半；主界面是大窗/最大化。不要用固定像素阈值：
-        # 150% DPI 下同一登录框可分别报告成 832x591 或 1248x886。
-        # 自动登录完成时找到的会是主界面——打字会落进主窗口控件，必须跳过。
-        r = win32gui.GetWindowRect(handle)
-        return _looks_like_login_window(
-            r, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1))
-
-    if not _looks_like_login_dialog():
+    kind = _kind(handle)
+    if kind == "main":
         log.info("window is already the main interface (auto-login); skipping credentials")
         return
+    if kind != "login":
+        raise QmtLauncherError("unsupported or unavailable QMT window; refusing credential input")
 
     # 国金 2.1.19 登录框（624x443）控件的相对位置，按比例适配尺寸变化。
     # 账号框 x 必须避开右侧下拉按钮（~0.66w，点它会展开账号列表——实盘事故），
@@ -617,17 +618,17 @@ def _login_via_window(credentials, window_title_prefix=None, appear_timeout_seco
             "aborted without submitting."
         )
 
-    if not _looks_like_login_dialog():
-        # 自动登录在打字过程中已完成——对话框已关闭，别再点"登录"坐标。
+    kind = _kind(handle)
+    if kind == "main":
         log.info("login dialog gone mid-entry (auto-login completed); skipping submit click")
         return
+    if kind != "login":
+        raise QmtLauncherError("QMT window changed or disappeared; refusing login submission")
     # 用 Enter 提交而不是点坐标——布局无关（issue #128）。
     _key(win32con.VK_RETURN)
     if not _wait_for_main_window(
             _find,
-            win32gui.GetWindowRect,
-            user32.GetSystemMetrics(0),
-            user32.GetSystemMetrics(1),
+            _kind,
             timeout_seconds=appear_timeout_seconds):
         raise QmtLauncherError(
             "QMT login did not reach the main window within %.0fs; the login "
