@@ -2460,6 +2460,8 @@ class BigQmtXtData:
         """
         return self.client.call("quote_unsubscribe_all", {})
 
+    _SUBSCRIBE_PRIME_MAX_CODES = 100
+
     def subscribe_whole_quote(self, code_list, callback=None):
         session = self._whole_quote_session()
         session.start()
@@ -2471,12 +2473,34 @@ class BigQmtXtData:
         # subscribe_whole_quote, which is not narrowed, so a narrowed snapshot
         # would hand the subscriber 2315 stocks and then start pushing all
         # 26744 instruments. The primer has to cover what the push covers.
+        #
+        # Large individual code lists (e.g. 3000 stocks) would block the server
+        # adjust thread for seconds via get_full_tick(thousands_of_codes). Instead,
+        # extract the exchange tokens (SH/SZ/...) from the codes and call
+        # get_full_tick with those tokens -- QMT handles exchange tokens as
+        # whole-exchange operations (fast). Then filter the result to only the
+        # codes the caller actually asked for.
         if callback is not None:
             try:
-                callback(self.get_full_tick(code_list, types=["all"]))
+                snapshot = self._prime_snapshot(code_list)
+                if snapshot:
+                    callback(snapshot)
             except Exception:
                 pass
         return sub_id
+
+    def _prime_snapshot(self, code_list):
+        codes = [str(c).strip() for c in (code_list or []) if str(c or "").strip()]
+        if not codes:
+            return {}
+        if len(codes) <= self._SUBSCRIBE_PRIME_MAX_CODES:
+            return self.get_full_tick(codes, types=["all"]) or {}
+        markets = sorted({c.split(".")[-1].upper() for c in codes if "." in c})
+        if not markets:
+            return self.get_full_tick(codes, types=["all"]) or {}
+        wanted = {c.upper() for c in codes}
+        full = self.get_full_tick(markets, types=["all"]) or {}
+        return {k: v for k, v in full.items() if str(k).upper() in wanted}
 
     def unsubscribe_quote(self, seq):
         # Three kinds of handle now: whole-quote / tick subscriptions owned by
