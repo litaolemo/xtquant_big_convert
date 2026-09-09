@@ -831,35 +831,70 @@ xtdata.get_local_data(["close"], ["600654.SH"], period="1d",
 
 ### 多账号使用（股票+期货 / 普通+信用）
 
-当前架构是**单账号单实例**——一个 QMT 策略进程绑定一个账号，RPC channel 按 `account_id` 隔离（`bigqmt:rpc:req:{account_id}`）。多账号场景（如股票+期货、普通+信用账户同时交易）的推荐方案是**在 QMT 里跑多个策略实例**，每个实例绑一个账号。
+当前架构是**单账号单实例**——一个 QMT 策略实例绑一个账号，RPC channel 按 `account_id` 隔离（`bigqmt:rpc:req:{account_id}`）。多账号（股票+期货、普通+信用同时交易）的做法是**在 QMT 里加载多个策略实例，每个实例读自己的那份配置**。
 
-#### 方案：多策略实例（推荐，不改代码）
+#### 服务端（QMT 内）：三步
 
-**服务端（QMT 内）**：为每个账号创建一个独立的配置文件和 DRYRUN 入口。
+**第 1 步：每个账号一份配置文件。** 都放在 QMT 的 `python` 目录，都不进 git。两份之间必须不同的是账号和账号类型：
 
 ```python
-# bigqmt_signal_trader_local_config_stock.py  — 股票账号
+# bigqmt_signal_trader_local_config_stock.py  —— 股票（普通）账号
 BIGQMT_ACCOUNT_ID = "你的股票账号"
+BIGQMT_ACCOUNT_TYPE = "STOCK"
 BIGQMT_REDIS_CONFIG = {
     "host": "...", "port": 6379, "db": 5, "password": "...",
     "transport": "redis",          # 或 "zmq"
-    "account_type": "STOCK",       # 股票
-    # ...
-}
-
-# bigqmt_signal_trader_local_config_credit.py  — 信用账号
-BIGQMT_ACCOUNT_ID = "你的信用账号"
-BIGQMT_REDIS_CONFIG = {
-    "host": "...", "port": 6379, "db": 5, "password": "...",
-    "transport": "redis",
-    "account_type": "CREDIT",      # 信用（两融）
-    # ...
+    # 其余键照抄 src/bigqmt_signal_trader_local_config.example.py
 }
 ```
 
-然后在 QMT 策略编辑器里加载两个 DRYRUN 文件（每个指向不同的配置），分别运行。两个实例的 RPC channel 自动隔离（按 account_id）。
+```python
+# bigqmt_signal_trader_local_config_credit.py  —— 信用（两融）账号
+BIGQMT_ACCOUNT_ID = "你的信用账号"
+BIGQMT_ACCOUNT_TYPE = "CREDIT"     # 别漏：信用账户按 STOCK 查不会报错，
+                                   # 只会返回一行全 0 的资产（issue #92）
+BIGQMT_REDIS_CONFIG = {
+    "host": "...", "port": 6379, "db": 5, "password": "...",
+    "transport": "redis",
+    "account_type": "CREDIT",      # 与 BIGQMT_ACCOUNT_TYPE 二选一即可，两处都认
+}
+```
 
-> **zmq 模式注意**：每个实例的 zmq 端口从 account_id 派生（`15560 + account_id mod 100`），不同账号自动不冲突。
+两份都改名之后就不必再留 `bigqmt_signal_trader_local_config.py` 了 —— 但那样**每个入口副本都必须带下面第 2 步那一行**：没带的入口会去读默认配置，读不到时面板打 `local rpc config load failed`，账号只能靠 QMT 注入的全局兜底（多半是空的）。想省事也可以让其中一个账号继续用默认名，另一个用改名的那份。
+
+**第 2 步：每个账号一份入口副本，各加一行。** 把 `BIGQMT_REDIS_DRYRUN.py`（纯 ZMQ 部署则是 `BIGQMT_ZMQ_DRYRUN.py`）另存一份，在文件顶部加**一行**指明它读哪个配置模块：
+
+```python
+# BIGQMT_REDIS_DRYRUN_CREDIT.py —— 信用账号的入口副本，文件顶部加这一行
+BIGQMT_LOCAL_CONFIG_MODULE = "bigqmt_signal_trader_local_config_credit"
+```
+
+- 写**模块名**，不带 `.py`、不带路径（写成 `..._credit.py` 也认，写路径会直接报错）。
+- 入口会把这个文件**以标准名 `bigqmt_signal_trader_local_config` 装载**——runtime 和 strategy 里那两处写死的 `import` 因此不用改，`_detect_account_id()` 的 `importlib.reload`、`xt_trader.reload_deployment()` 的清模块之后，读到的仍然是这一份。
+- **不加这一行**就是读默认的 `bigqmt_signal_trader_local_config.py`：单账号部署一个字都不用改。
+- 指定的模块**找不到时入口直接报错停机**，并列出找过的目录。它不会退回默认配置——那是另一个账号的配置，用错账号下单比起不来严重得多。
+- 另存的入口文件名随意（`BIGQMT_REDIS_DRYRUN_CREDIT.py` 只是举例），QMT 认的是你加载的那个文件。
+- **升级时记得重拷副本**：`xt_trader.sync_deployment()` 只刷新部署里已有的同名文件，你另存的入口副本它不认识、也就不会更新。升级后从新版 `BIGQMT_REDIS_DRYRUN.py` 重新另存一份，再把那一行加回去。
+
+**第 3 步：两份入口都加进 QMT 的模型交易，分别运行。** 两个实例的 RPC channel 按 `account_id` 自动隔离。
+
+#### 怎么确认每个实例读对了配置
+
+看 QMT 输出面板的启动行，`module=` 就是这个实例真正读到的配置模块：
+
+```
+[bigqmt_shell] local config module=bigqmt_signal_trader_local_config_credit file=D:\...\python\bigqmt_signal_trader_local_config_credit.py
+[bigqmt_shell] local rpc config loaded module=bigqmt_signal_trader_local_config_credit transport=redis keys=[...]
+[bigqmt_rpc] started channel=bigqmt:rpc:req:你的信用账号
+```
+
+`module=` 是唯一能看出「那一行没生效」的地方：没生效时它显示的是标准名 `bigqmt_signal_trader_local_config`，而其余一切照常启动——这一路只是悄悄跑在了另一个账号上。channel 末尾的账号也要和你预期的对上。
+
+> **zmq 模式注意**：每个实例的 zmq 端口从 account_id 派生（`15560 + 账号数字 mod 100`），不同账号一般不冲突；但两个账号的数字末两位相同就会撞端口。显式指定即可：在该账号的 `BIGQMT_REDIS_CONFIG` 里写 `"zmq": {"port": 15571}`。
+
+> **单文件版不用这个开关**：`build_single_file.py` / `build_no_redis_single_file_flat.py` 的产物把配置内嵌在文件顶部的 config block 里，本来就是一份文件一个账号——生成两份、各改各的 config block 即可。
+
+> 机制本身有单测覆盖（`tests/bigqmt_signal_trader/test_multi_account_config_module.py`，含 reload 后仍然生效），但**维护者手上只有一个账号，双实例同时跑没有实盘复跑过**。跑起来了欢迎把上面那三行启动日志贴到 issue 里。
 
 **客户端（外部程序）**：为每个账号创建独立的 client/trader 对象。
 

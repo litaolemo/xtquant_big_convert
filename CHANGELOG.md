@@ -3,6 +3,52 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [未发布]
+
+### 修复
+
+- **README 里的多账号用法并不存在：入口没有办法指定读哪份配置**（#261，@RuralHunter
+  报告）。「多账号使用」一节从写下起就说「在 QMT 策略编辑器里加载两个 DRYRUN 文件
+  （每个指向不同的配置）」，但配置模块名在三处写死 —— `BIGQMT_REDIS_DRYRUN.py` 的
+  `_load_local_config()`、runtime 的 `from bigqmt_signal_trader_local_config import
+  BIGQMT_ACCOUNT_ID, ...`、strategy `_detect_account_id()` 里的那次 reload ——
+  所以第二份入口副本读到的是**第一个账号**的配置：两个实例绑同一个账号，而两边都
+  正常启动、没有任何报错。文档描述的功能不存在。
+
+  入口现在认一个全局 `BIGQMT_LOCAL_CONFIG_MODULE`（和 `BIGQMT_FORCE_TRANSPORT`
+  同一种形状 —— QMT 会 exec 入口文件，所以文件里的全局就是旋钮）：
+
+  ```python
+  # BIGQMT_REDIS_DRYRUN_CREDIT.py 顶部
+  BIGQMT_LOCAL_CONFIG_MODULE = "bigqmt_signal_trader_local_config_credit"
+  ```
+
+  指定的文件**以标准名 `bigqmt_signal_trader_local_config` 装载**，因此上面另外两处
+  写死的 import 一个字都不用改，四条 reload 路径也照常工作：`_local_import` /
+  `importlib.import_module`、`_detect_account_id()` 的 `importlib.reload`、
+  `reload_deployment()` 的清模块（它清的是 `bigqmt_signal_trader[.*]`，不含这个名字）、
+  以及下一次入口运行的 `_clear_local_modules()`（清干净，所以两次运行之间可以换配置）。
+  四条都有单测。不写这一行就是原来的行为，单账号部署一个字不用改。
+
+  指定的模块**找不到时入口直接报错停机**并列出找过的目录，不会退回默认配置 ——
+  那是另一个账号的配置，用错账号下单比起不来严重得多。启动行加了 `module=`
+  （`[bigqmt_shell] local rpc config loaded module=... transport=... keys=...`），
+  这是「那一行没生效」唯一能看出来的地方：没生效时一切照常启动，只是这一路悄悄跑在了
+  另一个账号上。
+
+  `bigqmt_no_redis/DRYRUN_no_redis.py`（手工维护的副本，会静默漂移）同步加了同一个开关。
+
+  **未在双账号实盘环境复跑过**：维护者手上只有一个账号，双实例同时跑需要第二个可用账号。
+
+### 文档
+
+- README「多账号使用（股票+期货 / 普通+信用）」重写成能照着做的步骤：两份配置文件
+  （差异是 `BIGQMT_ACCOUNT_ID` 与 `BIGQMT_ACCOUNT_TYPE`）、两份入口副本各加一行、
+  怎么从启动行确认每个实例读对了配置、zmq 端口末两位撞车怎么办、单文件版为什么不需要
+  这个开关、以及 `sync_deployment()` 不会更新你另存的入口副本。
+  `docs/DEPLOY_QUICKSTART.md` 增加「再加一个账号」小节指过去。
+
+
 ## [0.3.31] - 2026-09-09
 
 行情推送的自愈。由 @shengyy 报告并提交修复（#256 / #257），本仓收尾（#258）。

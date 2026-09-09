@@ -1,6 +1,6 @@
 # 部署快速开始（单账号）
 
-> 面向第一次部署的最短路径。完整安装、传输层对比、多账号、无 redis 版本等见 [README](../README.md) 的「环境要求与依赖安装」「快速开始」章节；排错见 README「日志与排错」。
+> 面向第一次部署的最短路径。完整安装、传输层对比、无 redis 版本等见 [README](../README.md) 的「环境要求与依赖安装」「快速开始」章节；同一台 QMT 上跑第二个账号见 README「多账号使用（股票+期货 / 普通+信用）」；排错见 README「日志与排错」。
 
 ## 前提
 
@@ -102,5 +102,15 @@ xt_trader.reload_status()            # -> {'ok': True, 'modules_purged': 28,
 约 0.8 秒，期间约 1 秒的查询会超时（服务正在重建）。
 
 **但改这两个文件仍然要重启策略**：`bigqmt_signal_trader_strategy.py`、`BIGQMT_REDIS_DRYRUN.py` —— QMT 自己 exec 它们，模块没法 reload 自己所在的模块。
+
+## 再加一个账号
+
+同一台 QMT 上跑第二个账号（股票+信用、股票+期货）：每个账号一份配置文件，再从 `BIGQMT_REDIS_DRYRUN.py` 另存一份入口副本，副本里加一行说明它读哪份配置：
+
+```python
+BIGQMT_LOCAL_CONFIG_MODULE = "bigqmt_signal_trader_local_config_credit"
+```
+
+两份入口分别加载运行即可。完整步骤和「怎么确认读对了配置」见 README「多账号使用（股票+期货 / 普通+信用）」。
 
 更细的排错（日志位置、日志保留策略、启动诊断字段）见 README「日志与排错」。

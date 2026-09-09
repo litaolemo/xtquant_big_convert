@@ -41,6 +41,30 @@ _LOCAL_ROOTS = (
     "bigqmt_signal_trader_redis_rpc_runtime",
     "bigqmt_signal_trader_local_config",
 )
+# The config module name the runtime and the strategy import literally --
+# bigqmt_signal_trader_redis_rpc_runtime does `from
+# bigqmt_signal_trader_local_config import BIGQMT_ACCOUNT_ID, ...` at import
+# time, and the strategy importlib.reloads that same name in
+# _detect_account_id. Neither takes a parameter, so a second account cannot be
+# expressed by pointing them somewhere else (#261).
+_CANONICAL_LOCAL_CONFIG = "bigqmt_signal_trader_local_config"
+# Multi-account: copy this entry per account and add ONE line near the top of
+# the copy (see the multi-account section of the README):
+#
+#     BIGQMT_LOCAL_CONFIG_MODULE = "bigqmt_signal_trader_local_config_credit"
+#
+# The named file is then loaded UNDER the canonical name, so both import sites
+# above stay untouched and every reload path (importlib.reload in
+# _detect_account_id, reload_deployment's package purge, _clear_local_modules
+# on the next entry run) keeps working exactly as it does with one account.
+#
+# Do NOT assign BIGQMT_LOCAL_CONFIG_MODULE in this file. BIGQMT_ZMQ_DRYRUN.py
+# execs this source into its OWN globals, so a default assignment here would
+# overwrite whatever a copy of that wrapper set -- which is why
+# BIGQMT_FORCE_TRANSPORT is only ever read with globals().get() too.
+#
+# name -> source path, for a module loaded from a file not named after it.
+_LOCAL_MODULE_SOURCE_OVERRIDES = {}
 _ORIGINAL_IMPORT = _builtins.__import__
 _ORIGINAL_IMPORT_MODULE = _importlib.import_module
 _ORIGINAL_RELOAD = _importlib.reload
@@ -81,15 +105,22 @@ def _resolve_name(name, module_globals, level):
     return package + ("." + name if name else "")
 
 
-def _find_local_source(name):
-    relative = name.replace(".", os.sep)
+def _local_source_dirs():
     dirs = []
     if _SOURCE_ROOT:
         dirs.append(_SOURCE_ROOT)
     for p in sys.path:
         if p and os.path.isdir(p) and p not in dirs:
             dirs.append(p)
-    for d in dirs:
+    return dirs
+
+
+def _find_local_source(name):
+    override = _LOCAL_MODULE_SOURCE_OVERRIDES.get(name)
+    if override:
+        return override, False
+    relative = name.replace(".", os.sep)
+    for d in _local_source_dirs():
         package_init = os.path.join(d, relative, "__init__.py")
         if os.path.isfile(package_init):
             return package_init, True
@@ -257,11 +288,56 @@ def _stop_previous_rpc_service():
         print("[bigqmt_shell] previous rpc service stop failed: %s" % exc)
 
 
+def _resolve_local_config_module():
+    """Point the canonical config name at whichever module this entry names.
+
+    Returns the module name that will actually be read. Must run after
+    _clear_local_modules() (so the next load reads the chosen file) and before
+    anything imports the config -- the runtime imports it at module load.
+    """
+    chosen = str(globals().get("BIGQMT_LOCAL_CONFIG_MODULE") or "").strip()
+    if chosen.endswith(".py"):
+        # A module name is what is wanted, but "...config_credit.py" is the
+        # obvious slip and its intent is not ambiguous.
+        chosen = chosen[:-3]
+    _LOCAL_MODULE_SOURCE_OVERRIDES.pop(_CANONICAL_LOCAL_CONFIG, None)
+    if not chosen or chosen == _CANONICAL_LOCAL_CONFIG:
+        return _CANONICAL_LOCAL_CONFIG
+    if os.sep in chosen or "/" in chosen or "." in chosen:
+        raise RuntimeError(
+            "BIGQMT_LOCAL_CONFIG_MODULE must be a module name, not a path: %r. "
+            "Put the config file in the QMT python directory beside this entry "
+            "and name the module, e.g. BIGQMT_LOCAL_CONFIG_MODULE = "
+            "\"bigqmt_signal_trader_local_config_credit\"." % chosen)
+    try:
+        source_path, unused_is_package = _find_local_source(chosen)
+    except ImportError:
+        # Falling back to the default config would start this instance on
+        # ANOTHER account -- the one failure mode worse than not starting.
+        raise RuntimeError(
+            "BIGQMT_LOCAL_CONFIG_MODULE = %r, but %s.py was not found. Looked "
+            "in: %s. Create that file (copy "
+            "bigqmt_signal_trader_local_config.example.py, set its "
+            "BIGQMT_ACCOUNT_ID / BIGQMT_ACCOUNT_TYPE) into the QMT python "
+            "directory. Not falling back to %s.py: that is the other account's "
+            "config, and trading the wrong account is worse than not starting."
+            % (chosen, chosen,
+               ", ".join(_local_source_dirs()) or "(no directories)",
+               _CANONICAL_LOCAL_CONFIG))
+    _LOCAL_MODULE_SOURCE_OVERRIDES[_CANONICAL_LOCAL_CONFIG] = source_path
+    return chosen
+
+
 _stop_previous_rpc_service()
 _clear_local_modules()
 _importlib.import_module = _local_import_module
 _importlib.reload = _local_reload
 print("[bigqmt_shell] importlib entry source_root=%s" % _SOURCE_ROOT)
+_LOCAL_CONFIG_MODULE = _resolve_local_config_module()
+if _LOCAL_CONFIG_MODULE != _CANONICAL_LOCAL_CONFIG:
+    print("[bigqmt_shell] local config module=%s file=%s" % (
+        _LOCAL_CONFIG_MODULE,
+        _LOCAL_MODULE_SOURCE_OVERRIDES.get(_CANONICAL_LOCAL_CONFIG, "")))
 
 
 def _fallback_account_id():
@@ -284,7 +360,10 @@ _runtime = _local_import("bigqmt_signal_trader_redis_rpc_runtime", globals(), fr
 
 
 def _load_local_config():
-    return _local_import("bigqmt_signal_trader_local_config", globals(), fromlist=("*",))
+    # Always the canonical name: _resolve_local_config_module has already
+    # pointed it at whichever file this entry names, so the runtime and the
+    # strategy read the same module object this returns.
+    return _local_import(_CANONICAL_LOCAL_CONFIG, globals(), fromlist=("*",))
 
 
 try:
@@ -310,7 +389,12 @@ try:
             # configured/default switch so MiniQMT-compatible order and trade
             # callbacks keep working without Redis.
             BIGQMT_REDIS_CONFIG["full_tick_cache_enabled"] = False
-    print("[bigqmt_shell] local rpc config loaded transport=%s keys=%s" % (
+    # module= names the file this instance actually read. With two accounts in
+    # two QMT strategies the only way to tell them apart at startup is this
+    # line; a copy whose BIGQMT_LOCAL_CONFIG_MODULE never took effect reads as
+    # the canonical name here instead of failing anywhere.
+    print("[bigqmt_shell] local rpc config loaded module=%s transport=%s keys=%s" % (
+        _LOCAL_CONFIG_MODULE,
         (BIGQMT_REDIS_CONFIG or {}).get("transport", "redis"),
         sorted((BIGQMT_REDIS_CONFIG or {}).keys()),
     ))
