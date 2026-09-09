@@ -36,7 +36,7 @@ from bigqmt_signal_trader.xtquant_compat import BigQmtXtData, BigQmtXtTrader
 # issue #262：这张清单一度装着整个「合约/品种」族。问题在于 README 的 RPC
 # 表按名字把它们列成「可调用」，报的人照着写 xtdata.get_open_date(...) 就吃
 # 一个 AttributeError —— 清单是对的（走 call_method 确实能调），但没有任何
-# 一处让调用方发现这一点。现在这一族都有同名包装了（含三个「实测答不了、
+# 一处让调用方发现这一点。现在这一族都有同名包装了（含两个「实测答不了、
 # 于是显式报错」的），清单只留真正没人按名字承诺过的。
 CALL_METHOD_ONLY = frozenset({
     "get_ETF_list",
@@ -173,8 +173,13 @@ class L2ThousandWrapperTest(unittest.TestCase):
 #     AttributeError: 'BigQmtXtData' object has no attribute 'get_open_date'
 #
 # 下面的期望值全部来自 2026-09-09 对实盘桥的实测（见 docs/RPC_API_REFERENCE.md
-# 3.12 的备注）。三个「对任何输入都答同一个空值」的按 get_stock_type 的先例
+# 3.12 的备注）。两个「对任何输入都答同一个空值」的按 get_stock_type 的先例
 # 显式报错，不转发假答案。
+#
+# 曾经是三个：get_bvol 也被判成「恒 0」而拒绝转发，实际是取样全是收盘后只剩
+# 15:00 集合竞价的股票 —— 逆回购（204001.SH -> 1506858）和 511990.SH
+# （-> 22883）立刻有值。所以这里也钉一条：**它必须透传**，0 是合法答案，
+# 没有哨兵可用（回归防线，见 ContractInfoWindowVolumeTest）。
 # ----------------------------------------------------------------------
 
 README_CONTRACT_ROW = (
@@ -304,17 +309,6 @@ class ContractInfoAnswerShapeTest(unittest.TestCase):
 class ContractInfoRefusalTest(unittest.TestCase):
     """实测对任何输入都答同一个空值的，报错而不是转发。"""
 
-    def test_get_bvol_refuses_instead_of_handing_back_the_constant_zero(self):
-        data = _Recorder()
-        data._answer = 0
-        with self.assertRaises(NotImplementedError) as caught:
-            data.get_bvol("601398.SH")
-        text = str(caught.exception)
-        self.assertIn("returns 0 for every code", text)
-        self.assertIn("get_svol", text)
-        self.assertIn("call_method", text)      # 想自己调的人有路可走
-        self.assertEqual(data.calls, [])        # 不用花这次往返
-
     def test_get_turn_over_rate_refuses_instead_of_handing_back_none(self):
         data = _Recorder()
         data._answer = None
@@ -325,11 +319,73 @@ class ContractInfoRefusalTest(unittest.TestCase):
         self.assertIn("call_method", text)
         self.assertEqual(data.calls, [])
 
-    def test_get_svol_still_forwards_because_it_does_answer(self):
-        # 配对的 bvol 拒了，svol 不能跟着拒：实测它对每个代码给不同的非零数
+    def test_the_turn_over_rate_hint_uses_pvolume_not_volume(self):
+        # get_ticks()['volume'] 是手、get_last_volume 是股，相除小 100 倍
+        # （600519.SH 32226 手 vs 3222611 股 / 1250081601 股 = 0.258%）。
+        # 提示里写 'volume' 就是把调用方直接送进那个 100 倍错误。
         data = _Recorder()
-        data._answer = 32586
-        self.assertEqual(data.get_svol("601398.SH"), 32586)
+        data._answer = None
+        with self.assertRaises(NotImplementedError) as caught:
+            data.get_turn_over_rate("600519.SH")
+        text = str(caught.exception)
+        # 公式里必须是 pvolume；提到 ['volume'] 只能是「别用它」那句
+        self.assertIn("[code]['pvolume']", text)
+        self.assertNotIn("[code]['volume']", text)
+        self.assertIn("get_last_volume", text)
+        self.assertIn("100x", text)             # 说清楚用错字段的后果
+
+    def test_the_turn_over_rate_message_names_the_data_precondition(self):
+        # 区间版 get_turnover_rate 要求先下载财务数据（股本）+ 日线
+        # （docs/BIGQMT_INNER_PYTHON_API_REFERENCE.md）。本终端没下过，所以
+        # 「stub 坏了」并不是结论；有数据的终端应当被指到那条路上去，而不是
+        # 读成「这个功能坏了」。
+        data = _Recorder()
+        data._answer = None
+        with self.assertRaises(NotImplementedError) as caught:
+            data.get_turn_over_rate("600519.SH")
+        text = str(caught.exception)
+        self.assertIn("financial data", text)
+        self.assertIn("download", text)
+
+
+class ContractInfoWindowVolumeTest(unittest.TestCase):
+    """内外盘：两个都必须透传。
+
+    get_bvol 一度被判成「对任何代码都答 0」而拒绝转发 —— 那一轮取样全是收盘
+    后只剩 15:00 集合竞价的股票/ETF（集合竞价一个价位撮合、没有主动方，整根
+    落进单侧），换成连续交易到 15:30 的逆回购立刻两侧都有值：
+
+        204001.SH  svol=43226876  bvol=1506858
+        131810.SZ  svol=2898199   bvol=2404676
+        511990.SH  svol=0         bvol=22883     <- 反过来，内盘才是 0
+
+    0 是合法答案、没有哨兵可用，所以拒绝转发等于把一个能用的方法判死。
+    """
+
+    LIVE = (
+        # (code, svol, bvol) —— 2026-09-09 收盘后实测
+        ("204001.SH", 43226876, 1506858),
+        ("131810.SZ", 2898199, 2404676),
+        ("511990.SH", 0, 22883),
+        ("601398.SH", 32586, 0),
+    )
+
+    def test_both_sides_forward_the_terminals_own_number(self):
+        for code, svol, bvol in self.LIVE:
+            for name, answer in (("get_svol", svol), ("get_bvol", bvol)):
+                data = _Recorder()
+                data._answer = answer
+                got = getattr(data, name)(code)
+                self.assertEqual(got, answer, "%s(%s)" % (name, code))
+                self.assertEqual(data.calls, [(name, {"stock": code})],
+                                 "%s(%s)" % (name, code))
+
+    def test_a_zero_is_forwarded_not_turned_into_an_error(self):
+        # 收盘后的股票外盘、511990.SH 的内盘都真的是 0，那是答案不是故障
+        for name in ("get_svol", "get_bvol"):
+            data = _Recorder()
+            data._answer = 0
+            self.assertEqual(getattr(data, name)("601398.SH"), 0, name)
 
 
 class ContractMultiplierSentinelTest(unittest.TestCase):
@@ -370,19 +426,56 @@ class ContractMultiplierSentinelTest(unittest.TestCase):
 
 
 class ShimReachesTheWrappersTest(unittest.TestCase):
-    """顶层 src/xtquant/xtdata.py 的 __getattr__ 直接转到兼容层对象上，
-    所以补了包装之后 `from xtquant import xtdata; xtdata.get_open_date(...)`
-    也跟着通 —— 包括那三个拒绝的（拿到的是带原因的报错，不是 0/None）。"""
+    """报的人写的是 `from xtquant import xtdata`，所以这条路要真的走一遍。
 
-    def test_module_getattr_forwards_to_the_compat_object(self):
-        import io
+    这里**调**，不 grep 源码：原来的版本断言 src/xtquant/xtdata.py 里有
+    `def __getattr__` 和那行 `return getattr(...)`，两句在补包装之前就都在
+    文件里 —— 测试是绿的，而 xtdata.get_open_date(...) 照样抛 AttributeError
+    （CLAUDE.md：验证含义，不是形状）。
 
-        path = os.path.join(ROOT, "src", "xtquant", "xtdata.py")
-        with io.open(path, encoding="utf-8") as handle:
-            source = handle.read()
+    走的是 _Recorder（BigQmtXtData 子类，_call 只记账），所以不需要活桥。
+    """
 
-        self.assertIn("def __getattr__(name):", source)
-        self.assertIn("return getattr(_compat.xtdata, name)", source)
+    def setUp(self):
+        from unittest import mock
+
+        import bigqmt_signal_trader.xtquant_compat as _compat
+
+        self.recorder = _Recorder()
+        patcher = mock.patch.object(_compat, "xtdata", self.recorder)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_reporters_import_path_resolves_and_forwards(self):
+        from xtquant import xtdata as shim
+
+        self.recorder._answer = 20010827
+        self.assertEqual(shim.get_open_date("600519.SH"), 20010827)
+        self.assertEqual(self.recorder.calls,
+                         [("get_open_date", {"stock": "600519.SH"})])
+
+    def test_the_whole_contract_row_is_callable_through_the_shim(self):
+        from xtquant import xtdata as shim
+
+        for name in README_CONTRACT_ROW:
+            attr = getattr(shim, name)          # 补包装前这里就是 AttributeError
+            self.assertTrue(callable(attr), name)
+
+    def test_bvol_answers_through_the_shim_too(self):
+        # 一度在这层被拒；实测 204001.SH -> 1506858
+        from xtquant import xtdata as shim
+
+        self.recorder._answer = 1506858
+        self.assertEqual(shim.get_bvol("204001.SH"), 1506858)
+        self.assertEqual(self.recorder.calls,
+                         [("get_bvol", {"stock": "204001.SH"})])
+
+    def test_a_refused_one_arrives_as_the_explained_error_not_as_none(self):
+        from xtquant import xtdata as shim
+
+        self.recorder._answer = None
+        with self.assertRaises(NotImplementedError):
+            shim.get_turn_over_rate("600519.SH")
 
 
 if __name__ == "__main__":

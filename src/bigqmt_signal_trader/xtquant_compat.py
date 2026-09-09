@@ -3070,6 +3070,11 @@ class BigQmtXtData:
     # 结果见 docs/RPC_API_REFERENCE.md 3.12。**凡是对任何代码都答同一个
     # 空值的，这里不给假答案**：一个恒为 0/None 的返回值看不见，
     # AttributeError 看得见（get_stock_type 就是这么定的）。
+    #
+    # 「恒为空」这个判据本身要小心用：get_bvol 一度被判成「对任何代码都答
+    # 0」而拒绝转发，实际是取样全是收盘后只剩 15:00 集合竞价的股票 —— 换
+    # 逆回购（204001.SH 1506858 / 131810.SZ 2404676）和 511990.SH（22883）
+    # 立刻有值。分母取错就会把一个能用的方法判死，所以现在它照常转发。
     # ------------------------------------------------------------------
 
     def get_instrument(self, stock_code):
@@ -3148,51 +3153,60 @@ class BigQmtXtData:
         return self._call("get_risk_free_rate", index=index)
 
     def get_svol(self, stock):
-        """内盘成交量。
+        """内盘成交量 —— **盘中窗口量，不是当日累计内盘**。
 
-        **数值含义未能证实。** 实测它对每个代码答一个不同的非零数，但和
-        当天成交量对不上，而配对的 get_bvol（外盘）对每个代码都答 0，所以
-        「内盘 + 外盘 = 成交量」在这台终端上不成立：601398.SH svol=32586 /
-        成交量 2154432 手，600519.SH svol=688 / 32226 手。转发原值，别把它
-        直接当成当日内盘量用。
+        和配对的 get_bvol 一起看才读得懂（2026-09-09 收盘后实测）：
+
+        - 尾盘只剩 15:00 收盘集合竞价的代码上，`svol + bvol` **恰好等于最后
+          一根 1 分钟 K 线的成交量**：601398.SH 32586+0、510300.SH 59408+0、
+          000001.SZ 5177+0、511990.SH 0+22883，逐位等于
+          get_market_data_ex(['volume'], period='1m') 的末根。集合竞价一个
+          价位撮合、没有主动方，所以整根落进单侧、另一侧为 0 —— 落哪一侧
+          不固定（511990.SH 落在外盘）。
+        - 连续交易到 15:30 的逆回购上，两侧都非零，但 `svol + bvol` 既不是
+          末根 1 分钟 K 线也不是当日成交量：204001.SH 43226876+1506858
+          =44733734，末根 5565745，当日 2093850077 —— 大约是尾盘几分钟的量，
+          **具体窗口没能定死**。
+
+        所以：`svol + bvol ≠ 日成交量`，两个都不是当日内外盘。要当日口径请
+        自己按 tick 或 K 线累计。
         """
         return self._call("get_svol", stock=stock)
 
     def get_bvol(self, stock):
-        """外盘成交量 —— 这台终端上答不了，直接报错而不是回一个 0。
+        """外盘成交量 —— 语义同 get_svol，见那边的实测记录。
 
-        实测 601398.SH / 000001.SZ / 600519.SH / 510300.SH 全部返回 0，
-        而同一次运行里配对的 get_svol（内盘）对每个代码都给出不同的非零数。
-        恒为 0 的「外盘」比 AttributeError 危险：它会被读成「今天没有主动
-        买盘」，那是一个交易信号。
+        它**不是**恒 0：实测 204001.SH -> 1506858、131810.SZ -> 2404676、
+        511990.SH -> 22883。股票在收盘后答 0，是因为那时最后一根 K 线是
+        15:00 集合竞价、整根都落进内盘，不是这个方法答不了。
         """
-        raise NotImplementedError(
-            "get_bvol is not usable on this Big QMT terminal: the server-side "
-            "ContextInfo.get_bvol stub returns 0 for every code (verified live "
-            "against 601398.SH / 000001.SZ / 600519.SH / 510300.SH, while "
-            "get_svol answered a different non-zero number for each). A "
-            "constant 0 reads as 'no buy-side volume', which is a trading "
-            "signal, so it is refused rather than forwarded. If your terminal "
-            "does answer, call it explicitly with "
-            "xtdata.call_method(\"get_bvol\", stock=...)."
-        )
+        return self._call("get_bvol", stock=stock)
 
     def get_turn_over_rate(self, stockcode):
         """换手率（单值版）—— 这台终端上答不了，直接报错。
 
         实测对 600519.SH / 000001.SZ / 510300.SH / 000300.SH / 601398.SH
-        全部返回 None，换代码格式（600519 / SH600519）也一样。区间版
-        get_turnover_rate 在同一次运行里返回空 DataFrame。
+        全部返回 None，换代码格式（600519 / SH600519）也一样，收盘后重测
+        仍是 None（不是「非交易时段才空」）。区间版 get_turnover_rate 在同
+        一次运行里返回空 DataFrame —— 而它按官方文档需要先下载财务数据
+        （股本）与日线数据，本终端两样都没下过，所以没能区分「stub 坏了」
+        和「缺基础数据」。
         """
         raise NotImplementedError(
             "get_turn_over_rate is not usable on this Big QMT terminal: the "
             "server-side ContextInfo.get_turn_over_rate stub returns None for "
             "every code (verified live against a stock, an ETF, an index and "
-            "several code formats), and the range version get_turnover_rate "
-            "answered an empty DataFrame in the same run. Derive it instead "
-            "from get_ticks()[code]['volume'] and get_last_volume(code) "
-            "(float shares), or call it explicitly with "
-            "xtdata.call_method(\"get_turn_over_rate\", stockcode=...)."
+            "several code formats, after the close). The range version "
+            "get_turnover_rate answered an empty DataFrame in the same run, "
+            "and it documents a precondition this terminal has not met: the "
+            "financial data (share capital) and daily bars must be downloaded "
+            "first (download_financial_data / download_history_data). If yours "
+            "has them, call it explicitly with "
+            "xtdata.call_method(\"get_turn_over_rate\", stockcode=...). "
+            "Otherwise derive it: get_ticks()[code]['pvolume'] / "
+            "get_last_volume(code) -- pvolume is in shares like the float "
+            "share count, while ['volume'] is in lots and would come out 100x "
+            "too small."
         )
 
     # int32 最大值。合约乘数不可能是这个数，它是「没有值」的哨兵。
