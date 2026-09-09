@@ -3274,9 +3274,19 @@ class RedisPubSubRpcService:
         if not self.process_in_listener:
             return False
         method = str((payload or {}).get("method") or "")
+        canonical = getattr(self.handlers, "_canonical_method", lambda value: value)(method)
+        # Second gate, on the per-request path rather than the config path: a
+        # trade-context method never runs on the receive thread, whatever
+        # listener_methods happens to contain (#252). The expansion below is a
+        # one-off at construction; this runs for every request, so a spelling
+        # nobody thought of cannot route get_trade_detail_data off the main
+        # strategy thread -- where it answers with the right row count and
+        # every field None, which a client reads as "no money", not as a
+        # failed call.
+        if method in LISTENER_DEFERRED_METHODS or canonical in LISTENER_DEFERRED_METHODS:
+            return False
         if method in self.listener_methods:
             return True
-        canonical = getattr(self.handlers, "_canonical_method", lambda value: value)(method)
         return canonical in self.listener_methods
 
     def _expand_listener_methods(self, listener_methods):
@@ -3297,6 +3307,7 @@ class RedisPubSubRpcService:
         it here instead: no configuration can route a trade-context method to
         a background thread, so the flag is free to be chosen on latency.
         """
+        resolve = getattr(self.handlers, "_canonical_method", lambda value: value)
         methods = set()
         for method in listener_methods or ():
             method = str(method)
@@ -3304,9 +3315,16 @@ class RedisPubSubRpcService:
                 methods.update(READ_METHODS)
             else:
                 methods.add(method)
-                canonical = getattr(self.handlers, "_canonical_method", lambda value: value)(method)
-                methods.add(canonical)
-        return methods - LISTENER_DEFERRED_METHODS
+                methods.add(resolve(method))
+        # Subtract by CANONICAL name, not by the literal spelling. The loop
+        # above keeps the caller's alias alongside the canonical name, so a
+        # plain `methods - LISTENER_DEFERRED_METHODS` removed `get_positions`
+        # and left `query_stock_positions` sitting right next to it -- and
+        # `_should_process_in_listener` matches the raw method name first, so
+        # the alias won (#252). `("get_positions",)` and `("*",)` were correct
+        # throughout, which is what made this read as "the config spelling
+        # changes the answer" rather than as a dispatch bug.
+        return set(m for m in methods if resolve(m) not in LISTENER_DEFERRED_METHODS)
 
     def _loads(self, raw_payload):
         if isinstance(raw_payload, dict):
