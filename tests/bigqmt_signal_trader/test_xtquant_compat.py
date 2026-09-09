@@ -1026,5 +1026,170 @@ class FormulaStaleWarnTest(unittest.TestCase):
         self.xc._warn_stale_formula_bars({"X": self._df("not-a-date")}, {"period": "1m"})
 
 
+class PartialAnswerMarkerTest(unittest.TestCase):
+    """#237: the server marks an answer that is not the one that was asked for
+    (fewer columns, a dropped argument, a different servant). The client has to
+    carry that onto the frame and say so out loud -- the whole failure mode is
+    an answer that looks complete and is not, and the server's log is on the
+    trading machine where the caller is not looking."""
+
+    MARKER = {
+        "reason": "synth_period_primary_empty",
+        "period": "1mon",
+        "source": "ContextInfo.get_market_data",
+        "requested": ["close", "preClose"],
+        "served": ["close"],
+        "missing": ["preClose"],
+        "fill_data_dropped": True,
+        "padding_rows_dropped": 7,
+    }
+
+    def setUp(self):
+        try:
+            import pandas  # noqa: F401
+        except ImportError:
+            self.skipTest("pandas is not installed")
+        import bigqmt_signal_trader.xtquant_compat as compat
+        compat._partial_warned.clear()
+
+    def _envelope(self, marker=True):
+        frame = {
+            "__bigqmt_type__": "DataFrame",
+            "columns": ["stime", "close"],
+            "records": [["20260831", 1299.52], ["20260930", 1290.88]],
+        }
+        if marker:
+            frame["__bigqmt_partial__"] = dict(self.MARKER)
+        return {"600519.SH": frame}
+
+    def test_restore_puts_the_marker_on_the_frame(self):
+        from bigqmt_signal_trader.xtquant_compat import (
+            PARTIAL_MARKER_ATTR, _restore_jsonable)
+
+        data = _restore_jsonable(self._envelope())
+
+        frame = data["600519.SH"]
+        self.assertEqual(2, len(frame))
+        self.assertEqual(self.MARKER, frame.attrs[PARTIAL_MARKER_ATTR])
+        self.assertNotIn("__bigqmt_partial__", list(frame.columns))
+
+    def test_an_unmarked_answer_rebuilds_exactly_as_before(self):
+        """Skew both ways: an old server sends no marker, and a new client
+        must not invent one."""
+        from bigqmt_signal_trader.xtquant_compat import (
+            PARTIAL_MARKER_ATTR, _restore_jsonable)
+
+        frame = _restore_jsonable(self._envelope(marker=False))["600519.SH"]
+
+        self.assertEqual(["stime", "close"], list(frame.columns))
+        self.assertNotIn(PARTIAL_MARKER_ATTR, dict(frame.attrs))
+
+    def test_the_marker_survives_normalisation_and_warns(self):
+        import warnings as _warnings
+
+        from bigqmt_signal_trader.xtquant_compat import (
+            BigQmtXtData, PARTIAL_MARKER_ATTR, _restore_jsonable)
+
+        envelope = self._envelope()
+
+        class _Client:
+            account_id = "acct"
+            local_cache_config = {}
+            full_tick_cache_config = {}
+
+            def call(self, method, params=None, timeout_seconds=None, **kwargs):
+                return _restore_jsonable(envelope)
+
+        xt = BigQmtXtData(_Client())
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            data = xt._get_market_data_ex_batch(
+                {"field_list": ["close"], "stock_list": ["600519.SH"],
+                 "period": "1mon", "count": 2})
+
+        frame = data["600519.SH"]
+        # Normalisation copies, slices and drops columns; pandas only
+        # propagates attrs on a best-effort basis, so the marker is carried
+        # across explicitly rather than hoped for.
+        self.assertEqual(self.MARKER, frame.attrs[PARTIAL_MARKER_ATTR])
+        messages = [str(item.message) for item in caught]
+        self.assertTrue(any("MISSING preClose" in text for text in messages),
+                        messages)
+        self.assertTrue(any("ContextInfo.get_market_data" in text
+                            for text in messages), messages)
+        self.assertTrue(any("fill_data did not reach the terminal" in text
+                            for text in messages), messages)
+
+    def test_the_same_degradation_warns_once(self):
+        """A bar poll runs this per second; #139 is what one unthrottled line
+        per call costs."""
+        import warnings as _warnings
+
+        from bigqmt_signal_trader.xtquant_compat import _warn_partial_market_data
+
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            for _ in range(5):
+                _warn_partial_market_data([dict(self.MARKER)])
+
+        self.assertEqual(1, len(caught))
+
+    def test_an_unmarked_answer_never_warns(self):
+        import warnings as _warnings
+
+        from bigqmt_signal_trader.xtquant_compat import (
+            BigQmtXtData, PARTIAL_MARKER_ATTR, _restore_jsonable)
+
+        envelope = self._envelope(marker=False)
+
+        class _Client:
+            account_id = "acct"
+            local_cache_config = {}
+            full_tick_cache_config = {}
+
+            def call(self, method, params=None, timeout_seconds=None, **kwargs):
+                return _restore_jsonable(envelope)
+
+        xt = BigQmtXtData(_Client())
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            data = xt._get_market_data_ex_batch(
+                {"field_list": ["close"], "stock_list": ["600519.SH"],
+                 "period": "1mon", "count": 2})
+
+        self.assertEqual([], [str(item.message) for item in caught])
+        self.assertNotIn(PARTIAL_MARKER_ATTR,
+                         dict(data["600519.SH"].attrs))
+
+
+class SynthRescueOnlyIsNotRoutedToFormulaTest(unittest.TestCase):
+    """#237's diagnostic asks the bridge to skip the primary. FormulaServer has
+    no such concept and would answer normally, so a dead rescue would read as
+    alive. It must go to the RPC bridge."""
+
+    def test_the_flag_makes_the_params_untranslatable(self):
+        from bigqmt_signal_trader.formula_server import _market_data_params
+
+        base = {"field_list": ["close"], "stock_list": ["600519.SH"],
+                "period": "1mon", "count": 10}
+        # Without the flag it routes fine.
+        self.assertEqual(["600519.SH"],
+                         _market_data_params(dict(base))["stockCodes"])
+        with self.assertRaises(ValueError):
+            _market_data_params(dict(base, synth_fallback_only=True))
+
+    def test_a_false_flag_still_routes(self):
+        from bigqmt_signal_trader.formula_server import _market_data_params
+
+        base = {"field_list": ["close"], "stock_list": ["600519.SH"],
+                "period": "1mon", "count": 10}
+        for value in (False, "false", "0", "", None):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    ["600519.SH"],
+                    _market_data_params(
+                        dict(base, synth_fallback_only=value))["stockCodes"])
+
+
 if __name__ == "__main__":
     unittest.main()

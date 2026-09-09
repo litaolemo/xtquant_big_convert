@@ -13,6 +13,7 @@ import queue as _queue
 from collections import OrderedDict as _OrderedDict
 import threading
 import importlib
+import warnings
 import datetime as _dt
 from typing import Any, Dict, Iterable, List, Optional
 # Only these three are used below, but every public constant is re-exported
@@ -424,6 +425,71 @@ def _account_type_code(value):
     return 0
 
 
+#: Where a server-side "this answer is degraded" marker lands on the rebuilt
+#: frame. ``DataFrame.attrs`` is pandas >= 1.0; on anything older the marker is
+#: simply dropped, which is why nothing downstream may depend on it existing.
+PARTIAL_MARKER_ATTR = "bigqmt_partial"
+
+#: Reasons already warned about, so a polling caller is told once rather than
+#: once per bar pull (#139 is what unthrottled per-call logging costs).
+_partial_warned = set()
+
+
+def _attach_partial_marker(frame, marker):
+    if not isinstance(marker, dict):
+        return frame
+    try:
+        frame.attrs[PARTIAL_MARKER_ATTR] = dict(marker)
+    except Exception:
+        pass
+    return frame
+
+
+def _partial_marker(frame):
+    """The server's degraded-answer marker on a frame, or None."""
+    try:
+        marker = frame.attrs.get(PARTIAL_MARKER_ATTR)
+    except Exception:
+        return None
+    return marker if isinstance(marker, dict) else None
+
+
+def _warn_partial_market_data(markers):
+    """Say once per distinct degradation that the answer is not the full one.
+
+    The server logs this too, but the server's log is on the trading machine
+    and the caller is not reading it -- and the whole failure mode #237 is
+    about is an answer that looks complete and is not.
+    """
+    for marker in markers:
+        if not isinstance(marker, dict):
+            continue
+        key = (
+            str(marker.get("reason") or ""),
+            str(marker.get("period") or ""),
+            str(marker.get("source") or ""),
+            ",".join(str(name) for name in (marker.get("missing") or [])),
+            bool(marker.get("fill_data_dropped")),
+        )
+        if key in _partial_warned:
+            continue
+        _partial_warned.add(key)
+        message = (
+            "bigqmt: %s bars for period=%s were served by %s, not the usual "
+            "path: columns served %s%s%s. See DataFrame.attrs[%r]."
+            % (marker.get("reason") or "partial",
+               marker.get("period") or "?",
+               marker.get("source") or "?",
+               ",".join(str(name) for name in (marker.get("served") or [])) or "-",
+               ("; MISSING %s" % ",".join(str(n) for n in marker["missing"]))
+               if marker.get("missing") else "",
+               "; fill_data did not reach the terminal"
+               if marker.get("fill_data_dropped") else "",
+               PARTIAL_MARKER_ATTR))
+        warnings.warn(message, stacklevel=2)
+        log.warning("%s", message)
+
+
 def _restore_jsonable(value):
     if isinstance(value, dict):
         marker = value.get("__bigqmt_type__")
@@ -431,9 +497,17 @@ def _restore_jsonable(value):
             try:
                 import pandas as pd
 
-                return pd.DataFrame(value.get("records") or [], columns=value.get("columns") or None)
+                frame = pd.DataFrame(value.get("records") or [],
+                                     columns=value.get("columns") or None)
             except Exception:
                 return value.get("records") or []
+            # #237: the server marks an answer that is not the one that was
+            # asked for -- fewer columns, a dropped argument, a different
+            # servant. Carry it onto the frame so a caller can see it without
+            # reading the terminal's log. An answer without the key rebuilds
+            # exactly as before, so an old server and a new client agree.
+            _attach_partial_marker(frame, value.get("__bigqmt_partial__"))
+            return frame
         if marker == "Panel":
             # pandas dropped Panel in 1.0, so a 3-D object cannot be rebuilt on
             # a modern client. It comes back as what a caller can actually use:
@@ -1743,7 +1817,19 @@ class BigQmtXtData:
         data = self._heal_adjusted("get_market_data_ex", params, data, timeout_seconds=timeout_seconds)
         # Normalize Big QMT's stime-indexed frame to MiniQMT shape (time-indexed).
         if isinstance(data, dict):
+            # Capture the degraded-answer markers first: normalisation copies,
+            # slices and drops columns, and pandas only propagates ``attrs``
+            # on a best-effort basis -- a marker that survives on one pandas
+            # version and not the next is worse than none (#237).
+            markers = dict((code, _partial_marker(frame))
+                           for code, frame in data.items())
             data = _normalize_market_data_result(data, field_list=params.get("field_list"))
+            if isinstance(data, dict) and any(markers.values()):
+                for code, marker in markers.items():
+                    if marker is not None and code in data:
+                        _attach_partial_marker(data[code], marker)
+                _warn_partial_market_data(
+                    [marker for marker in markers.values() if marker])
         return data
 
     @staticmethod
