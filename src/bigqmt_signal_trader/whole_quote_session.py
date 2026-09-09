@@ -83,11 +83,18 @@ class WholeQuoteClientSession(object):
         with self._lock:
             items = [(sid, dict(entry)) for sid, entry in self._subscriptions.items()]
             self._replay_pending = True
+        error = None
         for sub_id, entry in items:
-            self._rpc(
-                "subscribe_whole_quote",
-                {"client_id": self.client_id, "sub_id": sub_id, "codes": entry["codes"]},
-            )
+            try:
+                self._rpc(
+                    "subscribe_whole_quote",
+                    {"client_id": self.client_id, "sub_id": sub_id, "codes": entry["codes"]},
+                )
+            except Exception as exc:
+                if error is None:
+                    error = exc
+        if error is not None:
+            raise error
         with self._lock:
             self._replay_pending = False
 
