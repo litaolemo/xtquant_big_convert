@@ -7,6 +7,50 @@
 
 ### 修复
 
+- **README 按名字列出来的「合约/品种」方法，客户端一个都调不到**（#262，由
+  @pujfei 报告）。`xtdata.get_stock_name("513100.SH")` 好用、
+  `xtdata.get_trading_dates(...)` 好用，`xtdata.get_open_date("600519.SH")` 抛
+  `AttributeError: 'BigQmtXtData' object has no attribute 'get_open_date'`。
+  服务端一直是全的（适配器有 stub、`READ_METHODS` 白名单里有名字），缺的只是
+  客户端那层同名包装 —— 和 #130 一模一样的缺口。这些方法当时被有意归进
+  `CALL_METHOD_ONLY`（走 `xtdata.call_method(...)` 兜底），清单本身没错，
+  错在 README 的 RPC 表按名字把它们列成「可调用」，而报错信息里没有任何东西
+  能让调用方发现兜底入口的存在。
+
+  现在 `get_instrument` / `get_ticks` / `get_last_close` / `get_last_volume` /
+  `get_open_date` / `get_contract_expire_date` / `get_float_caps` /
+  `get_total_share` / `get_weight_in_index` / `get_svol` / `get_bvol` /
+  `get_contract_multiplier` / `get_risk_free_rate` 都能按名字直接调。
+
+- **两个方法「有名字没答案」，包装显式报错而不是转发那个空值**（#262 的实测
+  部分）。补包装之前先对实盘桥逐个探了一遍：
+
+  | 方法 | 实测 | 处理 |
+  |---|---|---|
+  | `get_turn_over_rate` | 5 个代码 × 3 种格式全部 `None`（收盘后重测仍是 `None`）；区间版 `get_turnover_rate` 同一次运行返回空 DataFrame | 抛 `NotImplementedError`，报错里给出替代算法和数据前提 |
+  | `get_contract_multiplier` | 股票 / ETF / 期权 / 期货代码一律 `2147483647`（int32 哨兵）| 回读答案，**只有**对上哨兵才报错，真乘数照常放行 |
+  | `get_stock_type` | 恒 `0`（#130 已处理，本次一并写进文档）| 已有的报错保持 |
+
+  `2147483647` 当合约乘数用会把下单金额算错 20 亿倍。报错看得见，一个恒定的
+  假答案看不见 —— 沿用 #130 给 `get_stock_type` 定的那条线。想自己试的人
+  `xtdata.call_method("get_turn_over_rate", stockcode=...)` 仍然打得通，报错
+  信息里就写着。
+
+- **`get_bvol` 一度被误判成「对任何代码都返回 0」而拒绝转发，本次改回透传**
+  （评审复现，#262）。第一轮取样全是收盘后只剩 15:00 集合竞价的股票/ETF，
+  于是外盘整排 0；换一批代码立刻有值：204001.SH（GC001）`1506858`、
+  131810.SZ（R-001）`2404676`、511990.SH `22883`（这只反过来是 `svol=0`）。
+  这两只逆回购连续交易到 15:30，没有收盘集合竞价 —— 集合竞价一个价位撮合、
+  没有主动方，整根落进单侧，所以「股票收盘后外盘为 0」是**对的答案**，不是
+  答不了。没有哨兵可用（0 是合法值），拒绝转发就是把一个能用的方法判死。
+
+  同一轮实测还纠正了 `get_svol` 的说法：它和 `get_bvol` 之和**逐位等于最后
+  一根 1 分钟 K 线的成交量**（601398.SH 32586、510300.SH 59408、000001.SZ
+  5177、511990.SH 22883，对 `get_market_data_ex(period='1m')` 的末根），
+  之前拿**当日**成交量当分母才得出「内盘 + 外盘 ≠ 成交量、含义未证实」。
+  正确的说法是：两者是**盘中窗口量、不是当日累计**，所以
+  `svol + bvol ≠ 日成交量` 成立，但每根 K 线内是成立的。
+
 - **合成周期（1mon/1q/1hy/1y）在部分终端构建上恒返回 0 行**（#237，报告人
   @yucejade）。国金实盘终端 **2.0.8.0** 上，凡是走 C++ `context.get_market_data2`
   的路径 —— `get_market_data_ex`、`get_market_data_ex_ori`、空 `field_list`、
@@ -67,6 +111,39 @@
   原始接口就只走它」，两台终端因此可能跑在两条完全不同的代码路径上；而
   `_PROBE_CONTEXT_METHODS` 里没有这个名字，probe 永远不报它，报告人和维护者都
   把「两边都没有这个键」读成了「两边一样」，白白多走了两轮。
+
+### 文档
+
+- **`docs/RPC_API_REFERENCE.md` 3.12 有两条标注是错的，按实测订正**：
+  `get_last_volume` 标的是「昨量」、`get_float_caps` 标的是「流通市值」，
+  实际两个都返回**流通股本（股数）**，和 `get_instrument` 的 `FloatVolume`
+  逐位相同（601398.SH → `269612212539`，而同一天成交量是 2154432 手，差五个
+  数量级）。按「昨量」或「市值」用都会静默算错。`get_total_share` 是对的
+  （601398.SH → `356406257089` = `TotalVolume`，确实和流通股本不同）。
+  同时补上整节的实测表（含测量时段与终端版本）、每个方法的客户端调法，以及
+  `get_svol` / `get_bvol`（盘中窗口的内外盘，`svol + bvol` = 末根 1m K 线量，
+  非当日累计）和 `get_risk_free_rate`（恒 3.5，不随 `index` 变，是终端设置值
+  不是 CGB10Y 序列）这两条已知边界。服务端 `market_bigqmt.py` 里
+  `get_float_caps`「流通市值」、`get_last_volume` 的行内注释一并订正。
+
+- **换手率的自算公式之前写错了一个字段**：`get_ticks()[code]['volume']` 是
+  **手**，而 `get_last_volume` 给的流通股本是**股**，两者相除小 100 倍
+  （600519.SH：32226/1250081601 = 0.00258%，真值 0.258%）。改成
+  `['pvolume']`（股）。同时点名区间版 `get_turnover_rate` 的数据前提——官方
+  文档要求先下载财务数据（股本）与日线数据，本终端两样都没下过，所以「stub
+  坏了」和「缺基础数据」没能区分开；有数据的终端值得自己试一次。
+
+- README 的 RPC 表说明改成「表里的方法名，客户端就按这个名字调」，并点名
+  `xtdata.call_method(...)` / `xt_trader.client.call(...)` 这两个兜底入口。
+
+**未能验证**：这台终端没有期货行情（`get_instrument('IF2612.IF')` / `('cu2610.SF')`
+都是 `{}`，`get_his_contract_list('IF')` 是 0 条），所以 `get_contract_multiplier`
+**没能区分「stub 坏了」和「没订阅期货」**，「有期货数据的终端会返回真乘数
+（IF 300 / rb 10）」也**没有实测过** —— 包装因此做成回读哨兵才报错，非哨兵
+一律放行。逆回购上 `svol + bvol` 对不上末根 1m K 线（204001.SH 44733734 vs
+5565745），窗口具体多长没能定死。`get_turn_over_rate` 的数据前提未满足，
+故「stub 本身坏了」这条也只是可能而非结论。以上都只来自一台终端（国金大 QMT
+2.1.19.0），2026-09-09 收盘后实测；`svol` / `bvol` 是盘中量，盘中重测数字会变。
 
 ### 已验证 / 未验证
 

@@ -82,7 +82,7 @@ python -m bigqmt_signal_trader.init_config
 |------|------|
 | **系统** | `ping` |
 | **行情快照** | `get_ticks` / `get_full_tick`（五档盘口）|
-| **合约/品种** | `get_instrument` / `get_instrument_type` / `get_stock_name` / `get_stock_type` / `get_last_close` / `get_last_volume` / `get_open_date` / `get_contract_expire_date` / `get_contract_multiplier` / `get_float_caps` / `get_total_share` / `get_turn_over_rate` / `get_weight_in_index` / `get_svol` / `get_bvol` / `get_risk_free_rate` / `is_stock_type` / `get_cb_info` |
+| **合约/品种** | `get_instrument` / `get_instrument_type` / `get_stock_name` / `get_last_close` / `get_last_volume`（流通股本）/ `get_open_date` / `get_contract_expire_date` / `get_float_caps`（流通股本）/ `get_total_share` / `get_weight_in_index` / `get_svol`、`get_bvol`（盘中窗口内外盘，非当日累计）/ `get_contract_multiplier`（仅在答 int32 哨兵 `2147483647` 时报错）/ `get_risk_free_rate` / `is_stock_type` / `get_cb_info`；**实测答不了、客户端显式报错**：`get_stock_type`（恒 0）/ `get_turn_over_rate`（恒 None）|
 | **K线/历史** | `get_market_data` / `get_market_data_ex` / `get_local_data` / `get_close_price` / `get_index_weight` |
 | **L2 行情** | `get_l2_quote` / `get_l2_order` / `get_l2_transaction` / `subscribe_l2thousand`（需 L2 权限）|
 | **板块** | `get_stock_list_in_sector` / `get_sector_list`* / `get_sector_info` / `create_sector` / `add_sector` / `remove_sector` |
@@ -102,7 +102,15 @@ python -m bigqmt_signal_trader.init_config
 | **持仓同步** | `sync_positions`（写回 Redis 供客户端缓存）|
 | **下单/撤单** | `submit_order` / `cancel_order`（默认关闭，需显式开启）|
 
-> 客户端兼容层 `BigQmtXtData` 对常用方法有显式封装（`xtdata.get_longhubang(...)`、`xtdata.bsm_price(...)` 等），其余通过万能入口 `xtdata.call_method("get_float_caps", stockcode="000001.SZ")` 调用。
+> **表里是 RPC 的方法名，客户端怎么调：**
+>
+> - **行情 / 参考数据**（上表除「账户查询」及往下几行外）在兼容层 `BigQmtXtData` 上有**同名**封装，按表里的名字直接调即可：`xtdata.get_open_date("600519.SH")`、`xtdata.get_longhubang(...)`、`xtdata.bsm_price(...)`。参数名见 [docs/RPC_API_REFERENCE.md](docs/RPC_API_REFERENCE.md)。（issue #262 之前「合约/品种」整族只有兜底一条路，照着表写 `xtdata.get_open_date(...)` 会撞 `AttributeError`。）
+> - **账户 / 委托 / 下单**走 `xt_trader`，用的是 MiniQMT 的方法名：`get_asset` → `xt_trader.query_stock_asset(account)`、`get_positions` → `query_stock_positions`、`submit_order` → `order_stock`，见下节「客户端兼容层」。
+> - **没有同名封装的**（如 `get_ETF_list` / `get_hkt_exchange_rate` / `ping` / `sync_positions`）走万能入口：`xtdata.call_method("get_ETF_list")`，或直接 `xt_trader.client.call("<method>", {...})` —— 白名单里的任何方法都能这么调。
+>
+> **两个方法在实测的这台终端上有名字没答案**（`get_stock_type` 恒 0、`get_turn_over_rate` 对 5 个代码 × 3 种格式恒 None）。这两个的封装**显式抛 `NotImplementedError` 并说明实测结果和替代算法**，不把那个空值递给你 —— 报错看得见，一个恒定的假答案看不见。要自己试的话 `xtdata.call_method("get_turn_over_rate", stockcode=...)` 仍然打得通（区间版 `get_turnover_rate` 按官方文档需先下载财务数据（股本）与日线数据，本终端没下过）。
+>
+> `get_contract_multiplier` 是**回读式**：答案是 int32 哨兵 `2147483647`（这台终端对股票 / ETF / 期权 / 期货代码一律给这个）才报错，真乘数照常放行 —— 但本终端没有期货行情，**「有期货数据时能正常返回」这一条没有实测过**。
 
 > `*` 标记的方法在大 QMT（完整交易端）环境下用 **fallback** 实现（非原生数据）：`get_sector_list` **不再静默返回兜底清单** —— 拿不到终端真实板块时直接抛错，要那 13 个常用板块名请显式传 `allow_fallback=True`（issue #143：一份和真列表长得一模一样的假清单，调用方分辨不出来，用户自建的板块永远不出现）；`get_holidays` 从交易日历反推，`get_markets` 返回固定市场集合，`get_market_last_trade_date` 从日历派生。详见 [docs/RPC_API_REFERENCE.md](docs/RPC_API_REFERENCE.md) 第 8 节「大 QMT 环境的能力边界」。
 

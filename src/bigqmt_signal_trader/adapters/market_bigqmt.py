@@ -2121,7 +2121,9 @@ class BigQmtMarketDataProvider:
         return self._call_context("get_last_close", stock)
 
     def get_last_volume(self, stock):
-        # ContextInfo stub: get_last_volume(stock)
+        # ContextInfo stub: get_last_volume(stock) — 最新**流通股本**，不是「昨量」。
+        # 实测 601398.SH -> 269612212539.0，= get_instrument_detail 的 FloatVolume；
+        # 同一天成交量 2154432 手，差五个数量级（#262）。
         return self._call_context("get_last_volume", stock)
 
     def get_open_date(self, stock):
@@ -2137,7 +2139,9 @@ class BigQmtMarketDataProvider:
         return self._call_context("get_contract_multiplier", stockcode)
 
     def get_float_caps(self, stockcode):
-        # ContextInfo stub: get_float_caps(stockcode) — 流通市值。
+        # ContextInfo stub: get_float_caps(stockcode) — 流通**股本（股数）**，不是流通市值。
+        # 实测与 get_last_volume / FloatVolume 逐位相同（601398.SH -> 269612212539），
+        # 当市值用会差一个价格的倍数（#262）。
         return self._call_context("get_float_caps", stockcode)
 
     def get_total_share(self, stockcode):
@@ -2153,11 +2157,17 @@ class BigQmtMarketDataProvider:
         return self._call_context("get_weight_in_index", mtkindexcode, stockcode)
 
     def get_svol(self, stock):
-        # ContextInfo stub: get_svol(stock)
+        # ContextInfo stub: get_svol(stock) — 内盘，盘中窗口量不是当日累计。
+        # svol + bvol 不等于当日成交量（#262）。它等于最后一根 1 分钟 K 线的
+        # 成交量，只在尾盘活动只剩 15:00 集合竞价的代码上成立（601398.SH
+        # 32586、511990.SH 22883）；连续交易到 15:30 的逆回购上两者对不上
+        # （204001.SH 44733734 vs 末根 5565745），所以只能说这是一个盘中窗口
+        # 的量，窗口具体多长没能定死。详见 xtquant_compat.get_svol 的实测记录。
         return self._call_context("get_svol", stock)
 
     def get_bvol(self, stock):
-        # ContextInfo stub: get_bvol(stock)
+        # ContextInfo stub: get_bvol(stock) — 外盘，语义同 get_svol。
+        # 股票收盘后答 0 是因为集合竞价整根落进内盘；逆回购（连续到 15:30）两侧都非零。
         return self._call_context("get_bvol", stock)
 
     def get_risk_free_rate(self, index=-1):
