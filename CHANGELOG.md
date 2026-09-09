@@ -3,6 +3,62 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [未发布]
+
+### 修复
+
+- **README 按名字列出来的「合约/品种」方法，客户端一个都调不到**（#262，由
+  @pujfei 报告）。`xtdata.get_stock_name("513100.SH")` 好用、
+  `xtdata.get_trading_dates(...)` 好用，`xtdata.get_open_date("600519.SH")` 抛
+  `AttributeError: 'BigQmtXtData' object has no attribute 'get_open_date'`。
+  服务端一直是全的（适配器有 stub、`READ_METHODS` 白名单里有名字），缺的只是
+  客户端那层同名包装 —— 和 #130 一模一样的缺口。这些方法当时被有意归进
+  `CALL_METHOD_ONLY`（走 `xtdata.call_method(...)` 兜底），清单本身没错，
+  错在 README 的 RPC 表按名字把它们列成「可调用」，而报错信息里没有任何东西
+  能让调用方发现兜底入口的存在。
+
+  现在 `get_instrument` / `get_ticks` / `get_last_close` / `get_last_volume` /
+  `get_open_date` / `get_contract_expire_date` / `get_float_caps` /
+  `get_total_share` / `get_weight_in_index` / `get_svol` / `get_risk_free_rate`
+  都能按名字直接调。
+
+- **四个方法「有名字没答案」，包装显式报错而不是转发那个空值**（#262 的实测
+  部分）。补包装之前先对实盘桥逐个探了一遍，结果是有几个根本答不了：
+
+  | 方法 | 实测 | 处理 |
+  |---|---|---|
+  | `get_turn_over_rate` | 5 个代码 × 3 种格式全部 `None`；区间版 `get_turnover_rate` 同一次运行返回空 DataFrame | 抛 `NotImplementedError` |
+  | `get_bvol` | 4 个代码全部 `0`，而配对的 `get_svol` 每个都给不同的非零数 | 抛 `NotImplementedError` |
+  | `get_contract_multiplier` | 股票 / ETF / 期权 / 期货代码一律 `2147483647`（int32 哨兵）| 回读答案，对上哨兵才报错 |
+  | `get_stock_type` | 恒 `0`（#130 已处理，本次一并写进文档）| 已有的报错保持 |
+
+  恒为 `0` 的「外盘成交量」会被读成「今天没有主动买盘」，那是一个交易信号；
+  `2147483647` 当合约乘数用会把下单金额算错 20 亿倍。报错看得见，一个恒定的
+  假答案看不见 —— 沿用 #130 给 `get_stock_type` 定的那条线。想自己试的人
+  `xtdata.call_method("get_bvol", stock=...)` 仍然打得通，报错信息里就写着。
+
+### 文档
+
+- **`docs/RPC_API_REFERENCE.md` 3.12 有两条标注是错的，按实测订正**：
+  `get_last_volume` 标的是「昨量」、`get_float_caps` 标的是「流通市值」，
+  实际两个都返回**流通股本（股数）**，和 `get_instrument` 的 `FloatVolume`
+  逐位相同（601398.SH → `269612212539`，而同一天成交量是 2154432 手，差五个
+  数量级）。按「昨量」或「市值」用都会静默算错。`get_total_share` 是对的
+  （601398.SH → `356406257089` = `TotalVolume`，确实和流通股本不同）。
+  同时补上整节的实测表、每个方法的客户端调法，以及 `get_svol`（内盘+外盘 ≠
+  成交量，含义未证实）和 `get_risk_free_rate`（恒 3.5，不随 `index` 变，是
+  终端设置值不是 CGB10Y 序列）这两条已知边界。
+
+- README 的 RPC 表说明改成「表里的方法名，客户端就按这个名字调」，并点名
+  `xtdata.call_method(...)` / `xt_trader.client.call(...)` 这两个兜底入口。
+
+**未能验证**：这台终端没有期货行情（`get_instrument('IF2612.IF')` / `('cu2610.SF')`
+都是 `{}`，`get_his_contract_list('IF')` 是 0 条），所以 `get_contract_multiplier`
+**没能区分「stub 坏了」和「没订阅期货」** —— 包装因此做成回读哨兵才报错，
+有期货数据的终端能答就照常放行。`get_svol` 的数值含义同样没有对照源可证实。
+以上结论都只来自一台终端（国金大 QMT），非交易时段实测。
+
+
 ## [0.3.31] - 2026-09-09
 
 行情推送的自愈。由 @shengyy 报告并提交修复（#256 / #257），本仓收尾（#258）。

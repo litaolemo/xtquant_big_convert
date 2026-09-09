@@ -3058,6 +3058,176 @@ class BigQmtXtData:
     def get_stock_name(self, stock):
         return self._call("get_stock_name", stock=stock)
 
+    # ------------------------------------------------------------------
+    # 合约/品种基础查询（ContextInfo 扩展，大 QMT 独有）—— issue #262
+    #
+    # README「RPC 接口」表的「合约/品种」一行按名字列了这些方法，服务端
+    # 白名单和适配器也一直有，缺的只是这层同名包装 —— 于是
+    # `xtdata.get_open_date("600519.SH")` 抛 AttributeError，而报错信息里
+    # 没有任何东西告诉你其实可以走 call_method（#262，和 #130 同一类缺口）。
+    #
+    # 下面每一个的取舍都来自 2026-09-09 对实盘桥（国金大 QMT）的逐个实测，
+    # 结果见 docs/RPC_API_REFERENCE.md 3.12。**凡是对任何代码都答同一个
+    # 空值的，这里不给假答案**：一个恒为 0/None 的返回值看不见，
+    # AttributeError 看得见（get_stock_type 就是这么定的）。
+    # ------------------------------------------------------------------
+
+    def get_instrument(self, stock_code):
+        """RPC 侧的方法名。`get_instrument_detail` / `get_instrumentdetail`
+        是它的别名，三个名字回同一份合约详情。"""
+        return self.get_instrument_detail(stock_code)
+
+    def get_ticks(self, code_list, timeout_seconds=None, types=None):
+        """RPC 侧的方法名；MiniQMT 那边叫 `get_full_tick`，二者等价。"""
+        return self.get_full_tick(code_list, timeout_seconds=timeout_seconds,
+                                  types=types)
+
+    def get_last_close(self, stock):
+        """昨收价。实测 600519.SH -> 1309.3，与 get_instrument_detail 的
+        PreClose 一致。"""
+        return self._call("get_last_close", stock=stock)
+
+    def get_last_volume(self, stock):
+        """最新**流通股本**，不是「昨天的成交量」。
+
+        官方释义就是「获取最新流通股本」，名字具有误导性。实测
+        600519.SH -> 1250081601.0、601398.SH -> 269612212539.0，与
+        get_instrument_detail 的 FloatVolume 逐位相同；同一天 601398.SH 的
+        成交量是 2154432 手，差了五个数量级。要成交量请读 get_ticks()。
+        """
+        return self._call("get_last_volume", stock=stock)
+
+    def get_open_date(self, stock):
+        """上市日期，int yyyymmdd。
+
+        实测 600519.SH -> 20010827、510300.SH -> 20120528，与
+        get_instrument_detail 的 OpenDate 一致。
+        """
+        return self._call("get_open_date", stock=stock)
+
+    def get_contract_expire_date(self, stock):
+        """到期日。**返回字符串**，不是 int。
+
+        实测股票/ETF -> '99999999'（无到期日），终端里没有的合约 -> '0'。
+        get_instrument_detail 的 ExpireDate 是同一个值的 int 版，需要数字
+        比较时用那个。
+        """
+        return self._call("get_contract_expire_date", stock=stock)
+
+    def get_float_caps(self, stockcode):
+        """流通**股本**（股数），不是流通市值。
+
+        实测和 get_last_volume 逐位相同（601398.SH -> 269612212539，
+        = get_instrument_detail 的 FloatVolume）。同一天该股昨收 7.94 元，
+        流通市值应是 2 万亿量级 —— 按「市值」用会差一个价格的倍数。
+        """
+        return self._call("get_float_caps", stockcode=stockcode)
+
+    def get_total_share(self, stockcode):
+        """总股本。实测 601398.SH -> 356406257089，确实和流通股本
+        （269612212539）不同，= get_instrument_detail 的 TotalVolume。"""
+        return self._call("get_total_share", stockcode=stockcode)
+
+    def get_weight_in_index(self, mtkindexcode, stockcode):
+        """某只股票在某指数中的绝对权重，**单位是 %**。
+
+        实测 ('000300.SH','600519.SH') -> 5.801、('000016.SH','600519.SH')
+        -> 16.232、('000905.SH','600519.SH') -> 0.0（不是成分股）—— 会随
+        指数和个股变化，不是常数。
+        """
+        return self._call("get_weight_in_index", mtkindexcode=mtkindexcode,
+                          stockcode=stockcode)
+
+    def get_risk_free_rate(self, index=-1):
+        """无风险利率（官方说是十年期国债收益率 CGB10Y），单位 %。
+
+        实测这台终端恒返回 3.5，`index`（K 线索引号）传 -1/0/1/100/5000
+        都一样 —— 也就是说它给的是终端里的一个设置值，不是随 K 线走的
+        CGB10Y 序列。拿来做期权定价的常数可以，当历史利率序列用不行。
+        """
+        return self._call("get_risk_free_rate", index=index)
+
+    def get_svol(self, stock):
+        """内盘成交量。
+
+        **数值含义未能证实。** 实测它对每个代码答一个不同的非零数，但和
+        当天成交量对不上，而配对的 get_bvol（外盘）对每个代码都答 0，所以
+        「内盘 + 外盘 = 成交量」在这台终端上不成立：601398.SH svol=32586 /
+        成交量 2154432 手，600519.SH svol=688 / 32226 手。转发原值，别把它
+        直接当成当日内盘量用。
+        """
+        return self._call("get_svol", stock=stock)
+
+    def get_bvol(self, stock):
+        """外盘成交量 —— 这台终端上答不了，直接报错而不是回一个 0。
+
+        实测 601398.SH / 000001.SZ / 600519.SH / 510300.SH 全部返回 0，
+        而同一次运行里配对的 get_svol（内盘）对每个代码都给出不同的非零数。
+        恒为 0 的「外盘」比 AttributeError 危险：它会被读成「今天没有主动
+        买盘」，那是一个交易信号。
+        """
+        raise NotImplementedError(
+            "get_bvol is not usable on this Big QMT terminal: the server-side "
+            "ContextInfo.get_bvol stub returns 0 for every code (verified live "
+            "against 601398.SH / 000001.SZ / 600519.SH / 510300.SH, while "
+            "get_svol answered a different non-zero number for each). A "
+            "constant 0 reads as 'no buy-side volume', which is a trading "
+            "signal, so it is refused rather than forwarded. If your terminal "
+            "does answer, call it explicitly with "
+            "xtdata.call_method(\"get_bvol\", stock=...)."
+        )
+
+    def get_turn_over_rate(self, stockcode):
+        """换手率（单值版）—— 这台终端上答不了，直接报错。
+
+        实测对 600519.SH / 000001.SZ / 510300.SH / 000300.SH / 601398.SH
+        全部返回 None，换代码格式（600519 / SH600519）也一样。区间版
+        get_turnover_rate 在同一次运行里返回空 DataFrame。
+        """
+        raise NotImplementedError(
+            "get_turn_over_rate is not usable on this Big QMT terminal: the "
+            "server-side ContextInfo.get_turn_over_rate stub returns None for "
+            "every code (verified live against a stock, an ETF, an index and "
+            "several code formats), and the range version get_turnover_rate "
+            "answered an empty DataFrame in the same run. Derive it instead "
+            "from get_ticks()[code]['volume'] and get_last_volume(code) "
+            "(float shares), or call it explicitly with "
+            "xtdata.call_method(\"get_turn_over_rate\", stockcode=...)."
+        )
+
+    # int32 最大值。合约乘数不可能是这个数，它是「没有值」的哨兵。
+    CONTRACT_MULTIPLIER_SENTINEL = 2147483647
+
+    def get_contract_multiplier(self, stockcode):
+        """合约乘数。**答案是哨兵值时报错，不往外递。**
+
+        实测这台终端对股票 / ETF / 期权 / 期货代码一律返回 2147483647
+        （int32 上限，即「没有值」），而它自己也没有期货行情：
+        get_instrument('IF2612.IF') / ('cu2610.SF') 都是 {}，
+        get_his_contract_list('IF') 是 0 条。
+
+        把 2147483647 当乘数用会把下单金额算错 20 亿倍，所以这里回读结果、
+        对上哨兵就报错。有期货数据的终端能正常返回时照常放行。
+        """
+        answer = self._call("get_contract_multiplier", stockcode=stockcode)
+        try:
+            is_sentinel = int(answer) == self.CONTRACT_MULTIPLIER_SENTINEL
+        except (TypeError, ValueError):
+            is_sentinel = False
+        if is_sentinel:
+            raise NotImplementedError(
+                "get_contract_multiplier(%r) answered %s -- the int32 sentinel "
+                "this terminal returns when it has no multiplier for the code "
+                "(verified live: stocks, ETFs, options and futures codes all "
+                "answer it, and the same terminal has no futures data at all: "
+                "get_instrument('IF2612.IF') is {} and get_his_contract_list"
+                "('IF') is empty). Using it as a multiplier would misprice an "
+                "order by a factor of 2e9, so it is not returned. Check the "
+                "futures market data is subscribed, or read "
+                "get_instrument_detail(code)['VolumeMultiple'] instead."
+                % (stockcode, self.CONTRACT_MULTIPLIER_SENTINEL))
+        return answer
+
     def get_close_price(self, market, stock_code, real_timetag, period=86400000, divid_type=0):
         return self._call(
             "get_close_price",

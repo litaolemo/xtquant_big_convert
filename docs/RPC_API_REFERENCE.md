@@ -228,20 +228,55 @@
 |------|------|------|
 | `create_sector` | `sector_name` `stock_list`(list) | 创建/更新自定义板块（写操作）|
 | `get_stock_name` | `stock` | 股票名称（如「平安银行」）|
-| `get_stock_type` | `stock` | 股票类型 |
-| `get_last_close` | `stock` | 昨收价 |
-| `get_last_volume` | `stock` | 昨量 |
-| `get_open_date` | `stock` | 上市日期 |
-| `get_contract_expire_date` | `stock` | 到期日（股票返回 99999999）|
-| `get_contract_multiplier` | `stockcode` | 合约乘数 |
-| `get_float_caps` | `stockcode` | 流通市值 |
-| `get_total_share` | `stockcode` | 总股本 |
-| `get_turn_over_rate` | `stockcode` | 换手率（单值版）|
-| `get_weight_in_index` | `mtkindexcode` `stockcode` | 指数中权重 |
-| `get_svol` | `stock` | | 
-| `get_bvol` | `stock` | |
-| `get_risk_free_rate` | `index`(int, 默认-1) | 无风险利率 |
+| `get_stock_type` | `stock` | ❌ 对任何代码都返回 `0`，客户端包装显式报错，改用 `get_instrument_type` |
+| `get_last_close` | `stock` | 昨收价（= `get_instrument` 的 `PreClose`）|
+| `get_last_volume` | `stock` | **最新流通股本，不是「昨量」**（= `FloatVolume`）|
+| `get_open_date` | `stock` | 上市日期，int `yyyymmdd`（= `OpenDate`）|
+| `get_contract_expire_date` | `stock` | 到期日，**返回字符串**：股票/ETF `'99999999'`，终端里没有的合约 `'0'` |
+| `get_contract_multiplier` | `stockcode` | 合约乘数。⚠️ 实测返回 int32 哨兵 `2147483647`（见下）|
+| `get_float_caps` | `stockcode` | **流通股本（股数），不是流通市值**（= `FloatVolume`，与 `get_last_volume` 同值）|
+| `get_total_share` | `stockcode` | 总股本（= `TotalVolume`，与流通股本确实不同）|
+| `get_turn_over_rate` | `stockcode` | ❌ 对任何代码都返回 `None`，客户端包装显式报错 |
+| `get_weight_in_index` | `mtkindexcode` `stockcode` | 指数中的绝对权重，**单位 %** |
+| `get_svol` | `stock` | 内盘成交量。⚠️ 数值含义未证实（见下）|
+| `get_bvol` | `stock` | ❌ 对任何代码都返回 `0`，客户端包装显式报错 |
+| `get_risk_free_rate` | `index`(int, 默认-1) | 无风险利率（%）。实测恒为 `3.5`，不随 `index` 变 |
 | `get_close_price` | `market` `stock_code` `real_timetag` `period`(默认86400000) `divid_type`(默认0) | 指定时点收盘价 |
+
+**客户端怎么调（issue #262）**：上表每个方法在兼容层 `BigQmtXtData` 上都有同名
+包装，直接 `xtdata.get_open_date("600519.SH")` 即可，参数名同上表。没有同名包装
+的方法走万能入口 `xtdata.call_method("<name>", **params)` / `xt_trader.client.call("<name>", params)`。
+
+**实测记录（2026-09-09，国金大 QMT）**——上表几处订正的依据，和三个「答不了」的判据：
+
+| 方法 | 600519.SH | 510300.SH | 601398.SH |
+|------|-----------|-----------|-----------|
+| `get_open_date` | `20010827` | `20120528` | `20061027` |
+| `get_last_close` | `1309.3` | `4.624` | — |
+| `get_last_volume` | `1250081601.0` | `23468887700.0` | `269612212539.0` |
+| `get_float_caps` | `1250081601` | `23468887700` | `269612212539` |
+| `get_total_share` | `1250081601` | `23468887700` | **`356406257089`** |
+| `get_contract_expire_date` | `'99999999'` | `'99999999'` | `'99999999'` |
+| `get_svol` / `get_bvol` | `688` / `0` | `59408` / `0` | `32586` / `0` |
+| `get_turn_over_rate` | `None` | `None` | `None` |
+| `get_contract_multiplier` | `2147483647` | `2147483647` | `2147483647` |
+| `get_weight_in_index('000300.SH', ·)` | `5.801` | — | `0.806` |
+
+- `get_last_volume` / `get_float_caps` 与 `get_instrument` 的 `FloatVolume` **逐位相同**，
+  而同一天 601398.SH 的成交量是 2154432 手 —— 差五个数量级，所以「昨量」「流通市值」
+  两个旧标注都是错的。`get_total_share` 在 601398.SH 上确实给出不同的数（总股本
+  3564 亿股 vs 流通 2696 亿股），说明它是对的。
+- `get_bvol` 对 4 只不同代码全是 `0`，而同一次运行里配对的 `get_svol` 每个代码都给出
+  不同的非零数 —— 恒为 0 的「外盘」会被读成「今天没有主动买盘」，那是一个交易信号，
+  所以客户端拒绝转发。同时 `内盘 + 外盘 ≠ 成交量`（601398.SH：32586 vs 2154432 手），
+  **`get_svol` 的数值含义也没有证实**，转发原值但别直接当当日内盘量用。
+- `get_contract_multiplier` 对股票 / ETF / 期权 / 期货代码一律返回 `2147483647`
+  （int32 上限 = 「没有值」）。这台终端本身没有期货行情：`get_instrument('IF2612.IF')`
+  `('cu2610.SF')` 全是 `{}`，`get_his_contract_list('IF')` 是 0 条，所以**没能区分
+  「这个 stub 坏了」和「这台终端没订阅期货」**。客户端包装回读答案，对上哨兵才报错，
+  有期货数据的终端能正常返回时照常放行；另一条通道是 `get_instrument(code)['VolumeMultiple']`。
+- `get_risk_free_rate` 传 `index` = -1/0/1/100/5000 都返回 `3.5`，所以它给的是终端里的
+  一个设置值，不是随 K 线走的 CGB10Y 序列。当期权定价的常数可以，当历史利率序列不行。
 
 ---
 
