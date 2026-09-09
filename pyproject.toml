@@ -22,6 +22,8 @@ classifiers = [
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Office/Business :: Financial :: Investment",
 ]
 dependencies = [
@@ -29,7 +31,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-redis = ["redis>=5.0.0"]
+# 8.x 改了两个默认值：protocol 从 2 变 None，默认重试从 3 次抬到 10 次。
+# 重试要紧 —— RPC 请求用 RPUSH 发，而 RPUSH 不幂等：redis-py 的重试包住的是
+# 「发送 + 读应答」，服务端已收下、只是应答丢了的情况下同一条 RPUSH 会被重发，
+# 一次下单可能派发两次（#245）。服务端 0.3.29 起按 request_id 去重兜住了，
+# 但没有理由把默认重试抬到 10。5.2.1/6.4.0/7.4.0 实测 protocol 默认都是 2。
+redis = ["redis>=5.0.0,<8.0.0"]
 mysql = ["pymysql>=1.0.0", "DBUtils>=3.0.0"]
 # Faster/smaller wire encoding for whole-quote push (falls back to json if absent).
 msgpack = ["msgpack>=1.0.0"]
