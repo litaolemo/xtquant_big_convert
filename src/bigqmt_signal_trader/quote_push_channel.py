@@ -18,6 +18,7 @@ channel stays usable without the optional dependency.
 
 import json
 import threading
+import time
 
 try:
     import msgpack
@@ -234,6 +235,8 @@ class RedisQuotePushChannel(QuotePushChannel):
         # This receiver owns reconnect and closes its own connections. Capture
         # its stop event so a later start cannot revive an old blocked receiver.
         channels = [self._channel(topic) for topic in topics]
+        failures = 0          # consecutive reconnect failures, for log throttling
+        last_report = 0.0
         while not stopped.is_set():
             pubsub = None
             try:
@@ -258,7 +261,23 @@ class RedisQuotePushChannel(QuotePushChannel):
                         print("%s subscriber callback failed: %s" % (self.print_prefix, exc))
             except Exception as exc:
                 if not stopped.is_set():
-                    print("%s redis subscriber reconnecting: %s" % (self.print_prefix, exc))
+                    # Retry every second -- quotes should come back fast -- but
+                    # do NOT print every second. Redis down over a weekend is
+                    # 3600 lines/hour, and this repo has been bitten by log
+                    # volume before (#139 wrote one line 16 times; #144 grew a
+                    # log without bound because rotation could never run). The
+                    # zmq ROUTER rebuild backs its reporting off for the same
+                    # reason (#240). Report attempts 1, 2, 4, 8 ... then at most
+                    # once a minute: the first failure stays loud and a long
+                    # outage stays readable.
+                    failures += 1
+                    now = time.time()
+                    if (failures & (failures - 1)) == 0 or now - last_report >= 60.0:
+                        last_report = now
+                        print("%s redis subscriber reconnecting (attempt %d): %s"
+                              % (self.print_prefix, failures, exc))
+            else:
+                failures = 0
             finally:
                 if pubsub is not None:
                     try:

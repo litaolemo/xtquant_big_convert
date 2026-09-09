@@ -77,8 +77,12 @@ class RouterSelfHealTest(unittest.TestCase):
         transport._router_session = session
         transport._bind_configured_address = lambda: None
         real_sleep = time.sleep
+        mine = threading.current_thread()
         try:
-            time.sleep = lambda s: slept.append(s)
+            # 只记录本线程的 sleep。这里替换的是**全局** time.sleep，套件里任何
+            # 并发线程在这个窗口调一次，都会挤进 slept 把断言弄红 —— 实际发生过
+            # 一次偶发失败。门禁里的偶发红比没有断言更糟：读的人会学会忽略红。
+            time.sleep = lambda s: slept.append(s) if threading.current_thread() is mine else None
             transport._router_loop()
         finally:
             time.sleep = real_sleep
@@ -100,8 +104,12 @@ class RouterSelfHealTest(unittest.TestCase):
         transport._router_session = session
         transport._bind_configured_address = lambda: None
         real_sleep = time.sleep
+        mine = threading.current_thread()
         try:
-            time.sleep = lambda s: slept.append(s)
+            # 只记录本线程的 sleep。这里替换的是**全局** time.sleep，套件里任何
+            # 并发线程在这个窗口调一次，都会挤进 slept 把断言弄红 —— 实际发生过
+            # 一次偶发失败。门禁里的偶发红比没有断言更糟：读的人会学会忽略红。
+            time.sleep = lambda s: slept.append(s) if threading.current_thread() is mine else None
             transport._router_loop()
         finally:
             time.sleep = real_sleep
@@ -125,8 +133,9 @@ class RouterSelfHealTest(unittest.TestCase):
         transport._router_session = session
         transport._bind_configured_address = rebind
         real_sleep = time.sleep
+        mine = threading.current_thread()
         try:
-            time.sleep = lambda s: None
+            time.sleep = lambda s: None if threading.current_thread() is mine else real_sleep(s)
             transport._router_loop()
         finally:
             time.sleep = real_sleep
