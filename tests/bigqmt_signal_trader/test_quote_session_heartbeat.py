@@ -35,6 +35,39 @@ def _session_with_failing_rpc():
 
 
 class ReplayFailureDoesNotKillTheLoopTest(unittest.TestCase):
+    def test_partial_replay_retries_even_while_another_subscription_pushes(self):
+        attempts = {"A": 0, "B": 0}
+        active = set()
+        rounds = [0]
+
+        def rpc(method, params):
+            code = params["sub_id"]
+            if method == "subscribe_whole_quote":
+                attempts[code] += 1
+                if code == "B" and attempts[code] == 1:
+                    raise ConnectionError("B replay temporarily unavailable")
+                active.add(code)
+            if "A" in active:
+                session._on_push("A", {"A": {"lastPrice": 1}})
+            return {}
+
+        session = WholeQuoteClientSession(rpc, None, "offline-test", push_silence_replay_heartbeats=2)
+        session._subscriptions = {code: {"topic": code, "codes": [code], "callback": None} for code in attempts}
+        # A server reset requires replay of both existing subscriptions.
+        with self.assertRaises(ConnectionError):
+            session.replay_subscriptions()
+
+        def fake_sleep(_seconds):
+            rounds[0] += 1
+            if rounds[0] >= 10:
+                session._started = False
+
+        session._started = True
+        with mock.patch("time.sleep", fake_sleep):
+            session._heartbeat_loop()
+        self.assertEqual(active, {"A", "B"})
+        self.assertEqual(attempts, {"A": 2, "B": 2})  # Stop replaying once the batch succeeds.
+
     def test_the_loop_survives_a_failing_replay(self):
         session, calls = _session_with_failing_rpc()
         rounds = [0]

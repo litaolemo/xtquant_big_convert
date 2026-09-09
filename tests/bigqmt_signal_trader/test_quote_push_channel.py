@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -152,6 +153,52 @@ class ZmqPushChannelTest(unittest.TestCase):
 
 
 class RedisPushChannelTest(unittest.TestCase):
+    def test_connection_failures_reconnect_and_deliver_without_changing_topics(self):
+        for stage in ("pubsub", "subscribe", "get_message"):
+            with self.subTest(stage=stage):
+                redis_client = FakeRedis()
+                failed = FakePubSub(redis_client)
+                replacement = FakePubSub(redis_client)
+                if stage != "pubsub":
+                    setattr(failed, stage, mock.Mock(side_effect=ConnectionError("offline failure")))
+                redis_client.pubsub = mock.Mock(side_effect=[
+                    ConnectionError("offline failure") if stage == "pubsub" else failed, replacement])
+                client = RedisQuotePushChannel(redis_client, account_id="acct")
+                received, done = [], threading.Event()
+
+                def callback(topic, data):
+                    received.append((topic, data))
+                    done.set()
+
+                redis_client.publish(client._channel("SH"), encode_push_payload({"data": {"x": 1}}))
+                client.start_subscriber(["SH"], callback)
+                try:
+                    self.assertTrue(done.wait(3.0), "connection recovered but callbacks did not")
+                    self.assertEqual(redis_client.pubsub.call_count, 2)
+                    self.assertEqual(received, [("SH", {"x": 1})])
+                    if stage != "pubsub":
+                        self.assertTrue(failed._closed)
+                finally:
+                    client.stop()
+                self.assertTrue(replacement._closed)
+
+    def test_stop_during_reconnect_backoff_does_not_open_another_connection(self):
+        redis_client = FakeRedis()
+        failed = FakePubSub(redis_client)
+        failed.get_message = mock.Mock(side_effect=ConnectionError("offline failure"))
+        closed = threading.Event()
+        failed.close = closed.set
+        redis_client.pubsub = mock.Mock(return_value=failed)
+        client = RedisQuotePushChannel(redis_client)
+        client.start_subscriber(["SH"], lambda *_: None)
+        thread = client._thread
+        try:
+            self.assertTrue(closed.wait(2.0))
+        finally:
+            client.stop()
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(redis_client.pubsub.call_count, 1)
+
     def test_pub_sub_roundtrip(self):
         redis_client = FakeRedis()
         server = RedisQuotePushChannel(redis_client, account_id="acct")

@@ -42,6 +42,7 @@ class WholeQuoteClientSession(object):
         self._subscribed_topics = frozenset()  # topic set the subscriber covers now
         self._heartbeat_thread = None
         self._last_push_time = None  # monotonic time of last incoming push
+        self._replay_pending = False  # a failed batch must finish despite other subscriptions pushing
 
     # -- subscription lifecycle ---------------------------------------------
     def subscribe_whole_quote(self, code_list, callback=None):
@@ -81,11 +82,14 @@ class WholeQuoteClientSession(object):
         Idempotent on the server (keyed by client_id+combo), so replays are safe."""
         with self._lock:
             items = [(sid, dict(entry)) for sid, entry in self._subscriptions.items()]
+            self._replay_pending = True
         for sub_id, entry in items:
             self._rpc(
                 "subscribe_whole_quote",
                 {"client_id": self.client_id, "sub_id": sub_id, "codes": entry["codes"]},
             )
+        with self._lock:
+            self._replay_pending = False
 
     # -- heartbeat -------------------------------------------------------------
     def start(self):
@@ -131,20 +135,9 @@ class WholeQuoteClientSession(object):
                     self._rpc("quote_keepalive", {"client_id": self.client_id, "sub_id": sub_id})
                 except Exception:
                     failures += 1
+            recovered = not failures and consecutive_failures >= 3
             if failures:
                 consecutive_failures += 1
-            elif consecutive_failures >= 3:
-                # Server is back after a restart window: replay subscriptions so
-                # the restarted server re-creates the big-QMT subscriptions (its
-                # state is gone). Idempotent on the server, so replays are safe.
-                # The replay is itself an RPC and can fail while the window is
-                # still open -- that must never kill this loop (#231): a dead
-                # heartbeat leaves every subscription to age out server-side.
-                try:
-                    self.replay_subscriptions()
-                except Exception:
-                    pass
-                consecutive_failures = 0
             else:
                 consecutive_failures = 0
             # Push-silence detection: a server restart can survive with keepalive
@@ -157,9 +150,11 @@ class WholeQuoteClientSession(object):
             else:
                 silence_rounds += 1
             prev_last_push = last_push
-            if silence_rounds >= self._push_silence_replay_heartbeats:
-                # Same rule as the recovery replay above: a failed replay is a
-                # retry next round, never a dead loop (#231).
+            with self._lock:
+                replay_pending = self._replay_pending
+            if recovered or replay_pending or silence_rounds >= self._push_silence_replay_heartbeats:
+                # Retry the idempotent batch until every subscription succeeds.
+                # A's pushes cannot erase B's unresolved replay (#231).
                 try:
                     self.replay_subscriptions()
                 except Exception:

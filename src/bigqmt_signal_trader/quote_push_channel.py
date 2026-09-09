@@ -202,6 +202,7 @@ class RedisQuotePushChannel(QuotePushChannel):
         self._running = False
         self._pubsub = None
         self._thread = None
+        self._subscriber_stop = threading.Event()
 
     def _channel(self, topic):
         return self.channel_template.format(account_id=self.account_id, topic=topic)
@@ -220,51 +221,57 @@ class RedisQuotePushChannel(QuotePushChannel):
 
     # -- client side ---------------------------------------------------------
     def start_subscriber(self, topics, on_msg):
+        self.stop()
         self._running = True
+        self._subscriber_stop = threading.Event()
         self._thread = threading.Thread(
-            target=self._sub_loop, args=(list(topics or []), on_msg), name="bigqmt-quote-push-sub", daemon=True
+            target=self._sub_loop, args=(list(topics or []), on_msg, self._subscriber_stop),
+            name="bigqmt-quote-push-sub", daemon=True
         )
         self._thread.start()
 
-    def _sub_loop(self, topics, on_msg):
-        # The pubsub connection is owned by THIS thread and closed HERE so a
-        # concurrent stop() can't close it out from under us.
-        pubsub = self.redis.pubsub(ignore_subscribe_messages=True)
-        self._pubsub = pubsub
+    def _sub_loop(self, topics, on_msg, stopped):
+        # This receiver owns reconnect and closes its own connections. Capture
+        # its stop event so a later start cannot revive an old blocked receiver.
         channels = [self._channel(topic) for topic in topics]
-        try:
-            pubsub.subscribe(*channels)
-        except Exception as exc:
-            print("%s redis subscribe failed: %s" % (self.print_prefix, exc))
-            return
-        try:
-            while self._running:
-                try:
-                    message = pubsub.get_message(timeout=0.2)
-                except Exception:
-                    break
-                if not message or message.get("type") != "message":
-                    continue
-                channel = message.get("channel")
-                if isinstance(channel, bytes):
-                    channel = channel.decode("utf-8", errors="ignore")
-                topic = str(channel).rsplit(":", 1)[-1]
-                data = decode_push_payload(message.get("data"))
-                payload_data = data.get("data") if isinstance(data, dict) else data
-                try:
-                    on_msg(topic, payload_data)
-                except Exception as exc:
-                    print("%s subscriber callback failed: %s" % (self.print_prefix, exc))
-        finally:
+        while not stopped.is_set():
+            pubsub = None
             try:
-                pubsub.close()
-            except Exception:
-                pass
+                pubsub = self.redis.pubsub(ignore_subscribe_messages=True)
+                self._pubsub = pubsub
+                pubsub.subscribe(*channels)
+                while not stopped.is_set():
+                    message = pubsub.get_message(timeout=0.2)
+                    if stopped.is_set():
+                        break
+                    if not message or message.get("type") != "message":
+                        continue
+                    channel = message.get("channel")
+                    if isinstance(channel, bytes):
+                        channel = channel.decode("utf-8", errors="ignore")
+                    topic = str(channel).rsplit(":", 1)[-1]
+                    data = decode_push_payload(message.get("data"))
+                    payload_data = data.get("data") if isinstance(data, dict) else data
+                    try:
+                        on_msg(topic, payload_data)
+                    except Exception as exc:
+                        print("%s subscriber callback failed: %s" % (self.print_prefix, exc))
+            except Exception as exc:
+                if not stopped.is_set():
+                    print("%s redis subscriber reconnecting: %s" % (self.print_prefix, exc))
+            finally:
+                if pubsub is not None:
+                    try:
+                        pubsub.close()
+                    except Exception:
+                        pass
+            stopped.wait(1.0)
 
     def stop(self):
         self._running = False
+        self._subscriber_stop.set()
         thread = self._thread
-        if thread is not None and thread.is_alive():
+        if thread is not None and thread is not threading.current_thread() and thread.is_alive():
             thread.join(1.0)
         self._thread = None
         self._pubsub = None
