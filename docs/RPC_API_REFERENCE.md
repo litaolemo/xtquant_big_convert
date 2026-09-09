@@ -106,6 +106,46 @@
 
 > DataFrame / Series 在 RPC 协议层用 `__bigqmt_type__` 标记序列化，客户端 `xtquant_compat` 自动还原为 pandas 对象。
 
+**合成周期回落与「这一份不全」标记（#237）**
+
+部分终端构建（实测国金 **2.0.8.0**）上，凡是走 C++ `context.get_market_data2`
+的路径对 `1mon/1q/1hy/1y` 恒返回 0 行，而同一进程里 `ContextInfo.get_market_data`
+给得出来。主路径（含 #219 的 11 列重试）全空且周期属于合成周期时，桥会**逐只代码**
+改走 `ContextInfo.get_market_data` 取数。
+
+它只服务 `open/high/low/close/volume/amount` 六列，签名里也没有 `fill_data`（是
+`skip_paused`）。所以这种应答**不是**调用方要的那一份，桥会在每个代码的 DataFrame
+外层加一个 `__bigqmt_partial__`：
+
+| 字段 | 含义 |
+|------|------|
+| `reason` | `synth_period_primary_empty`（主路径空）或 `synth_rescue_only`（诊断参数强制）|
+| `period` | 触发的周期 |
+| `source` | 真正应答的终端函数，如 `ContextInfo.get_market_data` |
+| `requested` / `served` / `missing` | 请求的列 / 实际给出的列 / **缺的列** |
+| `fill_data_dropped` | `true` = 调用方的 `fill_data` 没送达终端 |
+| `padding_rows_dropped` | 丢掉的 `count` 补齐行数（四价相同、量额为 0 的假 bar）|
+
+客户端 `xtquant_compat` 把它还原到 `DataFrame.attrs["bigqmt_partial"]`，并按
+（原因, 周期, 来源, 缺列）去重发一条 `warnings.warn`。旧客户端会直接忽略这个键，
+应答形状不变。
+
+**诊断参数 `synth_fallback_only`（只读）**
+
+正常终端上主路径从不返回空，回落路径因此**够不到**，也就无法证明它还活着。
+`synth_fallback_only=True` 让合成周期**跳过主路径**、直接走回落（其他周期忽略此参数；
+回落取不到数据时返回诚实的空应答，绝不拿主路径的结果顶替）。它刻意不在客户端
+`xtdata.get_market_data_ex` 的公开签名里——诊断走 `xtdata.call_method` / `client.call`：
+
+```python
+from xtquant import xtdata
+xtdata.call_method("get_market_data_ex", field_list=[], stock_list=["600519.SH"],
+                   period="1mon", count=10, synth_fallback_only=True)
+```
+
+FormulaServer 直连不认这个参数，带上它会强制回落到 RPC 桥（否则「回落通了」会
+是假象——回落根本没跑）。
+
 ### 3.3 板块
 
 | 方法 | 参数 | 返回 | Big QMT 实现说明 |
