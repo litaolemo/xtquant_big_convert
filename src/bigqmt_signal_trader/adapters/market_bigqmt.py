@@ -211,6 +211,113 @@ def _raw_market_data_payload(payload, field_list, stock_list):
     }
 
 
+# The fields ContextInfo.get_local_data actually serves. Measured on Guojin
+# 2.1.19.0 by asking for one field at a time (600519.SH, 1mon, count=10):
+# open/high/low/close/volume/amount/settle answer 10 rows; time,
+# settelementPrice, openInterest, preClose, suspendFlag and stime answer ZERO
+# -- and one unserved name in the list zeroes the WHOLE request (the 11-column
+# list returns 0 rows, an empty field_list returns 0 rows).
+#
+# ``settle`` is deliberately left out even though it answered: it is the one
+# name whose spelling differs between builds (settle vs settelementPrice), so
+# including it risks zeroing the rescue on the very terminals that need it.
+# The six below are exactly what the #237 reporter measured working on the
+# broken build.
+_LOCAL_DATA_SERVED_FIELDS = ("open", "high", "low", "close", "volume", "amount")
+
+
+def _frame_axis_rows(frame):
+    """``[(axis label, row dict), ...]`` for a market-data frame.
+
+    ``_frame_rows`` above is not enough here: get_local_data carries the bar
+    date on the frame's *index*, not in a column, and ``_frame_rows`` reads a
+    pandas frame positionally (``frame[name][i]``), which is label lookup on a
+    date-indexed frame and raises. So walk the index explicitly.
+    """
+    if frame is None:
+        return []
+    if isinstance(frame, dict) and frame.get("__bigqmt_type__") == "DataFrame":
+        columns = [str(name) for name in (frame.get("columns") or [])]
+        out = []
+        for record in frame.get("records") or []:
+            if isinstance(record, dict):
+                row = dict(record)
+            elif isinstance(record, (list, tuple)) and columns:
+                row = dict(zip(columns, record))
+            else:
+                continue
+            out.append((row.get("stime"), row))
+        return out
+    if hasattr(frame, "columns") and hasattr(frame, "index"):
+        try:
+            columns = [name for name in frame.columns]
+            labels = list(frame.index)
+            series = dict((name, list(frame[name])) for name in columns)
+            return [
+                (labels[i], dict((str(name), series[name][i]) for name in columns))
+                for i in range(len(labels))
+            ]
+        except Exception:
+            return []
+    return [(row.get("stime") or row.get("index") or row.get("time"), row)
+            for row in _frame_rows(frame)]
+
+
+def _bar_axis_label(label, row):
+    """The bar's ``stime`` spelling, or None when there is no usable one.
+
+    A frame indexed 0..n (positional, no dates) must not be turned into bars
+    stamped "0", "1", "2" -- that would be a fabricated time axis, which is
+    worse than the empty answer it replaced. None means "abandon".
+    """
+    for candidate in (row.get("stime"), label, row.get("time")):
+        text = str(candidate if candidate is not None else "")
+        digits = "".join(ch for ch in text if ch.isdigit())
+        if len(digits) >= 8:
+            return text
+    return None
+
+
+def _leading_synthetic_bars(rows):
+    """How many leading rows are QMT's count-padding rather than real bars.
+
+    Asked for more bars than it has, get_local_data does not return fewer --
+    it pads the HEAD to reach ``count`` with rows carrying the first real
+    bar's price in all four OHLC slots and zero volume/amount. Measured on
+    600519.SH 1y count=10: seven rows stamped 20171231..20231231, every one of
+    them ``open=high=low=close=1524.0, volume=0, amount=0`` -- 1524.0 being the
+    close of the first real (2024) bar. Moutai did not trade at 1524 in 2017.
+
+    Dropping them is what makes the fallback faithful, not a guess: with the
+    pad removed the answer is identical row-for-row to what the primary path
+    returns on a terminal where the primary works (verified for 600519.SH and
+    000001.SZ across 1w/1d/1mon/1q/1hy/1y, and for 1mon count=200 where the
+    primary has 26 bars and get_local_data padded to 200).
+
+    A genuinely zero-volume monthly/quarterly/yearly bar (a security suspended
+    for the whole period) at the HEAD of the window is dropped too. It carries
+    no price information -- all four prices are the carried-forward previous
+    close -- and this runs only in the rescue path, where the alternative is
+    zero rows.
+    """
+    count = 0
+    for row in rows:
+        volume = _float_or_none(row.get("volume"))
+        amount = _float_or_none(row.get("amount"))
+        open_ = _float_or_none(row.get("open"))
+        high = _float_or_none(row.get("high"))
+        low = _float_or_none(row.get("low"))
+        close = _float_or_none(row.get("close"))
+        if None in (volume, amount, open_, high, low, close):
+            break
+        if volume != 0 or amount != 0:
+            break
+        if not (open_ == high == low == close):
+            break
+        count += 1
+    return count
+
+
 _NATIVE_XTDATA = None  # cached native xtdata SDK module (None = not yet tried)
 _NATIVE_XTDATA_UNAVAILABLE = object()  # sentinel: looked, not importable
 
@@ -818,26 +925,143 @@ class BigQmtMarketDataProvider:
     # columns" to QMT, and how a build expands that for synthesized periods is
     # not trustworthy. Retry once with the explicit K-line field list from the
     # terminal's own reference; an empty retry still means empty.
+    #
+    # Since #237 this tuple gates two things: the field retry above, and the
+    # get_local_data rescue below (which fires for an explicit field list too,
+    # because the broken build answers 0 for the 6-column list as well). Both
+    # stay off daily and intraday periods, where an empty answer is usually
+    # the truth.
     _SYNTH_PERIOD_FIELD_RETRY = ("1w", "1mon", "1q", "1hy", "1y")
     _KLINE_ALL_FIELDS = (
         "time", "open", "high", "low", "close", "volume", "amount",
         "settle", "openInterest", "preClose", "suspendFlag",
     )
 
+    # Warn at most once per period per this interval. The rescue below fires
+    # per call on an affected terminal, and a K-line poll is a per-second
+    # thing -- #139 is what one unthrottled line per call costs (the same
+    # message 373 times in QMT's own panel).
+    _SYNTH_FALLBACK_WARN_INTERVAL_SECONDS = 300.0
+
     def get_market_data_ex(self, **kwargs):
         answer = self._get_market_data_ex_once(**kwargs)
         fields = kwargs.get("field_list") or kwargs.get("fields")
         period = str(kwargs.get("period") or "")
-        if (fields or period not in self._SYNTH_PERIOD_FIELD_RETRY
+        if (period not in self._SYNTH_PERIOD_FIELD_RETRY
                 or not _market_data_answer_empty(answer)):
             return answer
-        retry = dict(kwargs)
-        retry.pop("fields", None)
-        retry["field_list"] = list(self._KLINE_ALL_FIELDS)
-        retried = self._get_market_data_ex_once(**retry)
-        # The retry is a strict improvement only when it found rows; otherwise
-        # keep the original (empty) answer, so "no data" stays "no data".
-        return retried if not _market_data_answer_empty(retried) else answer
+        if not fields:
+            retry = dict(kwargs)
+            retry.pop("fields", None)
+            retry["field_list"] = list(self._KLINE_ALL_FIELDS)
+            retried = self._get_market_data_ex_once(**retry)
+            # The retry is a strict improvement only when it found rows;
+            # otherwise keep going, so "no data" stays "no data".
+            if not _market_data_answer_empty(retried):
+                return retried
+        rescued = self._synth_period_local_fallback(kwargs, fields, period)
+        return answer if rescued is None else rescued
+
+    def _synth_period_local_fallback(self, kwargs, fields, period):
+        """get_local_data as a last resort for a synthesized period (#237).
+
+        Guojin terminal build **2.0.8.0** answers 0 rows for 1mon/1q/1hy/1y on
+        every ContextInfo path that goes through the C++
+        ``context.get_market_data2`` -- ``get_market_data_ex``,
+        ``get_market_data_ex_ori``, empty field_list, the 6-column list and the
+        11-column #219 retry alike -- while ``get_local_data`` on the SAME
+        process and the SAME bars answers 10 rows. 1w and 1d are fine there, and
+        build 2.1.19.0 is fine on every period, so this is one build's
+        synthesis path, not missing data.
+
+        Deliberately narrow:
+
+        * only the synthesized periods. An empty daily/minute answer is
+          usually truthful, and a second RPC per empty call is not free.
+        * only after the primary and the #219 retry have both come up empty.
+        * ``get_local_data`` serves 6 of the 11 columns (see
+          ``_LOCAL_DATA_SERVED_FIELDS``), so a request for all fields comes
+          back with OHLCV only. There is no in-band way to say so -- the client
+          rebuilds the answer as a bare ``pandas.DataFrame`` and drops any
+          extra envelope key -- so the missing columns are the disclosure
+          (``preClose`` is *absent*, not None, so reading it raises rather than
+          lying) and an operator gets the WARNING below.
+        * a caller who asked only for columns get_local_data cannot serve gets
+          the honest empty answer back, not a differently-shaped one.
+
+        Returns None when nothing was rescued, so the caller keeps the
+        original answer.
+        """
+        requested = [str(field) for field in (fields or [])]
+        if requested:
+            served = [field for field in requested
+                      if field in _LOCAL_DATA_SERVED_FIELDS]
+            if not served:
+                return None
+        else:
+            served = list(_LOCAL_DATA_SERVED_FIELDS)
+
+        probe = dict(kwargs)
+        probe.pop("fields", None)
+        # Always ask for the full OHLCV set even when the caller wanted fewer:
+        # spotting the count-padding needs volume/amount and all four prices.
+        probe["field_list"] = list(_LOCAL_DATA_SERVED_FIELDS)
+        try:
+            local = self.get_local_data(**probe)
+        except Exception as exc:
+            self._warn_synth_fallback(
+                period, "get_local_data raised: %s: %s"
+                % (type(exc).__name__, exc))
+            return None
+        if not isinstance(local, dict) or not local:
+            return None
+
+        records = {}
+        trimmed = 0
+        for code, frame in local.items():
+            pairs = _frame_axis_rows(frame)
+            pad = _leading_synthetic_bars([row for _label, row in pairs])
+            if pad:
+                trimmed += pad
+                pairs = pairs[pad:]
+            rows = []
+            for label, row in pairs:
+                stime = _bar_axis_label(label, row)
+                if stime is None:
+                    # No usable time axis: refuse rather than stamp bars with
+                    # positional labels.
+                    self._warn_synth_fallback(
+                        period, "get_local_data answered %d row(s) for %s with "
+                        "no usable time axis; keeping the empty answer"
+                        % (len(pairs), code))
+                    return None
+                rows.append([stime] + [row.get(name) for name in served])
+            records[str(code)] = rows
+
+        if not any(records.values()):
+            return None
+        self._warn_synth_fallback(
+            period,
+            "primary get_market_data2 path answered 0 rows; get_local_data "
+            "rescued %d row(s) for %s (columns served: %s; requested: %s; "
+            "dropped %d count-padding row(s)). Known on Guojin terminal build "
+            "2.0.8.0 -- check resource/version"
+            % (sum(len(rows) for rows in records.values()),
+               ",".join(sorted(records)), ",".join(served),
+               ",".join(requested) if requested else "<all fields>", trimmed))
+        return _raw_market_data_payload(
+            records, served,
+            kwargs.get("stock_list") or kwargs.get("stock_code"))
+
+    def _warn_synth_fallback(self, period, message):
+        seen = getattr(self, "_synth_fallback_warned_at", None)
+        if seen is None:
+            seen = self._synth_fallback_warned_at = {}
+        now = time.time()
+        if now - seen.get(period, 0.0) < self._SYNTH_FALLBACK_WARN_INTERVAL_SECONDS:
+            return
+        seen[period] = now
+        log.warning("[bigqmt_synth_fallback] period=%s: %s", period, message)
 
     def _get_market_data_ex_once(self, **kwargs):
         raw_method = getattr(self.context_info, "get_market_data_ex_ori", None)

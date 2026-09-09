@@ -1566,6 +1566,17 @@ class ProbeCapabilitiesTest(unittest.TestCase):
         handlers = self._handlers()
         self.assertIn("probe_capabilities", handlers.allowed_methods)
 
+    def test_probe_reports_the_raw_market_data_method(self):
+        """#237: 适配层「有 get_market_data_ex_ori 就只走它」，两台终端因此可能
+        跑在两条不同的代码路径上。名单里没有这个名字时 probe 永远不报它，报告人
+        和维护者就都拿「两边都没有这个键」当「两边一样」的证据 —— 名单缺一个名字
+        等于把差异藏起来。"""
+        info = self._handlers().handle("probe_capabilities", {})
+
+        self.assertIn("get_market_data_ex_ori", info["contextinfo_methods"])
+        # 这个 fake 的 ContextInfo 没有原始接口，所以必须是 False，不是缺键。
+        self.assertFalse(info["contextinfo_methods"]["get_market_data_ex_ori"])
+
 
 class BatchSettlementTest(unittest.TestCase):
     """#181 顺带点名的隐患: 批量里的每一笔都往同一个结算单槽里塞。
