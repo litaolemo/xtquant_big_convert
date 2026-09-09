@@ -2482,25 +2482,68 @@ class BigQmtXtData:
         # codes the caller actually asked for.
         if callback is not None:
             try:
-                snapshot = self._prime_snapshot(code_list)
-                if snapshot:
-                    callback(snapshot)
+                # Called unconditionally, including with an empty snapshot:
+                # that is what this did before #247, and a subscriber that
+                # waits for its first callback must not hang because the
+                # primer happened to come back empty.
+                callback(self._prime_snapshot(code_list))
             except Exception:
                 pass
         return sub_id
 
+    # Exchange tokens QMT actually answers a whole-market snapshot for.
+    # Measured on the live terminal: SH 卡 SZ together return 5218 rows in
+    # ~330ms, BJ returns 343. Every futures token -- SF DF ZF IF INE GF --
+    # returns **0 rows**, so routing a futures list through the token path
+    # yields an empty prime, and the subscriber silently never gets a first
+    # frame. That is the #95 shape again: the subscription looks alive, the
+    # snapshot is just missing.
+    _WHOLE_MARKET_TOKENS = ("SH", "SZ", "BJ")
+
     def _prime_snapshot(self, code_list):
+        """First-frame snapshot for subscribe_whole_quote.
+
+        Per-code get_full_tick runs on QMT's adjust thread, and its cost grows
+        with the list: measured medians on the live terminal were ~170ms at 100
+        codes, ~500ms at 200, ~2.5s at 500, ~9.5s at 1000, and a hard
+        TimeoutError at 3000 -- with the adjust thread blocked for that whole
+        time, which stalls the drain and queues every other RPC behind it
+        (#247). A whole-market token is ~330ms flat regardless of size, so
+        above the threshold the token path wins.
+
+        Codes are passed to QMT **verbatim**; only the exchange suffix is
+        upper-cased for routing and only upper-cased copies are used for
+        matching. Big QMT has cu2610.SF and not CU2610.SF, so upper-casing a
+        code before sending it silently kills futures subscriptions (#58/#95).
+        """
         codes = [str(c).strip() for c in (code_list or []) if str(c or "").strip()]
         if not codes:
             return {}
         if len(codes) <= self._SUBSCRIBE_PRIME_MAX_CODES:
             return self.get_full_tick(codes, types=["all"]) or {}
-        markets = sorted({c.split(".")[-1].upper() for c in codes if "." in c})
-        if not markets:
-            return self.get_full_tick(codes, types=["all"]) or {}
-        wanted = {c.upper() for c in codes}
-        full = self.get_full_tick(markets) or {}
-        return {k: v for k, v in full.items() if str(k).upper() in wanted}
+
+        # Split by whether this code's exchange can be primed wholesale.
+        whole, direct = [], []
+        for code in codes:
+            suffix = code.rsplit(".", 1)[-1].upper() if "." in code else ""
+            (whole if suffix in self._WHOLE_MARKET_TOKENS else direct).append(code)
+
+        snapshot = {}
+        if whole:
+            wanted = set()
+            tokens = set()
+            for code in whole:
+                wanted.add(code.upper())
+                tokens.add(code.rsplit(".", 1)[-1].upper())
+            full = self.get_full_tick(sorted(tokens)) or {}
+            snapshot.update(
+                (k, v) for k, v in full.items() if str(k).upper() in wanted)
+        if direct:
+            # No whole-market token for these (futures, and anything new).
+            # Slow for a long list, but slow-and-correct beats fast-and-empty:
+            # before #247 this was the only path, so it is not a regression.
+            snapshot.update(self.get_full_tick(direct, types=["all"]) or {})
+        return snapshot
 
     def unsubscribe_quote(self, seq):
         # Three kinds of handle now: whole-quote / tick subscriptions owned by
@@ -3167,6 +3210,15 @@ class BigQmtXtTrader:
         # ping reports, fall back to what the caller declared.
         self._server_account_type = ""
         self._declared_account_type = ""
+        # Set once the exec-event listener is really subscribed; start() waits
+        # on it instead of sleeping blind. Never cleared on reconnect rounds --
+        # start() only waits once, and a resubscribe does not un-start it.
+        self._event_ready = threading.Event()
+        try:
+            self.event_listener_ready_timeout = float(
+                os.environ.get("BIGQMT_EVENT_READY_TIMEOUT") or 1.0)
+        except (TypeError, ValueError):
+            self.event_listener_ready_timeout = 1.0
         # Account-query cache fallback (#243). OFF by default: a failed
         # POSITION/ASSET query must reach the caller, the way it already does
         # on every non-redis transport. Serving the last redis snapshot
@@ -3348,8 +3400,26 @@ class BigQmtXtTrader:
         # to the account's channels within ~1s if the account changed.
         self._start_event_listener()
         self._fire_account_status()
-        time.sleep(1)
+        # Wait for the exec-event listener to actually be subscribed, rather
+        # than sleeping a fixed second and hoping (#247 shipped time.sleep(1)
+        # here with "原因不明"). The race is real: _start_event_listener starts
+        # a daemon thread and returns, so events published between subscribe()
+        # and the pubsub.subscribe() inside that thread are lost -- a caller
+        # that orders immediately after subscribe() can miss its own fill
+        # callback. start() has the same shape but MiniQMT callers reach events
+        # through subscribe(), which is where the sleep was.
+        #
+        # Bounded by the same 1s the sleep cost, so the worst case is no worse
+        # than before, while the normal case (subscribed in a few ms) no longer
+        # pays for it. BIGQMT_EVENT_READY_TIMEOUT=0 disables the wait.
+        self._await_event_listener()
         return 0
+
+    def _await_event_listener(self):
+        timeout = self.event_listener_ready_timeout
+        if timeout <= 0:
+            return False
+        return self._event_ready.wait(timeout)
 
     def stop(self):
         # Drain first: orders already queued must go out before teardown.
@@ -3439,6 +3509,7 @@ class BigQmtXtTrader:
         try:
             channel = self._build_quote_push_channel()
             channel.start_subscriber(topics, self._on_push_exec_event)
+            self._event_ready.set()          # see the redis path (#247)
             while self._event_running:
                 if str(self.client.account_id or "") != account_id:
                     return       # account changed -> rebuild against the new address
@@ -3528,6 +3599,8 @@ class BigQmtXtTrader:
                 order_error_channel(account_id),
                 cancel_error_channel(account_id),
             )
+            # Subscribed for real -- release start()'s bounded wait (#247).
+            self._event_ready.set()
             while self._event_running:
                 if str(self.client.account_id or "") != account_id:
                     return  # account changed -> reconnect and resubscribe

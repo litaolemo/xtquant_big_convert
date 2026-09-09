@@ -1,0 +1,4 @@
+deferred 的别名 5 个 -> 仍会 inline: 无
+deferred canonical 34 个 -> 仍会 inline: 无
+行情别名被误延后的: 无（全部仍 inline）
+('*',) 展开 106 个, 等于 READ-DEFERRED: True
