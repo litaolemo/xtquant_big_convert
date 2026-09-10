@@ -65,10 +65,11 @@ class OrderTimeParsingTest(unittest.TestCase):
         row = _order_row(m_strInsertDate="20260819", m_strInsertTime="093015")
         self.assertEqual(_order_time_seconds(row), self._expected("20260819093015"))
 
-    def test_morning_time_without_leading_zero(self):
-        for clock in ("93003", "93004", "93015", "93016", "93017"):
+    def test_hhmmss_preserves_seconds_and_afternoon_hours(self):
+        for clock in ("93000", "93003", "93004", "93010", "93015", "93016", "93017",
+                      "94000", "95959", "100000", "113000", "130000", "140000", "145500", "150000"):
             for raw in (clock, int(clock)):
-                expected = self._expected("202609100" + clock)
+                expected = self._expected("20260910" + clock.zfill(6))
                 self.assertEqual(date_time_seconds("20260910", raw), expected)
                 row = _order_row(m_strInsertDate="20260910", m_strInsertTime=raw)
                 self.assertEqual(_order_time_seconds(row), expected)
