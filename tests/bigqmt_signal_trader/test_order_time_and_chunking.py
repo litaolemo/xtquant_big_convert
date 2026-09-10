@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from bigqmt_signal_trader.adapters import order_bigqmt
 from bigqmt_signal_trader.adapters.order_bigqmt import BigQmtOrderGateway, _order_time_seconds
+from bigqmt_signal_trader.exec_events import date_time_seconds
 from bigqmt_signal_trader.models import OrderSnapshot
 from bigqmt_signal_trader.xtquant_compat import BigQmtXtData, BigQmtXtTrader, StockAccount
 
@@ -63,6 +64,14 @@ class OrderTimeParsingTest(unittest.TestCase):
     def test_parses_split_date_and_time(self):
         row = _order_row(m_strInsertDate="20260819", m_strInsertTime="093015")
         self.assertEqual(_order_time_seconds(row), self._expected("20260819093015"))
+
+    def test_morning_time_without_leading_zero(self):
+        for clock in ("93003", "93004", "93015", "93016", "93017"):
+            for raw in (clock, int(clock)):
+                expected = self._expected("202609100" + clock)
+                self.assertEqual(date_time_seconds("20260910", raw), expected)
+                row = _order_row(m_strInsertDate="20260910", m_strInsertTime=raw)
+                self.assertEqual(_order_time_seconds(row), expected)
 
     def test_tolerates_separators(self):
         row = _order_row(m_strInsertDate="2026-08-19", m_strInsertTime="09:30:15")

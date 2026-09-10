@@ -388,26 +388,7 @@ def _order_time_seconds(row):
         _report_missing_order_time(row)
         return 0
 
-    # 已是数字: 当成时间戳 (>1e11 视为毫秒)。
-    if isinstance(raw_time, (int, float)) and not isinstance(raw_time, bool):
-        value = float(raw_time)
-        if value > 1e11:
-            value /= 1000.0
-        if value > 1e8:      # 像时间戳而不是 093015 这种时分秒
-            return int(value)
-
-    date_text = "".join(ch for ch in str(raw_date or "") if ch.isdigit())
-    time_text = "".join(ch for ch in str(raw_time or "") if ch.isdigit())
-    if not date_text or len(date_text) < 8:
-        return 0
-    time_text = (time_text + "000000")[:6]   # 补齐到 HHMMSS, 丢掉毫秒
-    try:
-        import time as _time
-
-        parsed = _time.strptime(date_text[:8] + time_text, "%Y%m%d%H%M%S")
-        return int(_time.mktime(parsed))
-    except Exception:
-        return 0
+    return date_time_seconds(raw_date, raw_time)
 
 
 def _price_type_value(value, default):
