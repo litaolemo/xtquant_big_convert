@@ -3,7 +3,9 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
-## [未发布]
+## [0.3.33] - 2026-09-10
+
+对齐 MiniQMT 契约：账户查询从 dict 改成可属性访问的行对象（现场报错 `'dict' object has no attribute 'm_nStatus'`），另按终端自带的 `xttype` 逐个对账，补齐七处回调与返回对象缺的字段（#271）。
 
 ### 修复
 
