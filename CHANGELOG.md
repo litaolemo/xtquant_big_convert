@@ -3,6 +3,49 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [未发布]
+
+### 修复
+
+- **账户查询返回 dict，属性访问一律 AttributeError**（`query_account_status` /
+  `query_account_infos` / `query_credit_detail`）。现场报错是
+  `AttributeError: 'dict' object has no attribute 'm_nStatus'`。
+
+  按终端自带的 `xtquant` 核对过：MiniQMT 的**同步**查询把终端自己的对象原样交出
+  去，`common_op_sync_with_seq` 就是 `return future.result()`，全程不转换；整个
+  `xttrader.py` 里只有四处构造 `xttype.*`，都在异步应答和推送的包装里。账号状态
+  唯一那次转换发生在推送路径 `on_push_AccountStatus`，它读 `m_nStatus` 再包成
+  `XtAccountStatus`。所以同步查询本来就该给带 `m_` 属性的对象。
+
+  桥这边名字一直是对的（服务端原样转发终端的 `m_` 键），错的是容器。行改成
+  `CompatRow`，一个既能属性访问又仍然是 `dict` 的子类 —— 今天在用下标
+  `row["m_nStatus"]` 的调用方不受影响，json 编码和 `isinstance(.., dict)` 也照旧。
+
+- **七处回调/返回对象缺 `xttype` 契约里的字段**。#133 定的规矩是「契约声明的字段
+  必须在，缺就给 MiniQMT 语义的默认值，而不是让调用方撞 AttributeError」，当时补
+  的是委托/成交/持仓。拿终端自带的 `xttype` 逐个对账，剩下这些还短着：
+
+  | 交付点 | 缺失字段 |
+  | --- | --- |
+  | `on_order_error`（推送） | `account_type`、`account_id` |
+  | `on_cancel_error`（推送） | `account_type`、`account_id`、`market` |
+  | `query_stock_asset` | `account_type` |
+  | `on_order_error`（异步） | `account_type`、`account_id`、`strategy_name` |
+  | `on_order_stock_async_response` | `account_type` |
+  | `on_cancel_error`（异步） | `account_type`、`account_id`、`market` |
+  | `on_cancel_order_stock_async_response` | `account_type` |
+
+  `account_id` 尤其冤：推送那两处的 `_deliver_event` 在函数开头就把它算好了，只是
+  没往对象里传。资产对象同时补了 `m_nAccountType`，和 PR #67 给持仓/资产加的那套
+  `m_` 别名保持一致。
+
+  `XtCancelError.market` 按代码后缀推（`SH_MARKET` 0 / `SZ_MARKET` 1）。异步撤单
+  那条路径本来就没有代码，给 -1 表示「未知」，而不是让默认值冒充上海 —— `SH_MARKET`
+  正好是 0。
+
+  委托、成交、持仓、以及推送的账号状态四类对象对账下来没有缺口。
+
+
 ## [0.3.32] - 2026-09-10
 
 客户端方法补齐与合成周期回落（#262 / #237），另修两处取值 bug：上午五位 HHMMSS 成交时间被解析成 0（#266，由 @shengyy 报告并提交 #267），以及显式传空的 `strategy_name` 被替换成 `bigqmt_rpc`（#268）。

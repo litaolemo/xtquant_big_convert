@@ -94,6 +94,50 @@ class CompatObject:
         return "%s(%s)" % (self.__class__.__name__, items)
 
 
+class CompatRow(dict):
+    """A dict that also answers attribute access, keys untouched.
+
+    MiniQMT's *sync* queries hand back the terminal's own objects. Only the
+    push path builds an xttype object -- ``on_push_AccountStatus`` is the one
+    place ``xttrader`` reads ``m_nStatus`` and converts it -- while every
+    ``query_*`` returns ``common_op_sync_with_seq``'s result unchanged, so the
+    account family arrives with m_ prefixed attributes on it.
+
+    The bridge relayed the right names in the wrong container: a dict, where
+    ``.m_nStatus`` raises AttributeError and only ``["m_nStatus"]`` works.
+    Subclassing dict adds the attribute path without taking the subscript one
+    away, so callers written against today's behaviour keep working, and so
+    does anything that json-encodes the row or checks ``isinstance(.., dict)``.
+    """
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name)
+
+
+def _as_compat_row(row):
+    """Wrap a native-field dict for attribute access; pass anything else through."""
+    return CompatRow(row) if isinstance(row, dict) else row
+
+
+def _market_of(stock_code):
+    """``XtCancelError.market`` -- xtconstant SH_MARKET (0) / SZ_MARKET (1).
+
+    The code's suffix is the only source the bridge has, and the cancel paths
+    often carry no code at all. -1 there says "not known" rather than letting
+    an absent value impersonate 上海, which is what defaulting to 0 would do.
+    """
+    suffix = str(stock_code or "").rsplit(".", 1)[-1].upper()
+    if suffix == "SH":
+        return 0
+    if suffix == "SZ":
+        return 1
+    return -1
+
+
+
 
 
 
@@ -3930,6 +3974,10 @@ class BigQmtXtTrader:
                 _sysid = str(event.get("order_sys_id") or "")
                 callback.on_order_error(
                     CompatObject(
+                        # xttype.XtOrderError names both, and account_id
+                        # was already resolved at the top of this method.
+                        account_id=account_id,
+                        account_type=self._account_type_value(event),
                         error_id=event.get("error_id"),
                         error_msg=event.get("error_msg") or "",
                         order_sysid=_sysid,       # MiniQMT 规范名 (issue #65)
@@ -3948,6 +3996,9 @@ class BigQmtXtTrader:
                 _sysid = str(event.get("order_sys_id") or "")
                 callback.on_cancel_error(
                     CompatObject(
+                        account_id=account_id,
+                        account_type=self._account_type_value(event),
+                        market=_market_of(event.get("stock_code")),
                         error_id=event.get("error_id"),
                         error_msg=event.get("error_msg") or "",
                         order_sysid=_sysid,       # MiniQMT 规范名 (issue #65)
@@ -4005,6 +4056,9 @@ class BigQmtXtTrader:
                 market_value -= _safe_float(frozen_cash)
         return CompatObject(
             account_id=account_id,
+            # xttype.XtAsset carries it. #133 added account_type to
+            # order/trade/position; the asset object was missed.
+            account_type=self._account_type_value(),
             cash=_safe_float(cash, 0.0) if cash is not None else None,
             available_cash=_safe_float(cash, 0.0) if cash is not None else None,
             # MiniQMT's XtAsset always exposes frozen_cash, so default to 0.0
@@ -4014,6 +4068,7 @@ class BigQmtXtTrader:
             market_value=_safe_float(market_value, 0.0) if market_value is not None else 0.0,
             # ===== 原生 xtquant 字段名别名（兼容 m_ 前缀访问）=====
             m_strAccountID=account_id,
+            m_nAccountType=self._account_type_value(),
             m_dCash=_safe_float(cash, 0.0) if cash is not None else None,
             m_dAvailableCash=_safe_float(cash, 0.0) if cash is not None else None,
             m_dFrozenCash=_safe_float(frozen_cash, 0.0) if frozen_cash is not None else 0.0,
@@ -5109,6 +5164,9 @@ class BigQmtXtTrader:
                 if callback is not None:
                     callback.on_order_error(
                         CompatObject(
+                            account_id=self.client.account_id,
+                            account_type=self._account_type_value(),
+                            strategy_name=unit.get("strategy_name", ""),
                             error_id=unit["error_id"],
                             error_msg=unit["error_msg"],
                             order_sysid="",          # MiniQMT 规范名 (issue #65)
@@ -5143,6 +5201,7 @@ class BigQmtXtTrader:
                 callback.on_order_stock_async_response(
                     CompatObject(
                         account_id=self.client.account_id,
+                        account_type=self._account_type_value(),
                         seq=seq,
                         order_id=self._order_object_id(order_sys_id or unit["user_order_id"]),
                         order_sysid=order_sys_id,    # MiniQMT 规范名 (issue #65)
@@ -5170,6 +5229,11 @@ class BigQmtXtTrader:
                 if callback is not None:
                     callback.on_cancel_error(
                         CompatObject(
+                            account_id=self.client.account_id,
+                            account_type=self._account_type_value(),
+                            # No code reaches this path (stock_code is ""
+                            # just below), so the market is unknown.
+                            market=-1,
                             error_id=unit["error_id"],
                             error_msg=unit["error_msg"],
                             # seq was missing here while the response path had
@@ -5187,6 +5251,7 @@ class BigQmtXtTrader:
                 callback.on_cancel_order_stock_async_response(
                     CompatObject(
                         account_id=self.client.account_id,
+                        account_type=self._account_type_value(),
                         seq=seq,
                         success=bool(ok),
                         cancel_result=0 if ok else -1,
@@ -5379,9 +5444,15 @@ class BigQmtXtTrader:
     def _query_account_list(self, account, method):
         account_id = _account_id(account, self.client.account_id)
         try:
-            return self.client.call(method, {"account_id": account_id}, account_id=account_id) or []
+            rows = self.client.call(method, {"account_id": account_id}, account_id=account_id) or []
         except Exception:
             return []
+        # MiniQMT answers these by attribute (see CompatRow). The server
+        # already relays the terminal's own m_ names, so only the
+        # container was wrong.
+        if isinstance(rows, list):
+            return [_as_compat_row(row) for row in rows]
+        return _as_compat_row(rows)
 
     def query_account_infos(self, account=None):
         return self._query_account_list(account, "query_account_infos")
