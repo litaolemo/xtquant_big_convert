@@ -766,8 +766,14 @@ class BigQmtRpcHandlers:
     # 官方文档把 create_sector(parent_node, sector_name, overwrite) 记为 QMT
     # 全局函数，本仓库却按 ContextInfo.create_sector(sectorname, stocklist) 调。
     # 只探测存在性，不调用：create_sector 是写操作。
+    #
+    # get_market_data_ex_ori 是 #237 补进来的：适配层「有原始接口就只走它」，
+    # 所以两台终端跑的可能是两条完全不同的代码路径 —— 而名单里没有这个名字时，
+    # probe 永远不报它，报告人和维护者都拿它当「两边一样」的证据，白白多走了两
+    # 轮。名单本身就是判据，缺一个名字等于把这条差异藏起来。
     _PROBE_CONTEXT_METHODS = (
-        "get_full_tick", "get_market_data_ex", "get_market_data", "get_local_data",
+        "get_full_tick", "get_market_data_ex", "get_market_data_ex_ori",
+        "get_market_data", "get_local_data",
         "subscribe_quote", "subscribe_whole_quote", "unsubscribe_quote",
         "get_trading_dates", "get_financial_data", "get_stock_list_in_sector",
         "do_back_test", "get_trade_detail_data",

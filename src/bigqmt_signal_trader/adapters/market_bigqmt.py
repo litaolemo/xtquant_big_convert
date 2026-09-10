@@ -103,6 +103,25 @@ def _float_or_none(value):
     return number
 
 
+def _int_or_default(value, default):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _bool_flag(value):
+    """A request flag as a bool, with JSON's spellings of false honoured.
+
+    ``bool("false")`` is True, which is how a diagnostic switch turns itself
+    permanently on. Params arrive over RPC as JSON, so a caller writing
+    ``"false"`` or ``"0"`` has to mean it.
+    """
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "no", "none")
+    return bool(value)
+
+
 def _row_day(row):
     """The YYYYMMDD a bar belongs to, from whichever time column it carries.
 
@@ -191,7 +210,16 @@ def _market_data_answer_empty(answer):
     return True
 
 
-def _raw_market_data_payload(payload, field_list, stock_list):
+def _raw_market_data_payload(payload, field_list, stock_list, partial=None):
+    """Serialisable ``{code: DataFrame envelope}``.
+
+    ``partial`` rides along as an extra envelope key when the answer is not
+    the one that was asked for -- fewer columns, a dropped argument, a
+    different servant. An older client simply ignores the key (skew-safe);
+    this repo's client turns it into ``DataFrame.attrs["bigqmt_partial"]`` and
+    warns, so a caller learns their answer is degraded without having to read
+    the terminal's log.
+    """
     if not isinstance(payload, dict):
         return payload
     source = {str(code): records for code, records in payload.items()}
@@ -201,14 +229,182 @@ def _raw_market_data_payload(payload, field_list, stock_list):
         if text not in codes:
             codes.append(text)
     columns = _raw_frame_columns(field_list)
-    return {
-        code: {
+    frames = {}
+    for code in codes:
+        frame = {
             "__bigqmt_type__": "DataFrame",
             "columns": columns,
             "records": source.get(code) or [],
         }
-        for code in codes
-    }
+        if partial:
+            frame["__bigqmt_partial__"] = dict(partial)
+        frames[code] = frame
+    return frames
+
+
+# The fields the rescue's servant actually serves.
+#
+# Name the servant right, because it is NOT get_local_data. The terminal's own
+# wrapper is
+#     get_local_data(stock_code='', start_time='19700101', end_time='22010101',
+#                    period='follow', divid_type='none', count=-1)
+# -- no field list at all, and ``divid_type`` rather than ``dividend_type`` --
+# so every shape ``_market_data_shapes("get_local_data", ...)`` builds raises
+# TypeError, and the call lands on the ``get_market_data`` shapes appended
+# after them:
+#     ContextInfo.get_market_data(fields, stock_code=[], start_time='',
+#                                 end_time='', skip_paused=True,
+#                                 period='follow', dividend_type='follow',
+#                                 count=-1)
+# That is what answers on a Guojin terminal, that is what the field behaviour
+# below was measured on, and that is what the operator warning names.
+#
+# Measured by asking for one field at a time (600519.SH, 1mon, count=10):
+# open/high/low/close/volume/amount/settle answer 10 rows; time,
+# settelementPrice, openInterest, preClose, suspendFlag and stime answer ZERO
+# -- and one unserved name in the list zeroes the WHOLE request (the 11-column
+# list returns 0 rows, an empty field_list returns 0 rows). That follows from
+# the wrapper's own body, which does ``oriData[code][timenode][field]`` for
+# every requested name.
+#
+# ``settle`` is deliberately left out even though it answered: it is the one
+# name whose spelling differs between builds (settle vs settelementPrice), so
+# including it risks zeroing the rescue on the very terminals that need it.
+# The six below are exactly what the #237 reporter measured working on the
+# broken build.
+_SYNTH_RESCUE_SERVED_FIELDS = ("open", "high", "low", "close", "volume", "amount")
+
+
+def _single_code_frame(answer, code):
+    """The one code's bar frame out of whatever ContextInfo answered.
+
+    Asked for ONE code with a count or a time range, the terminal's
+    ``get_market_data`` returns a **bare** ``pandas.DataFrame`` (index = bar
+    labels, columns = fields) -- not ``{code: frame}``. Asked for several it
+    returns a ``pandas.Panel`` (QMT ships pandas 0.22). The rescue asks one
+    code at a time precisely so it lands on the first, predictable branch;
+    the other shapes are handled defensively, not relied on.
+
+    Returns None when the answer carries nothing for this code.
+    """
+    if answer is None:
+        return None
+    if isinstance(answer, dict):
+        if answer.get("__bigqmt_type__") == "DataFrame":
+            return answer
+        text = str(code)
+        for key, value in answer.items():
+            if str(key) == text:
+                return value
+        if len(answer) == 1:
+            return list(answer.values())[0]
+        return None
+    if hasattr(answer, "columns") and hasattr(answer, "index"):
+        return answer                      # the single-code DataFrame branch
+    try:
+        return answer[code]                # pandas Panel: item axis is the code
+    except Exception:
+        return None
+
+
+def _frame_axis_rows(frame):
+    """``[(axis label, row dict), ...]`` for a market-data frame.
+
+    ``_frame_rows`` above is not enough here: the rescue's frame carries the
+    bar date on the frame's *index*, not in a column, and ``_frame_rows``
+    reads a pandas frame positionally (``frame[name][i]``), which is label
+    lookup on a date-indexed frame and raises. So walk the index explicitly.
+    """
+    if frame is None:
+        return []
+    if isinstance(frame, dict) and frame.get("__bigqmt_type__") == "DataFrame":
+        columns = [str(name) for name in (frame.get("columns") or [])]
+        out = []
+        for record in frame.get("records") or []:
+            if isinstance(record, dict):
+                row = dict(record)
+            elif isinstance(record, (list, tuple)) and columns:
+                row = dict(zip(columns, record))
+            else:
+                continue
+            out.append((row.get("stime"), row))
+        return out
+    if hasattr(frame, "columns") and hasattr(frame, "index"):
+        try:
+            columns = [name for name in frame.columns]
+            labels = list(frame.index)
+            series = dict((name, list(frame[name])) for name in columns)
+            return [
+                (labels[i], dict((str(name), series[name][i]) for name in columns))
+                for i in range(len(labels))
+            ]
+        except Exception:
+            return []
+    return [(row.get("stime") or row.get("index") or row.get("time"), row)
+            for row in _frame_rows(frame)]
+
+
+def _bar_axis_label(label, row):
+    """The bar's ``stime`` spelling, or None when there is no usable one.
+
+    A frame indexed 0..n (positional, no dates) must not be turned into bars
+    stamped "0", "1", "2" -- that would be a fabricated time axis, which is
+    worse than the empty answer it replaced. None means "abandon".
+    """
+    for candidate in (row.get("stime"), label, row.get("time")):
+        text = str(candidate if candidate is not None else "")
+        digits = "".join(ch for ch in text if ch.isdigit())
+        if len(digits) >= 8:
+            return text
+    return None
+
+
+def _leading_synthetic_bars(rows):
+    """How many leading rows are QMT's count-padding rather than real bars.
+
+    Asked for more bars than it has, the rescue's servant does not return
+    fewer -- it pads the HEAD to reach ``count`` with rows carrying the first
+    real bar's price in all four OHLC slots and zero volume/amount. Measured
+    on 600519.SH 1y count=10: seven rows stamped 20171231..20231231, every one
+    of them ``open=high=low=close=1524.0, volume=0, amount=0`` -- 1524.0 being
+    the close of the first real (2024) bar. Moutai did not trade at 1524 in
+    2017.
+
+    Dropping them is what makes the fallback faithful, not a guess: with the
+    pad removed the answer is identical row-for-row to what the primary path
+    returns on a terminal where the primary works (verified for 600519.SH and
+    000001.SZ across 1w/1d/1mon/1q/1hy/1y, and for 1mon count=200 where the
+    primary has 26 bars and the rescue padded to 200).
+
+    A genuinely zero-volume monthly/quarterly/yearly bar (a security suspended
+    for the whole period) at the HEAD of the window is dropped too. It carries
+    no price information -- all four prices are the carried-forward previous
+    close -- and this runs only in the rescue path, where the alternative is
+    zero rows. The caller narrows it further by only trimming when the answer
+    actually reached ``count``: padding exists only to reach it, so a short
+    answer was never padded and must not be trimmed.
+
+    Deliberately NOT tightened to "must equal the first real close": under
+    ``dividend_type != none`` the pads come back scaled per date, so they stay
+    ``o == h == l == c`` while no longer matching any single close. The
+    tightened test would let exactly those through.
+    """
+    count = 0
+    for row in rows:
+        volume = _float_or_none(row.get("volume"))
+        amount = _float_or_none(row.get("amount"))
+        open_ = _float_or_none(row.get("open"))
+        high = _float_or_none(row.get("high"))
+        low = _float_or_none(row.get("low"))
+        close = _float_or_none(row.get("close"))
+        if None in (volume, amount, open_, high, low, close):
+            break
+        if volume != 0 or amount != 0:
+            break
+        if not (open_ == high == low == close):
+            break
+        count += 1
+    return count
 
 
 _NATIVE_XTDATA = None  # cached native xtdata SDK module (None = not yet tried)
@@ -488,20 +684,30 @@ class BigQmtMarketDataProvider:
                     self._native_dead_marks()[func_name] = time.time()
         return context_caller()
 
-    def _call_first_supported(self, shapes):
+    def _call_first_supported_named(self, shapes):
+        """``(method_name, args, kwargs, result)`` for the shape that bound.
+
+        Which shape won is not bookkeeping: the shapes list spans several
+        ContextInfo methods with different signatures, so "what answered" and
+        "which of my arguments reached the terminal" are only knowable here.
+        #237's rescue reports both to the caller.
+        """
         last_error = None
         for method_name, args, kwargs in shapes:
             method = getattr(self.context_info, method_name, None)
             if method is None:
                 continue
             try:
-                return method(*args, **kwargs)
+                return method_name, args, kwargs, method(*args, **kwargs)
             except TypeError as exc:
                 last_error = exc
                 continue
         if last_error is not None:
             raise last_error
         raise NotImplementedError("none of the ContextInfo methods is available")
+
+    def _call_first_supported(self, shapes):
+        return self._call_first_supported_named(shapes)[3]
 
     def _market_data_shapes(self, method_name, **params):
         field_list = list(params.get("field_list") or params.get("fields") or [])
@@ -818,26 +1024,225 @@ class BigQmtMarketDataProvider:
     # columns" to QMT, and how a build expands that for synthesized periods is
     # not trustworthy. Retry once with the explicit K-line field list from the
     # terminal's own reference; an empty retry still means empty.
+    #
+    # Since #237 this tuple gates two things: the field retry above, and the
+    # get_local_data rescue below (which fires for an explicit field list too,
+    # because the broken build answers 0 for the 6-column list as well). Both
+    # stay off daily and intraday periods, where an empty answer is usually
+    # the truth.
     _SYNTH_PERIOD_FIELD_RETRY = ("1w", "1mon", "1q", "1hy", "1y")
     _KLINE_ALL_FIELDS = (
         "time", "open", "high", "low", "close", "volume", "amount",
         "settle", "openInterest", "preClose", "suspendFlag",
     )
 
+    # Warn at most once per period per this interval. The rescue below fires
+    # per call on an affected terminal, and a K-line poll is a per-second
+    # thing -- #139 is what one unthrottled line per call costs (the same
+    # message 373 times in QMT's own panel).
+    _SYNTH_FALLBACK_WARN_INTERVAL_SECONDS = 300.0
+
+    # Diagnostic request parameter (#237): skip the primary for a synthesized
+    # period and answer from the rescue alone. Read-only, ignored for every
+    # other period, and deliberately absent from the client's public
+    # xtdata.get_market_data_ex signature -- reachable through
+    # client.call("get_market_data_ex", {...}) / xtdata.call_method, which is
+    # where a diagnostic belongs.
+    SYNTH_RESCUE_ONLY_PARAM = "synth_fallback_only"
+
     def get_market_data_ex(self, **kwargs):
-        answer = self._get_market_data_ex_once(**kwargs)
         fields = kwargs.get("field_list") or kwargs.get("fields")
         period = str(kwargs.get("period") or "")
-        if (fields or period not in self._SYNTH_PERIOD_FIELD_RETRY
+        request = dict(kwargs)
+        rescue_only = _bool_flag(request.pop(self.SYNTH_RESCUE_ONLY_PARAM, None))
+
+        if rescue_only and period in self._SYNTH_PERIOD_FIELD_RETRY:
+            # Diagnostic bypass (#237). On a terminal where the primary works
+            # the rescue is unreachable by a normal request, so there is no
+            # way to show it behaves -- and an untested rescue is exactly the
+            # thing that ships broken. This skips the primary and answers
+            # straight from the rescue, so a maintainer can diff the two on a
+            # healthy build and the reporter can diff them on 2.0.8.0.
+            # Read-only, ignored for every other period.
+            rescued = self._synth_period_rescue(
+                request, fields, period, reason="synth_rescue_only")
+            if rescued is not None:
+                return rescued
+            # Deliberately NOT the primary's answer: this parameter exists to
+            # report on the rescue, and quietly substituting the primary would
+            # make a dead rescue look alive.
+            return _raw_market_data_payload(
+                {}, list(fields or _SYNTH_RESCUE_SERVED_FIELDS),
+                request.get("stock_list") or request.get("stock_code"))
+
+        answer = self._get_market_data_ex_once(**request)
+        if (period not in self._SYNTH_PERIOD_FIELD_RETRY
                 or not _market_data_answer_empty(answer)):
             return answer
-        retry = dict(kwargs)
-        retry.pop("fields", None)
-        retry["field_list"] = list(self._KLINE_ALL_FIELDS)
-        retried = self._get_market_data_ex_once(**retry)
-        # The retry is a strict improvement only when it found rows; otherwise
-        # keep the original (empty) answer, so "no data" stays "no data".
-        return retried if not _market_data_answer_empty(retried) else answer
+        if not fields:
+            retry = dict(request)
+            retry.pop("fields", None)
+            retry["field_list"] = list(self._KLINE_ALL_FIELDS)
+            retried = self._get_market_data_ex_once(**retry)
+            # The retry is a strict improvement only when it found rows;
+            # otherwise keep going, so "no data" stays "no data".
+            if not _market_data_answer_empty(retried):
+                return retried
+        rescued = self._synth_period_rescue(
+            request, fields, period, reason="synth_period_primary_empty")
+        return answer if rescued is None else rescued
+
+    def _synth_period_rescue(self, kwargs, fields, period, reason):
+        """Bars for a synthesized period when the primary path has none (#237).
+
+        Guojin terminal build **2.0.8.0** answers 0 rows for 1mon/1q/1hy/1y on
+        every ContextInfo path that goes through the C++
+        ``context.get_market_data2`` -- ``get_market_data_ex``,
+        ``get_market_data_ex_ori``, empty field_list, the 6-column list and the
+        11-column #219 retry alike -- while a plain
+        ``ContextInfo.get_market_data`` on the SAME process and the SAME bars
+        answers 10 rows. 1w and 1d are fine there, and build 2.1.19.0 is fine
+        on every period, so this is one build's synthesis path, not missing
+        data.
+
+        Reached through ``self.get_local_data``, but **served** by
+        ``ContextInfo.get_market_data`` on a Guojin terminal: the terminal's
+        own ``get_local_data`` takes no field list, so every get_local_data
+        shape raises TypeError and the get_market_data shapes appended after
+        them are what bind. The marker below reports which one actually
+        answered rather than assuming.
+
+        Deliberately narrow:
+
+        * only the synthesized periods. An empty daily/minute answer is
+          usually truthful, and a second RPC per empty call is not free.
+        * only after the primary and the #219 retry have both come up empty
+          (or when the caller explicitly asked for the rescue alone).
+        * **one code per call.** Asked for several codes at once the servant
+          answers with a ``pandas.Panel`` (QMT ships pandas 0.22); asked for
+          one it answers a bare ``DataFrame``. Looping keeps every call on the
+          single-code branch, which is the shape this code reads. Asking for
+          many at once is how this rescue was dead code for its whole first
+          draft: the answer was not a dict, and a ``not isinstance(local,
+          dict)`` guard threw every rescued row away.
+        * the servant serves 6 of the 11 columns (see
+          ``_SYNTH_RESCUE_SERVED_FIELDS``), so a request for all fields comes
+          back with OHLCV only, and ``fill_data`` does not reach it at all --
+          its signature has ``skip_paused`` instead. Both are disclosed: in
+          the ``__bigqmt_partial__`` marker on the answer, and in the operator
+          WARNING.
+        * a caller who asked only for columns the servant cannot serve gets
+          the honest empty answer back, not a differently-shaped one.
+
+        Returns None when nothing was rescued, so the caller keeps the
+        original answer.
+        """
+        requested = [str(field) for field in (fields or [])]
+        if requested:
+            served = [field for field in requested
+                      if field in _SYNTH_RESCUE_SERVED_FIELDS]
+            if not served:
+                return None
+        else:
+            served = list(_SYNTH_RESCUE_SERVED_FIELDS)
+        missing = [field for field in requested if field not in served]
+
+        codes = [str(code) for code in _as_list(
+            kwargs.get("stock_list") or kwargs.get("stock_code"))]
+        if not codes:
+            return None
+        count = _int_or_default(kwargs.get("count"), -1)
+
+        base = dict(kwargs)
+        base.pop("fields", None)
+        base.pop("stock_code", None)
+        # Always ask for the full OHLCV set even when the caller wanted fewer:
+        # spotting the count-padding needs volume/amount and all four prices.
+        base["field_list"] = list(_SYNTH_RESCUE_SERVED_FIELDS)
+
+        records = {}
+        trimmed = 0
+        servant = ""
+        fill_data_delivered = True
+        for code in codes:
+            probe = dict(base)
+            probe["stock_list"] = [code]
+            try:
+                name, args, sent, answer = self._call_first_supported_named(
+                    self._local_bar_shapes(**probe))
+            except Exception as exc:
+                self._warn_synth_fallback(
+                    period, "the local-bar path raised: %s: %s"
+                    % (type(exc).__name__, exc))
+                return None
+            servant = name
+            if "fill_data" not in sent and len(args) < 8:
+                fill_data_delivered = False
+            pairs = _frame_axis_rows(_single_code_frame(answer, code))
+            # Padding exists only to reach ``count``: an answer that fell
+            # short of it was never padded, so trimming its head would drop
+            # real bars. Verified live -- 1y count=10 comes back as exactly 10
+            # rows, 7 of them pad.
+            if count > 0 and len(pairs) >= count:
+                pad = _leading_synthetic_bars([row for _label, row in pairs])
+                if pad:
+                    trimmed += pad
+                    pairs = pairs[pad:]
+            rows = []
+            for label, row in pairs:
+                stime = _bar_axis_label(label, row)
+                if stime is None:
+                    # No usable time axis: refuse rather than stamp bars with
+                    # positional labels.
+                    self._warn_synth_fallback(
+                        period, "the local-bar path answered %d row(s) for %s "
+                        "with no usable time axis; keeping the empty answer"
+                        % (len(pairs), code))
+                    return None
+                rows.append([stime] + [row.get(name) for name in served])
+            records[str(code)] = rows
+
+        if not any(records.values()):
+            return None
+        partial = {
+            "reason": reason,
+            "period": period,
+            "source": "ContextInfo.%s" % servant,
+            "requested": list(requested),
+            "served": list(served),
+            "missing": list(missing),
+            "fill_data_dropped": not fill_data_delivered,
+            "padding_rows_dropped": trimmed,
+        }
+        self._warn_synth_fallback(
+            period,
+            "%s; ContextInfo.%s rescued %d row(s) for %s (columns served: %s; "
+            "requested: %s; missing: %s; dropped %d count-padding row(s)%s). "
+            "Known on Guojin terminal build 2.0.8.0 -- check resource/version"
+            % ("the caller asked for the rescue only"
+               if reason == "synth_rescue_only"
+               else "primary get_market_data2 path answered 0 rows",
+               servant, sum(len(rows) for rows in records.values()),
+               ",".join(sorted(records)), ",".join(served),
+               ",".join(requested) if requested else "<all fields>",
+               ",".join(missing) if missing else "-", trimmed,
+               "; fill_data did not reach the terminal, ContextInfo."
+               "get_market_data takes skip_paused instead"
+               if not fill_data_delivered else ""))
+        return _raw_market_data_payload(
+            records, served,
+            kwargs.get("stock_list") or kwargs.get("stock_code"),
+            partial=partial)
+
+    def _warn_synth_fallback(self, period, message):
+        seen = getattr(self, "_synth_fallback_warned_at", None)
+        if seen is None:
+            seen = self._synth_fallback_warned_at = {}
+        now = time.time()
+        if now - seen.get(period, 0.0) < self._SYNTH_FALLBACK_WARN_INTERVAL_SECONDS:
+            return
+        seen[period] = now
+        log.warning("[bigqmt_synth_fallback] period=%s: %s", period, message)
 
     def _get_market_data_ex_once(self, **kwargs):
         raw_method = getattr(self.context_info, "get_market_data_ex_ori", None)
@@ -855,11 +1260,22 @@ class BigQmtMarketDataProvider:
             shapes.extend(self._market_data_shapes("get_market_data", **kwargs))
         return self._call_first_supported(shapes)
 
-    def get_local_data(self, **kwargs):
+    def _local_bar_shapes(self, **kwargs):
+        """Call shapes for "read bars without going through get_market_data2".
+
+        The get_market_data shapes are not a garnish. On a Guojin terminal
+        ContextInfo.get_local_data takes no field list at all, so every
+        get_local_data shape raises TypeError and one of these is what
+        actually answers -- which is why #237's rescue asks
+        _call_first_supported_named which one it was.
+        """
         shapes = self._market_data_shapes("get_local_data", **kwargs)
         if hasattr(self.context_info, "get_market_data"):
             shapes.extend(self._market_data_shapes("get_market_data", **kwargs))
-        return self._call_first_supported(shapes)
+        return shapes
+
+    def get_local_data(self, **kwargs):
+        return self._call_first_supported(self._local_bar_shapes(**kwargs))
 
     # Probing more than this many candidate ex-dividend days in one range
     # request is a sign the filter did not narrow anything (a code with no
@@ -1705,7 +2121,9 @@ class BigQmtMarketDataProvider:
         return self._call_context("get_last_close", stock)
 
     def get_last_volume(self, stock):
-        # ContextInfo stub: get_last_volume(stock)
+        # ContextInfo stub: get_last_volume(stock) — 最新**流通股本**，不是「昨量」。
+        # 实测 601398.SH -> 269612212539.0，= get_instrument_detail 的 FloatVolume；
+        # 同一天成交量 2154432 手，差五个数量级（#262）。
         return self._call_context("get_last_volume", stock)
 
     def get_open_date(self, stock):
@@ -1721,7 +2139,9 @@ class BigQmtMarketDataProvider:
         return self._call_context("get_contract_multiplier", stockcode)
 
     def get_float_caps(self, stockcode):
-        # ContextInfo stub: get_float_caps(stockcode) — 流通市值。
+        # ContextInfo stub: get_float_caps(stockcode) — 流通**股本（股数）**，不是流通市值。
+        # 实测与 get_last_volume / FloatVolume 逐位相同（601398.SH -> 269612212539），
+        # 当市值用会差一个价格的倍数（#262）。
         return self._call_context("get_float_caps", stockcode)
 
     def get_total_share(self, stockcode):
@@ -1737,11 +2157,17 @@ class BigQmtMarketDataProvider:
         return self._call_context("get_weight_in_index", mtkindexcode, stockcode)
 
     def get_svol(self, stock):
-        # ContextInfo stub: get_svol(stock)
+        # ContextInfo stub: get_svol(stock) — 内盘，盘中窗口量不是当日累计。
+        # svol + bvol 不等于当日成交量（#262）。它等于最后一根 1 分钟 K 线的
+        # 成交量，只在尾盘活动只剩 15:00 集合竞价的代码上成立（601398.SH
+        # 32586、511990.SH 22883）；连续交易到 15:30 的逆回购上两者对不上
+        # （204001.SH 44733734 vs 末根 5565745），所以只能说这是一个盘中窗口
+        # 的量，窗口具体多长没能定死。详见 xtquant_compat.get_svol 的实测记录。
         return self._call_context("get_svol", stock)
 
     def get_bvol(self, stock):
-        # ContextInfo stub: get_bvol(stock)
+        # ContextInfo stub: get_bvol(stock) — 外盘，语义同 get_svol。
+        # 股票收盘后答 0 是因为集合竞价整根落进内盘；逆回购（连续到 15:30）两侧都非零。
         return self._call_context("get_bvol", stock)
 
     def get_risk_free_rate(self, index=-1):

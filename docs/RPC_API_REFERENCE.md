@@ -106,6 +106,46 @@
 
 > DataFrame / Series 在 RPC 协议层用 `__bigqmt_type__` 标记序列化，客户端 `xtquant_compat` 自动还原为 pandas 对象。
 
+**合成周期回落与「这一份不全」标记（#237）**
+
+部分终端构建（实测国金 **2.0.8.0**）上，凡是走 C++ `context.get_market_data2`
+的路径对 `1mon/1q/1hy/1y` 恒返回 0 行，而同一进程里 `ContextInfo.get_market_data`
+给得出来。主路径（含 #219 的 11 列重试）全空且周期属于合成周期时，桥会**逐只代码**
+改走 `ContextInfo.get_market_data` 取数。
+
+它只服务 `open/high/low/close/volume/amount` 六列，签名里也没有 `fill_data`（是
+`skip_paused`）。所以这种应答**不是**调用方要的那一份，桥会在每个代码的 DataFrame
+外层加一个 `__bigqmt_partial__`：
+
+| 字段 | 含义 |
+|------|------|
+| `reason` | `synth_period_primary_empty`（主路径空）或 `synth_rescue_only`（诊断参数强制）|
+| `period` | 触发的周期 |
+| `source` | 真正应答的终端函数，如 `ContextInfo.get_market_data` |
+| `requested` / `served` / `missing` | 请求的列 / 实际给出的列 / **缺的列** |
+| `fill_data_dropped` | `true` = 调用方的 `fill_data` 没送达终端 |
+| `padding_rows_dropped` | 丢掉的 `count` 补齐行数（四价相同、量额为 0 的假 bar）|
+
+客户端 `xtquant_compat` 把它还原到 `DataFrame.attrs["bigqmt_partial"]`，并按
+（原因, 周期, 来源, 缺列）去重发一条 `warnings.warn`。旧客户端会直接忽略这个键，
+应答形状不变。
+
+**诊断参数 `synth_fallback_only`（只读）**
+
+正常终端上主路径从不返回空，回落路径因此**够不到**，也就无法证明它还活着。
+`synth_fallback_only=True` 让合成周期**跳过主路径**、直接走回落（其他周期忽略此参数；
+回落取不到数据时返回诚实的空应答，绝不拿主路径的结果顶替）。它刻意不在客户端
+`xtdata.get_market_data_ex` 的公开签名里——诊断走 `xtdata.call_method` / `client.call`：
+
+```python
+from xtquant import xtdata
+xtdata.call_method("get_market_data_ex", field_list=[], stock_list=["600519.SH"],
+                   period="1mon", count=10, synth_fallback_only=True)
+```
+
+FormulaServer 直连不认这个参数，带上它会强制回落到 RPC 桥（否则「回落通了」会
+是假象——回落根本没跑）。
+
 ### 3.3 板块
 
 | 方法 | 参数 | 返回 | Big QMT 实现说明 |
@@ -228,20 +268,80 @@
 |------|------|------|
 | `create_sector` | `sector_name` `stock_list`(list) | 创建/更新自定义板块（写操作）|
 | `get_stock_name` | `stock` | 股票名称（如「平安银行」）|
-| `get_stock_type` | `stock` | 股票类型 |
-| `get_last_close` | `stock` | 昨收价 |
-| `get_last_volume` | `stock` | 昨量 |
-| `get_open_date` | `stock` | 上市日期 |
-| `get_contract_expire_date` | `stock` | 到期日（股票返回 99999999）|
-| `get_contract_multiplier` | `stockcode` | 合约乘数 |
-| `get_float_caps` | `stockcode` | 流通市值 |
-| `get_total_share` | `stockcode` | 总股本 |
-| `get_turn_over_rate` | `stockcode` | 换手率（单值版）|
-| `get_weight_in_index` | `mtkindexcode` `stockcode` | 指数中权重 |
-| `get_svol` | `stock` | | 
-| `get_bvol` | `stock` | |
-| `get_risk_free_rate` | `index`(int, 默认-1) | 无风险利率 |
+| `get_stock_type` | `stock` | ❌ 对任何代码都返回 `0`，客户端包装显式报错，改用 `get_instrument_type` |
+| `get_last_close` | `stock` | 昨收价（= `get_instrument` 的 `PreClose`）|
+| `get_last_volume` | `stock` | **最新流通股本，不是「昨量」**（= `FloatVolume`）|
+| `get_open_date` | `stock` | 上市日期，int `yyyymmdd`（= `OpenDate`）|
+| `get_contract_expire_date` | `stock` | 到期日，**返回字符串**：股票/ETF `'99999999'`，终端里没有的合约 `'0'` |
+| `get_contract_multiplier` | `stockcode` | 合约乘数。⚠️ 实测返回 int32 哨兵 `2147483647`（见下）|
+| `get_float_caps` | `stockcode` | **流通股本（股数），不是流通市值**（= `FloatVolume`，与 `get_last_volume` 同值）|
+| `get_total_share` | `stockcode` | 总股本（= `TotalVolume`，与流通股本确实不同）|
+| `get_turn_over_rate` | `stockcode` | ❌ 对任何代码都返回 `None`，客户端包装显式报错。区间版 `get_turnover_rate` 需先下载财务数据（股本）+ 日线，本终端未下载（见下）|
+| `get_weight_in_index` | `mtkindexcode` `stockcode` | 指数中的绝对权重，**单位 %** |
+| `get_svol` | `stock` | 内盘成交量。⚠️ **盘中窗口量，不是当日累计**（见下）|
+| `get_bvol` | `stock` | 外盘成交量，语义同 `get_svol`。⚠️ 股票收盘后为 `0` 是集合竞价所致，不是答不了（见下）|
+| `get_risk_free_rate` | `index`(int, 默认-1) | 无风险利率（%）。实测恒为 `3.5`，不随 `index` 变 |
 | `get_close_price` | `market` `stock_code` `real_timetag` `period`(默认86400000) `divid_type`(默认0) | 指定时点收盘价 |
+
+**客户端怎么调（issue #262）**：上表每个方法在兼容层 `BigQmtXtData` 上都有同名
+包装，直接 `xtdata.get_open_date("600519.SH")` 即可，参数名同上表。没有同名包装
+的方法走万能入口 `xtdata.call_method("<name>", **params)` / `xt_trader.client.call("<name>", params)`。
+
+**实测记录（2026-09-09 收盘后，国金大 QMT 2.1.19.0，非交易时段）**——上表几处订正的
+依据，和两个「答不了」的判据。⚠️ `get_svol` / `get_bvol` 是**盘中窗口量**，同一组代码
+在盘中重测会是另一批数字；其余几行（股本、上市日期、到期日）与时段无关。
+
+| 方法 | 600519.SH | 510300.SH | 601398.SH |
+|------|-----------|-----------|-----------|
+| `get_open_date` | `20010827` | `20120528` | `20061027` |
+| `get_last_close` | `1309.3` | `4.624` | — |
+| `get_last_volume` | `1250081601.0` | `23468887700.0` | `269612212539.0` |
+| `get_float_caps` | `1250081601` | `23468887700` | `269612212539` |
+| `get_total_share` | `1250081601` | `23468887700` | **`356406257089`** |
+| `get_contract_expire_date` | `'99999999'` | `'99999999'` | `'99999999'` |
+| `get_svol` / `get_bvol` | `688` / `0` | `59408` / `0` | `32586` / `0` |
+| `get_turn_over_rate` | `None` | `None` | `None` |
+| `get_contract_multiplier` | `2147483647` | `2147483647` | `2147483647` |
+| `get_weight_in_index('000300.SH', ·)` | `5.801` | — | `0.806` |
+
+- `get_last_volume` / `get_float_caps` 与 `get_instrument` 的 `FloatVolume` **逐位相同**，
+  而同一天 601398.SH 的成交量是 2154432 手 —— 差五个数量级，所以「昨量」「流通市值」
+  两个旧标注都是错的。`get_total_share` 在 601398.SH 上确实给出不同的数（总股本
+  3564 亿股 vs 流通 2696 亿股），说明它是对的。
+- **`get_svol` / `get_bvol` 是盘中窗口的内外盘，不是当日累计** —— 上表 `bvol` 那一排 0
+  差点被读成「这个方法答不了」，换一批代码就露馅了：
+
+  | 代码 | `get_svol` | `get_bvol` | 末根 1m K 线 | 当日成交量 |
+  |------|-----------|-----------|--------------|-----------|
+  | 601398.SH | `32586` | `0` | **`32586`** | 2154432 |
+  | 510300.SH | `59408` | `0` | **`59408`** | — |
+  | 000001.SZ | `5177` | `0` | **`5177`** | — |
+  | 511990.SH | `0` | **`22883`** | **`22883`** | 751400 |
+  | 204001.SH（GC001）| `43226876` | **`1506858`** | `5565745` | 2093850077 |
+  | 131810.SZ（R-001）| `2898199` | **`2404676`** | `539882` | 263843386 |
+
+  股票/ETF 上 `svol + bvol` **逐位等于最后一根 1 分钟 K 线的成交量**
+  （`get_market_data_ex(['volume'], [code], period='1m')` 的末根）。收盘后那根是 15:00
+  集合竞价：一个价位撮合、没有主动方，所以整根落进单侧、另一侧为 0 —— 落哪一侧不固定
+  （511990.SH 落在外盘）。逆回购连续交易到 15:30，两侧都非零，但 `svol + bvol` 既不等于
+  末根 K 线也不等于当日量（204001.SH：44733734 vs 5565745 vs 2093850077，约是尾盘几分钟
+  的量），**具体窗口没能定死**。结论只有一条能确定：`svol + bvol ≠ 日成交量`，两个都不是
+  当日内外盘，要当日口径请自己按 tick / K 线累计。
+- `get_turn_over_rate` 对 5 个代码 × 3 种代码格式全部 `None`，收盘后重测仍是 `None`（不是
+  非交易时段才空）。区间版 `get_turnover_rate` 同一次运行返回空 DataFrame，而它按官方文档
+  （docs/BIGQMT_INNER_PYTHON_API_REFERENCE.md）**需先下载财务数据（股本）与日线数据**，本
+  终端两样都没下过 —— 所以没能区分「stub 坏了」和「缺基础数据」；有这些数据的终端值得先
+  `xtdata.call_method("get_turn_over_rate", stockcode=...)` 试一次。自己算的公式是
+  `get_ticks()[code]['pvolume'] / get_last_volume(code)`：`pvolume` 是**股**、和流通股本
+  同单位，`['volume']` 是**手**，用它会小 100 倍（600519.SH：3222611 股 / 1250081601 股
+  = 0.258%，用 32226 手算出来是 0.00258%）。
+- `get_contract_multiplier` 对股票 / ETF / 期权 / 期货代码一律返回 `2147483647`
+  （int32 上限 = 「没有值」）。这台终端本身没有期货行情：`get_instrument('IF2612.IF')`
+  `('cu2610.SF')` 全是 `{}`，`get_his_contract_list('IF')` 是 0 条，所以**没能区分
+  「这个 stub 坏了」和「这台终端没订阅期货」**。客户端包装回读答案，对上哨兵才报错，
+  有期货数据的终端能正常返回时照常放行；另一条通道是 `get_instrument(code)['VolumeMultiple']`。
+- `get_risk_free_rate` 传 `index` = -1/0/1/100/5000 都返回 `3.5`，所以它给的是终端里的
+  一个设置值，不是随 K 线走的 CGB10Y 序列。当期权定价的常数可以，当历史利率序列不行。
 
 ---
 
