@@ -2313,6 +2313,19 @@ class BigQmtRpcHandlers:
     # 旧名保留：外部调用方和既有测试还在用
     _credit_order_type_from_params = _forwarded_order_type
 
+    def _resolve_strategy_name(self, *candidates):
+        """First supplied candidate wins; "" is a real answer, not "unset".
+
+        ``or`` chains used to swallow an explicit empty string back into
+        ``default_strategy_name``. Blank is exactly how a caller asks for an
+        empty 报单来源 column, the way a hand-placed order looks (#154), so
+        only a missing value (``None``) may fall through to the default.
+        """
+        for candidate in candidates:
+            if candidate is not None:
+                return str(candidate)
+        return str(self.default_strategy_name)
+
     def _handle_submit_order(self, params):
         if self.order_gateway is None:
             raise RuntimeError("order_gateway is not configured")
@@ -2329,8 +2342,8 @@ class BigQmtRpcHandlers:
             volume=int(params.get("volume") or params.get("order_volume") or 0),
             price=float(price if price not in (None, "") else 0),
             price_type=params.get("price_type") or "LIMIT",
-            strategy_name=str(params.get("strategy_name")
-                              or self.default_strategy_name),
+            strategy_name=self._resolve_strategy_name(
+                params.get("strategy_name")),
             remark=order_tag,
             order_type=self._forwarded_order_type(params),
         )
@@ -2508,10 +2521,9 @@ class BigQmtRpcHandlers:
         batch_started = time.time()
         batch_id = str(params.get("batch_id") or uuid.uuid4().hex)
         account_id = self._request_account_id(params)
-        strategy_name = str(
-            params.get("strategy_name")
-            or (orders[0] or {}).get("strategy_name")
-            or self.default_strategy_name
+        strategy_name = self._resolve_strategy_name(
+            params.get("strategy_name"),
+            (orders[0] or {}).get("strategy_name"),
         )
         # order_stock_async routes a queued backlog through here (#181), but it
         # never promised order_stock_batch's idempotency contract, and
