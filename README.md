@@ -44,7 +44,13 @@
 bigqmt-init
 ```
 
-或者从源码检出运行 `python -m bigqmt_signal_trader.init_config`。
+`bigqmt-init` 找不到、或者用的是源码检出，等价写法：
+
+```bash
+python -m bigqmt_signal_trader.init_config
+```
+
+只能在终端里交互着答，不能用管道喂——密码那一问走 `getpass` 读终端。
 
 问资金账号、账号类型、传输方式（redis / zmq）、地址端口、Redis 用户名密码、是否允许远程下单、部署方式、两个目录，然后把服务端和客户端两份配置由**同一组答案**写出来，连接参数不会对不上：
 

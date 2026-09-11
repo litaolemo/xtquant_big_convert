@@ -32,13 +32,59 @@ pip install "xtquant-big-convert[redis]"
 
 ## 第 2 步：用 `bigqmt-init` 生成配置
 
-不要手抄 `.example.py`。在**能写到 QMT 的 python 目录的机器上**跑：
+不要手抄 `.example.py`。在**能写到 QMT 的 python 目录的机器上**跑，两种写法等价：
 
 ```powershell
 bigqmt-init
 ```
 
-它逐个问下面这些，括号里是默认值：
+```powershell
+python -m bigqmt_signal_trader.init_config
+```
+
+第一种是 pip 装包时注册的命令；`bigqmt-init` 找不到（PATH 没带上 Scripts 目录）或者你用的是源码检出，就用第二种。
+
+**它只能在终端里交互着答，不能用管道或脚本喂答案**：Redis 密码那一问走 `getpass`，直接读终端，从 stdin 喂会卡死。
+
+实际跑一遍长这样，`←` 后面是说明：
+
+```
+=== Big QMT 桥接配置 ===
+资金账号: 8886800503
+
+账号类型
+  1) STOCK (默认)
+  2) CREDIT
+  ...
+请选择 [1-6]: 1                         ← 信用户选 2
+
+传输方式
+  1) redis (默认)
+  2) zmq
+请选择 [1-2]: 1
+Redis 地址 [127.0.0.1]: 192.168.8.13
+Redis 端口 [6379]: 63790
+Redis db [5]: 5
+Redis 用户名（无则回车）:
+Redis 密码（无则回车，输入不回显）:
+
+远程下单/撤单默认关闭。打开后，任何能连上这条通道的程序都可以下单。
+允许远程下单/撤单？ [y/N]: n            ← 首次先 n，验证通过再开
+
+部署方式
+  1) 标准包部署（把 src/ 同步到 QMT 的 python 目录） (默认)
+  2) 单文件（base64 内嵌，redis 或 zmq 均可）
+  3) 单文件（明文代码，强制 zmq；沙箱拒绝 import redis 时用）
+请选择 [1-3]: 1
+QMT 的 python 目录（回车则写到当前目录）: D:\国金证券QMT交易端\python   ← 别回车
+客户端配置写到哪个目录（回车则当前目录）: D:\my_client
+
+=== 已写入 ===
+  D:\国金证券QMT交易端\python\bigqmt_signal_trader_local_config.py
+  D:\my_client\bigqmt_signal_trader_client_config.py
+```
+
+选项题输数字或直接输名字都认，`STOCK`、`redis`、`package` 这样写也行。每个问题的说明：
 
 | 问题 | 说明 |
 |---|---|
