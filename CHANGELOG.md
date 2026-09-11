@@ -19,6 +19,14 @@
   这正是 #143 担心的事：一份看起来像真的清单里混着答不出东西的名字。新增测试
   钉住改正后的两个名字、钉住错拼法不会回流、钉住基金拼法不被「顺手修坏」。
 
+- **委托回报推送上 `price_type` 恒为 None**。查询路径 `query_orders` 一直读原生
+  `m_nOrderPriceType`，推送路径 `normalize_order_event` 发了 19 个字段却从没读过
+  这一个，走 `on_stock_order` 回调的调用方拿到的 `XtOrder.price_type` 永远是
+  None——现场是同一笔委托，提交日志写着 MARKET，每条回报推送都是 None。
+  `xttype.XtOrder` 契约里有这个字段，所以这和 #271 补的七处、#173 补的
+  `trade_amount` 是同一类缺口：查询和推送两条路径要给出同一组字段。现在推送也读
+  `m_nOrderPriceType`，两边对齐。
+
 ### 文档
 
 - README「板块」一节加了 13 个名字的实测对照表，附返回条数；`get_stock_list_in_sector`

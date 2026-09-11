@@ -70,6 +70,7 @@ class FakeOrder:
     strategyName = "s1"
     m_strRemark = "remark-1"
     m_strOptName = "限价买入"
+    m_nOrderPriceType = 11        # 限价; the query path reads this same field
 
 
 class FakeOrderWithInsertDateTime:
@@ -220,6 +221,28 @@ class ExecEventsServerTest(unittest.TestCase):
         self.assertEqual(ev["remark"], "remark-1")
         self.assertEqual(ev["user_order_id"], "remark-1")
         self.assertEqual(ev["opt_name"], "限价买入")
+
+    def test_normalize_order_event_carries_price_type_like_the_query_path(self):
+        """xttype.XtOrder declares price_type; query_orders reads
+        m_nOrderPriceType, the push never did, so on_stock_order handed
+        callers price_type=None for every order (seen on a live 委托回报推送
+        as 订单类型 None while the submit had said MARKET)."""
+        ev = normalize_order_event(FakeOrder(), "acct")
+
+        self.assertEqual(ev["price_type"], 11)
+
+    def test_normalize_order_event_price_type_absent_is_none_not_a_crash(self):
+        class NoPriceType:
+            m_strAccountID = "acct"
+            m_strInstrumentID = "000001.SZ"
+            m_nOrderStatus = 50
+            m_nVolumeTotal = 200
+            m_strOrderSysID = "O2"
+            m_nDirection = 49
+
+        ev = normalize_order_event(NoPriceType(), "acct")
+
+        self.assertIsNone(ev["price_type"])
 
     def test_normalize_order_event_emits_real_order_time(self):
         # 官方 Order 字段 m_strInsertDate + m_strInsertTime -> 真实报单 Unix 秒。

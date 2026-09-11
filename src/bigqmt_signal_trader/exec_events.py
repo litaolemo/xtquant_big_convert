@@ -432,6 +432,10 @@ def normalize_order_event(order, account_id=""):
         "trade_amount": _attr(
             order, ["m_dTradeAmount", "trade_amount"]
         ),
+        # 报价类型。查询路径 (order_bigqmt) 一直读 m_nOrderPriceType，推送
+        # 路径从没读过，走回调的调用方拿到的 XtOrder.price_type 恒为 None ——
+        # 和上面 trade_amount 是同一个缺口，只是漏了这一个字段。
+        "price_type": _attr(order, ["m_nOrderPriceType", "price_type"]),
         "status": _attr(order, ["m_nOrderStatus", "order_status", "status"]),
         "direction": direction,
         "action": _action_from_direction(direction),
