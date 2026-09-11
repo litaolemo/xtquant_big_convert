@@ -21,7 +21,7 @@ copy never happened" and "the copy landed but was not picked up" look identical
 from the outside.
 """
 
-__version__ = "0.3.37"
+__version__ = "0.3.38"
 
 
 def deployment_report(package_dir=None):
