@@ -6,7 +6,10 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
-from bigqmt_signal_trader.adapters.market_bigqmt import BigQmtMarketDataProvider
+from bigqmt_signal_trader.adapters.market_bigqmt import (
+    BigQmtMarketDataProvider,
+    _market_data_answer_empty,
+)
 
 
 class RawMarketContext:
@@ -249,6 +252,12 @@ class _IndexedFrame(object):
 
 
 _SIX = ("open", "high", "low", "close", "volume", "amount")
+# Guojin 2.0.8.0 get_market_data_ex_ori empty 1mon: 12 keys, every list
+# length 0 (peeked 2026-09-11 on 0.3.34, field_list=[]).
+_ORI_EMPTY_COLUMNS = (
+    "time", "stime", "open", "high", "low", "close", "volume", "amount",
+    "settelementPrice", "openInterest", "preClose", "suspendFlag",
+)
 
 
 def _local_frame(rows, fields=None):
@@ -268,11 +277,15 @@ class TerminalContext(object):
     """
 
     def __init__(self, bars=None, broken_periods=("1mon", "1q", "1hy", "1y"),
-                 primary_rows=None, frame_for=None):
+                 primary_rows=None, frame_for=None,
+                 empty_ori_as_columns=False):
         self.broken_periods = set(broken_periods)
         self.bars = bars or []
         self.primary_rows = primary_rows or []
         self.frame_for = frame_for          # override the answered frame
+        # Guojin 2.0.8.0 get_market_data_ex_ori empty shape: a 12-key dict
+        # of length-0 arrays, not []. bool(that dict) is True.
+        self.empty_ori_as_columns = empty_ori_as_columns
         self.ori_calls = []
         self.market_calls = []
         self.local_calls = []
@@ -287,6 +300,9 @@ class TerminalContext(object):
                                "period": period, "count": count})
         codes = list(stock_code or [])
         if period in self.broken_periods:
+            if self.empty_ori_as_columns:
+                empty = dict((name, []) for name in _ORI_EMPTY_COLUMNS)
+                return dict((code, dict(empty)) for code in codes)
             return dict((code, []) for code in codes)
         return dict((code, list(self.primary_rows)) for code in codes)
 
@@ -352,6 +368,43 @@ def _partial_of(frame):
     return frame.get("__bigqmt_partial__")
 
 
+class MarketDataAnswerEmptyTest(unittest.TestCase):
+    """#237: 0 rows is a shape, not a Python truth value."""
+
+    def test_envelope_with_empty_row_list_is_empty(self):
+        answer = {"600519.SH": {
+            "__bigqmt_type__": "DataFrame",
+            "columns": ["stime", "close"],
+            "records": [],
+        }}
+        self.assertTrue(_market_data_answer_empty(answer))
+
+    def test_envelope_with_empty_column_dict_is_empty(self):
+        records = dict((name, []) for name in _ORI_EMPTY_COLUMNS)
+        answer = {"600519.SH": {
+            "__bigqmt_type__": "DataFrame",
+            "columns": [],
+            "records": records,
+        }}
+        self.assertTrue(_market_data_answer_empty(answer))
+
+    def test_envelope_with_populated_column_dict_is_not_empty(self):
+        answer = {"600519.SH": {
+            "__bigqmt_type__": "DataFrame",
+            "columns": [],
+            "records": {"time": [1, 2], "open": [10.0, 11.0]},
+        }}
+        self.assertFalse(_market_data_answer_empty(answer))
+
+    def test_envelope_with_row_list_is_not_empty(self):
+        answer = {"600519.SH": {
+            "__bigqmt_type__": "DataFrame",
+            "columns": ["stime", "close"],
+            "records": [["20260930", 1290.88]],
+        }}
+        self.assertFalse(_market_data_answer_empty(answer))
+
+
 class SynthPeriodRescueTest(unittest.TestCase):
     """#237: on Guojin 2.0.8.0 every get_market_data2 path answers 0 rows for
     1mon/1q/1hy/1y while a plain get_market_data answers the same bars. Rescue
@@ -382,6 +435,31 @@ class SynthPeriodRescueTest(unittest.TestCase):
         # It was get_market_data that served it -- get_local_data takes no
         # field list, so no shape the adapter builds can reach it.
         self.assertEqual(1, len(context.market_calls))
+        self.assertEqual("ContextInfo.get_market_data",
+                         _partial_of(frame)["source"])
+
+    def test_ori_column_dict_of_empty_arrays_is_rescued(self):
+        """The 2.0.8.0 empty answer is a 12-key dict of length-0 arrays.
+
+        ``bool({time: [], open: [], ...})`` is True, so the old
+        ``if records:`` treated 0 rows as data and never ran the rescue
+        (issue #237, measured 2026-09-11 on tagged 0.3.34). ``[]`` already
+        rescued; this is the shape that did not.
+        """
+        context, provider = self._provider(
+            bars=_MONTHLY_10, empty_ori_as_columns=True)
+
+        data = provider.get_market_data_ex(
+            field_list=[], stock_list=["600519.SH"], period="1mon", count=10,
+            dividend_type="none", fill_data=False)
+
+        frame = data["600519.SH"]
+        self.assertEqual(10, len(frame["records"]),
+                         "column-dict-of-empty-arrays must count as 0 rows")
+        self.assertEqual(["stime"] + list(_SIX), frame["columns"])
+        self.assertEqual(1, len(context.market_calls))
+        self.assertEqual("synth_period_primary_empty",
+                         _partial_of(frame)["reason"])
         self.assertEqual("ContextInfo.get_market_data",
                          _partial_of(frame)["source"])
 

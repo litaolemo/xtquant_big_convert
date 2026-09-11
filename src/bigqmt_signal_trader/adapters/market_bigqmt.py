@@ -185,19 +185,53 @@ def _raw_frame_columns(field_list):
     return columns
 
 
+def _records_have_rows(records):
+    """True when ``records`` carries at least one bar.
+
+    ``get_market_data_ex_ori`` answers two empty shapes:
+
+    * a list of rows (``[]``)
+    * a dict of column arrays whose every array has length 0
+
+    The column-dict is truthy in Python. On Guojin 2.0.8.0 that is the
+    empty answer for 1mon+ (12 keys, all length 0, measured 2026-09-11).
+    ``if records:`` treated it as data, so #237's rescue never ran: the
+    primary was kept, ``synth_fallback_only=True`` (which skips it) still
+    answered 10 rows from ``ContextInfo.get_market_data``.
+    """
+    if records is None:
+        return False
+    if isinstance(records, dict):
+        if records.get("__bigqmt_type__") == "DataFrame":
+            return _records_have_rows(records.get("records"))
+        for column in records.values():
+            try:
+                if len(column) > 0:
+                    return True
+            except TypeError:
+                if column not in (None, ""):
+                    return True
+        return False
+    try:
+        return len(records) > 0
+    except TypeError:
+        return bool(records)
+
+
 def _market_data_answer_empty(answer):
     """True when no code in the answer carries a single row.
 
     Covers both shapes get_market_data_ex can return: the raw path's
-    serialisable marker dict (records list) and the plain path's pandas
-    frames (index length). Anything unrecognised counts as an answer rather
-    than as empty -- a retry must never replace data with nothing.
+    serialisable marker dict (records list *or* a dict of column arrays)
+    and the plain path's pandas frames (index length). Anything
+    unrecognised counts as an answer rather than as empty -- a retry must
+    never replace data with nothing.
     """
     if not isinstance(answer, dict) or not answer:
         return True
     for value in answer.values():
         if isinstance(value, dict) and value.get("__bigqmt_type__") == "DataFrame":
-            if value.get("records"):
+            if _records_have_rows(value.get("records")):
                 return False
         elif hasattr(value, "index"):
             try:
@@ -205,7 +239,7 @@ def _market_data_answer_empty(answer):
                     return False
             except Exception:
                 return False
-        elif value:
+        elif _records_have_rows(value):
             return False
     return True
 

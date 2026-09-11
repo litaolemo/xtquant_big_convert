@@ -3,6 +3,14 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [Unreleased]
+
+### 修复
+
+- **合成周期回落在国金 2.0.8.0 上自动触发进不去**（issue #237）：`get_market_data_ex_ori` 对 1mon+ 的空答案不是 `[]`，而是 12 个字段、每个都是长度为 0 的列字典（`{time:[], stime:[], open:[], ... settelementPrice:[], ...}`）。`_market_data_answer_empty` 用 `if records:` 判断，这个 dict 为真，主路径被当成「有数」直接返回，`_synth_period_rescue` 根本不跑。同一台终端上 `synth_fallback_only=True` 能救出 10 行（`ContextInfo.get_market_data`），公式口六列也是 10 行。现在列字典看任一列的长度，全 0 才是空。单测假终端原先写 `{code: []}`，覆盖不到这个形状。
+
+---
+
 ## [0.3.35] - 2026-09-11
 
 ### 修复
