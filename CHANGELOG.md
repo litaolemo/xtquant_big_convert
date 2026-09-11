@@ -3,7 +3,9 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
-## [未发布]
+## [0.3.36] - 2026-09-11
+
+三处修复，都有实测依据：合成周期空答案是列字典时 #237 的回落进不去（#279，@yucejade）；`get_sector_list` 兜底清单里 `沪市A股` / `深市A股` 拼错，这台终端认的是 `上证A股` / `深证A股`；委托回报推送从没带过 `price_type`，回调拿到的永远是 None（#280）。
 
 ### 修复
 
