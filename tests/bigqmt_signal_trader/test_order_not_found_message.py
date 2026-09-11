@@ -73,8 +73,9 @@ class KeepsTheEvidenceTest(unittest.TestCase):
     def test_it_still_reports_the_order(self):
         block = _message_block()
 
-        for field in ("stock=%s", "action=%s", "price=%.2f", "volume=%d"):
+        for field in ("stock=%s", "action=%s", "price=%s", "volume=%d"):
             self.assertIn(field, block, field)
+        self.assertNotIn("price=%.2f", block)
 
     def test_it_still_reports_the_lookup_count(self):
         self.assertIn("lookup(s)", _message_block())
