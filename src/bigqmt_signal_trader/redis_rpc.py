@@ -2491,7 +2491,7 @@ class BigQmtRpcHandlers:
                 message = (
                     "ORDER IS LIVE -- DO NOT RESUBMIT. passorder reached the "
                     "broker and the order row exists (stock=%s action=%s "
-                    "price=%.2f volume=%d), but QMT had still not assigned "
+                    "price=%s volume=%d), but QMT had still not assigned "
                     "order_sys_id after %d lookup(s), so this reply carries no "
                     "id. Find it by remark %r, or in the 委托 list; it is not a "
                     "rejection (issue #152)."
@@ -2521,7 +2521,7 @@ class BigQmtRpcHandlers:
             # hours there before finding the mode (issue #122).
             message = (
                 "passorder submitted but order not found in system "
-                "(stock=%s action=%s price=%.2f volume=%d, %d lookup(s)). "
+                "(stock=%s action=%s price=%s volume=%d, %d lookup(s)). "
                 "FIRST check the strategy's run mode: in QMT's 模型交易 list the "
                 "运行模式 column defaults to 模拟, where passorder matches "
                 "internally and never reaches the broker -- switch it to 实盘 "
