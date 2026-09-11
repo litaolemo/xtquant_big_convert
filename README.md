@@ -38,37 +38,35 @@
 
 ### 配置向导：`bigqmt-init`
 
-不想手动抄两份 `.example.py`、也不想搞清楚三十来个键里哪些真的要改，直接跑：
+部署流程见 [docs/DEPLOY_QUICKSTART.md](docs/DEPLOY_QUICKSTART.md)，向导是它的**第 2 步**：替代手抄两份 `.example.py`。在能写到 QMT 的 python 目录的机器上跑：
 
 ```bash
 bigqmt-init
 ```
 
-或者从源码检出运行：
+或者从源码检出运行 `python -m bigqmt_signal_trader.init_config`。
 
-```bash
-python -m bigqmt_signal_trader.init_config
-```
+问资金账号、账号类型、传输方式（redis / zmq）、地址端口、Redis 用户名密码、是否允许远程下单、部署方式、两个目录，然后把服务端和客户端两份配置由**同一组答案**写出来，连接参数不会对不上：
 
-问几个问题——资金账号、账号类型、传输方式（redis / zmq）、地址端口、Redis 用户名密码、是否允许远程下单、部署方式——然后把配置写出来：
-
-| 文件 | 位置 | 作用 |
+| 文件 | 写到哪 | 谁用 |
 |---|---|---|
-| `bigqmt_signal_trader_local_config.py` | QMT 的 python 目录 | 服务端（QMT 内） |
-| `bigqmt_signal_trader_client_config.py` | 你指定的目录 | 客户端（外部程序） |
-| `BIGQMT_*_ALL_IN_ONE.py` | QMT 的 python 目录 | 选了单文件部署时，配置已烘焙进去 |
+| `bigqmt_signal_trader_local_config.py` | QMT 的 python 目录 | 服务端 |
+| `bigqmt_signal_trader_client_config.py` | 你指定的目录 | 客户端 |
+| `BIGQMT_*_ALL_IN_ONE.py` | QMT 的 python 目录 | 只有选了单文件部署才生成，配置已烘焙进去 |
 
-服务端和客户端两份配置由同一组答案生成，**连接参数不会对不上**。
+**它不做的事，也是最容易误解的地方：** 默认的 `package` 部署方式下它**只写配置，不拷包**。跑完打印的「把 src/ 下的包同步到 QMT 的 python 目录」是对源码检出说的；pip 装的没有 `src/`，按快速开始第 3 步找到包的位置再拷 4 项。单文件模式则已经生成到位。
 
-几个不问、直接定死的选项：
+**最容易答错的一问：**「QMT 的 python 目录（回车则写到当前目录）」。这里填 QMT 安装目录下的 `python`，直接回车会写到你当前所在的目录，服务端启动时找不到配置。
 
-- **`rpc_background_threads` 按传输选**（redis `True`、zmq/pipe `False`）—— 选反了差 4~37 倍，向导按你选的传输定，不问
-- **`rpc_allow_order_methods` 默认 `False`** —— 打开前会明确提示：任何能连上这条通道的程序都可以下单
+几个不问、直接定死的：
+
+- **`rpc_background_threads` 按传输选**（redis `True`、zmq/pipe `False`）——选反了差 4~37 倍
+- **`rpc_allow_order_methods` 默认 `False`**——打开前会明确提示：任何能连上这条通道的程序都可以下单
 - 选了**无 redis 单文件**会自动把传输改成 zmq，不会留下一份声称用 redis 的配置
 
 已存在的文件会先问再覆盖（`--force` 跳过询问）。
 
-> **密码分两类。** Redis 密码是服务凭据，写进配置文件（`.example.py` 本来就是这么记的），输入时不回显。**QMT 登录密码不落盘**——`qmt_launcher` 从环境变量 `BIGQMT_LOGIN_PASSWORD` 读，这样它不会出现在 `argv` 或磁盘文件里，`bigqmt-init` 沿用这个约定。
+> **密码分两类。** Redis 密码是服务凭据，写进配置文件，输入时不回显。**QMT 登录密码不落盘**——`qmt_launcher` 从环境变量 `BIGQMT_LOGIN_PASSWORD` 读，这样它不会出现在 `argv` 或磁盘文件里。
 >
 > 生成的文件带账号和凭据，**不要提交到版本库**。
 
