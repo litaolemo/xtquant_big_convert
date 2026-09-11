@@ -1922,7 +1922,8 @@ class BigQmtXtData:
         # the heal so the heal sees the shape it knows.
         return _to_documented_market_data_shape(data, field_list, stock_list, period)
 
-    def _get_market_data_ex_batch(self, params, timeout_seconds=None, use_formula=True):
+    def _get_market_data_ex_batch(self, params, timeout_seconds=None, use_formula=True,
+                                  heal=True):
         """One RPC's worth of bars, healed and normalized. No caching."""
         if use_formula:
             data = self.client.call("get_market_data_ex", params, timeout_seconds=timeout_seconds)
@@ -1931,7 +1932,9 @@ class BigQmtXtData:
             data = self.client.call("get_market_data_ex", params, timeout_seconds=timeout_seconds,
                                     use_formula=False)
         # Self-heal adjusted reads (all-zero bars -> server raw download + retry).
-        data = self._heal_adjusted("get_market_data_ex", params, data, timeout_seconds=timeout_seconds)
+        if heal:
+            data = self._heal_adjusted("get_market_data_ex", params, data,
+                                       timeout_seconds=timeout_seconds)
         # Normalize Big QMT's stime-indexed frame to MiniQMT shape (time-indexed).
         if isinstance(data, dict):
             # Capture the degraded-answer markers first: normalisation copies,
@@ -2240,8 +2243,16 @@ class BigQmtXtData:
         use_formula=True,
         backfill_pre_close=True,
         resynth_ongoing_multiday=True,
+        heal=True,
     ):
         """Pull bars over RPC, in batches of ``chunk_size`` codes.
+
+        ``heal=False`` skips the self-heal that answers an unready raw store
+        with a server-side raw download. The one caller that must turn it
+        off is ``download_history_data2``'s readiness poll (#275): it is
+        waiting for a download it just submitted, and healing there
+        re-submits that same download every 1.5s round, pushing the landing
+        it is waiting for further back until the 60s budget is gone.
 
         Cache-through: whatever is fetched is written to the local cache (keyed
         by dividend_type), so it stays the latest -- important for 前复权 data,
@@ -2282,7 +2293,7 @@ class BigQmtXtData:
         if step <= 0 or len(codes) <= step:
             data = self._get_market_data_ex_batch(
                 dict(base, stock_list=codes), timeout_seconds=timeout_seconds,
-                use_formula=use_formula,
+                use_formula=use_formula, heal=heal,
             )
         else:
             data = {}
@@ -2292,7 +2303,7 @@ class BigQmtXtData:
                 try:
                     part = self._get_market_data_ex_batch(
                         dict(base, stock_list=batch), timeout_seconds=timeout_seconds,
-                        use_formula=use_formula,
+                        use_formula=use_formula, heal=heal,
                     )
                 except Exception as exc:
                     # Losing one batch must not lose the others: a partial
@@ -2897,6 +2908,10 @@ class BigQmtXtData:
                     dividend_type=dividend_type,
                     fill_data=False,  # fill 会用全 0 占位行冒充数据，轮询判定必须关掉
                     timeout_seconds=float(data_wait_seconds),
+                    # 等的就是刚提交的那笔下载。heal 看到「还没落地」会把它原样
+                    # 再提交一遍、睡 2 秒、再读——每轮如此，等待目标被反复推后，
+                    # 单票冷启动必然打满 60 秒（#275）。轮询里的读不参与 heal。
+                    heal=False,
                 )
                 ready = 0
                 for code in batch:
