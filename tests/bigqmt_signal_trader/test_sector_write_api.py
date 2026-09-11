@@ -305,6 +305,53 @@ class GetSectorListHonestyTest(unittest.TestCase):
         self.assertNotEqual(list(answer), list(provider._FALLBACK_SECTORS))
 
 
+class FallbackNamesAreTheOnesThisTerminalAnswersTest(unittest.TestCase):
+    """Each fallback name was fed to get_stock_list_in_sector on a live
+    terminal (国金 Big QMT 2.1.19.0, 2026-09-11). Two of the original thirteen
+    answered with nothing.
+
+        沪市A股  0 rows        上证A股  2318 rows
+        深市A股  0 rows        深证A股  2902 rows
+
+    2318 + 2902 = 5220 = 沪深A股, so 上证 / 深证 is the terminal's spelling.
+    Funds are spelt the other way round (沪市基金 / 深市基金 answer, 上证基金 /
+    深证基金 do not), so nothing here can be inferred from a rule -- which is
+    exactly why a curated list needs pinning to a measurement.
+    """
+
+    def test_the_a_share_halves_use_the_spelling_that_returns_rows(self):
+        provider = _provider(Context(), None)
+        names = provider.get_sector_list(allow_fallback=True)
+
+        self.assertIn("上证A股", names)
+        self.assertIn("深证A股", names)
+
+    def test_the_spellings_that_return_nothing_are_not_offered(self):
+        """A fallback name that answers empty is the #143 problem in miniature."""
+        provider = _provider(Context(), None)
+        names = provider.get_sector_list(allow_fallback=True)
+
+        for wrong in provider._EMPTY_ON_BIG_QMT:
+            self.assertNotIn(wrong, names, "%s returns 0 rows on Big QMT" % wrong)
+
+    def test_the_count_the_error_message_quotes_is_still_right(self):
+        """get_sector_list() names the number of curated entries in its error."""
+        provider = _provider(Context(), None)
+
+        with self.assertRaises(NotImplementedError) as caught:
+            provider.get_sector_list()
+        self.assertIn("%d well-known names" % len(provider._FALLBACK_SECTORS),
+                      str(caught.exception))
+
+    def test_the_fund_spelling_is_left_alone(self):
+        """沪市基金 / 深市基金 are the ones that answer; do not 'fix' them to 上证/深证."""
+        provider = _provider(Context(), None)
+        names = provider.get_sector_list(allow_fallback=True)
+
+        self.assertIn("沪市基金", names)
+        self.assertIn("深市基金", names)
+
+
 class ReachableOverRpcTest(unittest.TestCase):
     def test_the_new_methods_are_whitelisted(self):
         from bigqmt_signal_trader.redis_rpc import MARKET_DATA_METHODS, READ_METHODS

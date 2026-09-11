@@ -1683,12 +1683,24 @@ class BigQmtMarketDataProvider:
     # get_stock_list_in_sector / get_sector. Used as a fallback when the full
     # sector list is not enumerable (Big QMT has no get_sector_list method and
     # the xtdata SDK's quote service is unreachable inside the full terminal).
+    #
+    # Every name here was fed to get_stock_list_in_sector on a live 国金 Big
+    # QMT 2.1.19.0 terminal (2026-09-11). Two of the original thirteen came
+    # back empty and are corrected below: the A-share halves are spelt 上证 /
+    # 深证 on this terminal, while 沪市A股 / 深市A股 return 0 rows. Funds go
+    # the other way -- 沪市基金 / 深市基金 answer and 上证基金 / 深证基金 do
+    # not -- so the spelling cannot be inferred, only measured. 中金所 also
+    # returned 0 on a STOCK account, which reads as a permission gap rather
+    # than a wrong name, so it stays.
     _FALLBACK_SECTORS = (
-        "沪深A股", "沪市A股", "深市A股", "科创板", "创业板",
+        "沪深A股", "上证A股", "深证A股", "科创板", "创业板",
         "上证期权", "深证期权", "中金所",
         "沪市债券", "深市债券",
         "沪市基金", "深市基金", "沪深ETF",
     )
+    # The two spellings that look right and answer with nothing. Kept so a
+    # test can pin that they never creep back into the list above.
+    _EMPTY_ON_BIG_QMT = ("沪市A股", "深市A股")
 
     def get_sector_list(self, allow_fallback=False):
         """Return the terminal's sector names, or say it cannot (issue #143).
