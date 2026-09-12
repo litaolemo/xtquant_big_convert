@@ -14,6 +14,31 @@ def _attr(obj, names, default=None):
     return default
 
 
+def _required_count(row, names, label, code, account_id):
+    """An integer the terminal must give for a position; a missing one is an
+    error, never a zero (issue #290).
+
+    ``m_nVolume`` / ``m_nCanUseVolume`` / ``m_nYesterdayVolume`` used to go
+    through ``int(_attr(row, names, 0) or 0)``, so a row that lacked the
+    attribute serialised exactly like a row that said 0. A caller could not
+    tell "the terminal did not say how much I hold" from "I hold nothing" --
+    and a strategy that reads 0 as "flat" buys again, one that reads 0 as
+    "nothing sellable" never sells. Reporting the row as unknown is worse
+    than refusing the query: #229/#230 already route a failed native query
+    to the RPC error path (ok=False, error=...) instead of an empty answer,
+    and this is the same class of failure one row down. A native 0 is still
+    a 0; an empty native result is still an empty result.
+    """
+    value = _attr(row, names)
+    if value is None:
+        raise ValueError(
+            "POSITION row for %s (account %s) carries no %s (looked for %s); "
+            "refusing to report 0 for a count the terminal did not give -- a "
+            "missing count and a real zero must not look alike (#290)"
+            % (code, account_id, label, "/".join(names)))
+    return int(value)
+
+
 def _float_or_none(value):
     if value is None:
         return None
@@ -170,8 +195,9 @@ class BigQmtPositionProvider:
                 continue
             positions[code] = PositionSnapshot(
                 stock_code=code,
-                volume=int(_attr(row, ("m_nVolume", "volume"), 0) or 0),
-                available=int(_attr(row, ("m_nCanUseVolume", "available", "can_use_volume"), 0) or 0),
+                volume=_required_count(row, ("m_nVolume", "volume"), "volume", code, account_id),
+                available=_required_count(
+                    row, ("m_nCanUseVolume", "available", "can_use_volume"), "available", code, account_id),
                 cost=float(_attr(row, ("m_dOpenPrice", "m_dCostPrice", "cost"), 0.0) or 0.0),
                 stock_name=str(_attr(row, ("m_strInstrumentName", "stock_name"), "") or ""),
                 market_value=_float_or_none(_attr(row, ("m_dMarketValue", "m_dInstrumentValue", "market_value"))),
@@ -179,7 +205,8 @@ class BigQmtPositionProvider:
                 open_price=_float_or_none(_attr(row, ("m_dOpenPrice", "m_dCostPrice", "open_price", "cost"))),
                 frozen_volume=int(_attr(row, ("m_nFrozenVolume", "frozen_volume"), 0) or 0),
                 on_road_volume=int(_attr(row, ("m_nOnRoadVolume", "on_road_volume"), 0) or 0),
-                yesterday_volume=int(_attr(row, ("m_nYesterdayVolume", "yesterday_volume"), 0) or 0),
+                yesterday_volume=_required_count(
+                    row, ("m_nYesterdayVolume", "yesterday_volume"), "yesterday_volume", code, account_id),
                 direction=int(_attr(row, ("m_nDirection", "direction"), 48) or 48),
             )
         return positions

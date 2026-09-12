@@ -3,6 +3,26 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [未发布]
+
+### 修复
+
+- **POSITION 行缺数量字段时被补成 0，与原生明确为 0 无法区分**（#290，由 @shengyy 带
+  离线复现报告）。`m_nVolume` / `m_nCanUseVolume` / `m_nYesterdayVolume` 原来走
+  `int(_attr(row, names, 0) or 0)`，缺属性的行序列化出来和终端明确说 0 的行逐字节相同，
+  "不知道持多少"和"持仓为零"在 adapter 这层就混成一个了，走公开 raw RPC 也救不回来。
+  读 0 当"空仓"的策略会重复买入，读 0 当"没有可卖"的策略永远不卖。
+
+  这三个是大 QMT POSITION 结构里无条件的 `int` 成员（`BIGQMT_INNER_PYTHON_API_REFERENCE`
+  没给它们标"股票不适用"，周围期货专属字段是标了的），#81 在 6 只实盘持仓上逐行核对过。
+  缺了就是终端自己的契约没守住。现在 adapter 直接抛 `ValueError`，点名代码、账户和缺的
+  字段，经 #229/#230 已有的路径以 `ok=False, error=...` 传回，客户端拿到异常而不是数据。
+  原生明确的 0 仍是 0，原生空结果仍是空结果。`frozen_volume` / `on_road_volume` 不在此列，
+  报告未涉及、也不决定"持多少/能卖多少"。
+
+  今天（周六、终端刚重启）实盘 POSITION 缓存为空，原生行的字段形状没能当场探到；契约依据
+  是上面的结构文档和 #81 的历史实测。
+
 ## [0.3.39] - 2026-09-12
 
 三处修复：策略首跑那条 `unknown encoding: idna` 不再出现（#288），`xtdata.get_divid_factors()` 返回对齐 miniQMT 实测形状的 DataFrame（#287），订单诊断信息不再把转债价格截成两位小数（#282）。
