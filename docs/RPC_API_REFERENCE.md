@@ -202,8 +202,11 @@ FormulaServer 直连不认这个参数，带上它会强制回落到 RPC 桥（�
 | `get_his_option_list_batch` | `undl_code` `start_time` `end_time` | 批量历史期权 |
 | `get_divid_factors` | `stock_code` 可选 `start_time`/`end_time` | 除权除息因子 |
 
-**`get_divid_factors` 参数说明（重要）**：
-`ContextInfo` 桩签名是 `get_divid_factors(marketAndStock, date='')`——**只收 2 个参数**（代码 + 单个日期）。适配器接受 `start_time`/`end_time` 以保持接口兼容，但实际只把 `end_time`（或 `start_time`）作为单个 `date` 传入。
+**`get_divid_factors` 说明**：
+
+- **区间是真的区间**（#165 起）。`ContextInfo` 桩只收单个日期，服务端先试原生 SDK 和 3 参形状，都不行才由日线 `preClose` 与前一根 `close` 的差定位除权日、逐日探测。以前把区间塌成 `end_time` 单日查，区间几乎必然返回空。
+- **线上格式**是大 QMT 原生的 `dict{毫秒时间戳: [每股红利, 每股送转, 每转赠, 配股, 配股价, 是否股改, 复权系数]}`，走原始 RPC（含 `getDividFactors` 别名）拿到的就是它。
+- **`xtdata.get_divid_factors()` 返回 DataFrame**，对齐真 miniQMT 实测的形状：索引是除权日 `YYYYMMDD`（毫秒戳按上海时间折算），八列 `time`（当天毫秒戳）/ `interest` / `stockBonus` / `stockGift` / `allotNum` / `allotPrice` / `gugai` / `dr`，全部 float64，后七列与上面 7 个位置一一对应。之前客户端把 dict 原样透传，`df["dr"]` 直接 KeyError。
 
 ### 3.7 因子 / 模型
 

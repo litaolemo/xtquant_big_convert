@@ -3,6 +3,34 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [未发布]
+
+### 修复
+
+- **`xtdata.get_divid_factors()` 返回 dict，不是 DataFrame**。在真 miniQMT 上实测
+  `df.info()`：`Index: 19990823 to 20080707`，八列 `time` / `interest` / `stockBonus` /
+  `stockGift` / `allotNum` / `allotPrice` / `gugai` / `dr`，`dtypes: float64(8)`——一行一个
+  除权日，索引是 YYYYMMDD，`time` 列是当天的毫秒戳。桥的客户端把 RPC 应答原样透传，
+  而应答是大 QMT 原生的 `dict{毫秒时间戳: [7 个数]}`：值和顺序都一样，但没有名字、日期
+  还是毫秒戳、`gugai` 是 int。照着真 xtdata 写的调用方 `df["dr"]` 是 KeyError，
+  `df.loc["20260626"]` 取不到，`df.tail()` 是 AttributeError。
+
+  现在客户端补日期索引、`time` 列、列名和 float64，和 `get_market_data_ex` 把线上
+  records 落成 frame 是同一种做法。毫秒戳是上海零点（三个实盘样本
+  `(ms/1000 + 8h) % 86400` 都是 0），折成 YYYYMMDD 用固定 +8h，不看客户端机器时区。
+  **线上格式不变**，走原始 RPC 和 `getDividFactors` 别名拿到的还是那个 dict。行序保持
+  服务端给的，不排序。
+
+  列序用国金 2.1.19.0 实盘数据钉住：000001.SZ 在 2000 年那次配股，两个非零值必须落在
+  `allotNum`（0.3）和 `allotPrice`（8.0）而不是 `interest`。600519.SH 端到端
+  `Index: 30 entries, 20020725 to 20260626`，8 列全 float64。
+
+- **RPC 参考里 `get_divid_factors` 那段参数说明还是 #165 修前的老话**（"实际只把
+  `end_time` 作为单个 `date` 传入"），区间早就是真区间了。按现状重写，并补上线上格式与
+  客户端返回格式的区别。
+
+---
+
 ## [0.3.38] - 2026-09-11
 
 文档版。部署快速开始重写：`bigqmt-init` 嵌进流程并写明它不做什么，新增「升级已有部署」一节，按实际跑过两遍的流程写（#285）。代码与 0.3.37 相同。

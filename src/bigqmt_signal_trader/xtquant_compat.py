@@ -641,6 +641,88 @@ def _to_documented_market_data_shape(data, field_list, stock_list, period):
     return out
 
 
+# xtdata.get_divid_factors 的七个权息列（dict.thinktrader.net「除权数据」一节），
+# 顺序就是大 QMT 原生返回里那个 7 元素列表的位置顺序：
+#   dict{毫秒时间戳: [每股红利, 每股送转, 每转赠, 配股, 配股价, 是否股改, 复权系数]}
+DIVID_FACTOR_COLUMNS = ("interest", "stockBonus", "stockGift",
+                        "allotNum", "allotPrice", "gugai", "dr")
+# 官方 frame 的完整列：time（毫秒时间戳）在前，然后是七个权息列，全部 float64。
+DIVID_FRAME_COLUMNS = ("time",) + DIVID_FACTOR_COLUMNS
+
+# 大 QMT 给的除权日毫秒戳是上海时间零点（实测三个样本 (ms/1000 + 8h) % 86400 == 0）。
+# 用固定 +8h 折成 YYYYMMDD，不依赖客户端机器的时区。
+_SHANGHAI_OFFSET_S = 8 * 3600
+
+
+def _divid_day_key(key):
+    """A big-QMT ms timestamp key -> the YYYYMMDD string xtdata indexes by.
+
+    Already-YYYYMMDD keys (8 digits) pass through; anything that is not a
+    plain number is left alone rather than guessed at.
+    """
+    import datetime as _dt
+
+    text = str(key).strip()
+    if len(text) == 8 and text.isdigit():
+        return text
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return text
+    seconds = number / 1000.0 if number > 1e11 else number
+    day = _dt.datetime(1970, 1, 1) + _dt.timedelta(seconds=seconds + _SHANGHAI_OFFSET_S)
+    return day.strftime("%Y%m%d")
+
+
+def _divid_factors_frame(data):
+    """``dict{ms: [7 values]}`` -> the DataFrame ``xtdata.get_divid_factors`` returns.
+
+    Measured against the real xtdata (``df.info()`` on a live miniQMT):
+
+        Index: 19990823 to 20080707            <- ex-dividend day, YYYYMMDD
+        time, interest, stockBonus, stockGift,
+        allotNum, allotPrice, gugai, dr        <- 8 columns, all float64
+
+    The wire carries big QMT's native shape -- a dict keyed by the day's ms
+    timestamp with a positional 7-list -- so this adds the day index, the
+    ``time`` column (the ms key, as float), the names, and the float64 dtype,
+    the way ``get_market_data_ex`` turns wire records into frames. Passing the
+    dict through as-is made ``df["dr"]`` a KeyError for every caller written
+    against the real xtdata.
+
+    Rows keep the server's order (chronological from the terminal). A value
+    that already comes as a named dict is read by name. Anything that is not
+    a dict passes through untouched, so an error envelope is not turned into
+    an empty frame.
+    """
+    if not isinstance(data, dict):
+        return data
+    import pandas as pd
+
+    columns = list(DIVID_FRAME_COLUMNS)
+    if not data:
+        return pd.DataFrame(columns=columns, dtype="float64")
+    rows = {}
+    for key, value in data.items():
+        try:
+            time_ms = float(key)
+        except (TypeError, ValueError):
+            time_ms = float("nan")
+        if isinstance(value, dict):
+            if value.get("time") is not None:
+                try:
+                    time_ms = float(value["time"])
+                except (TypeError, ValueError):
+                    pass
+            factors = [value.get(name) for name in DIVID_FACTOR_COLUMNS]
+        else:
+            seq = list(value) if isinstance(value, (list, tuple)) else [value]
+            factors = (seq + [None] * len(DIVID_FACTOR_COLUMNS))[:len(DIVID_FACTOR_COLUMNS)]
+        rows[_divid_day_key(key)] = [time_ms] + factors
+    frame = pd.DataFrame.from_dict(rows, orient="index", columns=columns)
+    return frame.astype("float64")
+
+
 def _digits_only(value):
     return "".join(ch for ch in str(value or "") if ch.isdigit())
 
@@ -2795,7 +2877,16 @@ class BigQmtXtData:
             time.sleep(3600)
 
     def get_divid_factors(self, stock_code, start_time="", end_time=""):
-        return self._call("get_divid_factors", stock_code=stock_code, start_time=start_time, end_time=end_time)
+        """除权除息因子，返回 DataFrame，对齐 ``xtdata.get_divid_factors``。
+
+        行是除权日（毫秒时间戳，同官方保留原始键），列是 ``interest`` /
+        ``stockBonus`` / ``stockGift`` / ``allotNum`` / ``allotPrice`` /
+        ``gugai`` / ``dr``。线上仍是大 QMT 原生的 ``dict{时间戳: [7 个数]}``，
+        走原始 RPC（含 ``getDividFactors`` 别名）拿到的还是那个 dict。
+        """
+        data = self._call("get_divid_factors", stock_code=stock_code,
+                          start_time=start_time, end_time=end_time)
+        return _divid_factors_frame(data)
 
     def download_history_data2(self, stock_list, period, start_time="", end_time="", callback=None, incrementally=None, dividend_type="none", chunk_size=None, download_timeout_seconds=180.0, data_wait_seconds=60.0):
         """Pull bars from Big QMT over RPC and cache them locally, in batches.
