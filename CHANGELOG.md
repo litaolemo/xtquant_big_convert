@@ -7,6 +7,25 @@
 
 ### 修复
 
+- **策略第一次跑，首个 adjust tick 报 `LookupError: unknown encoding: idna`**，再跑
+  就没有。`socket.getaddrinfo` 把主机名按 `idna` 编码，这个编码器是懒加载的：
+  `codecs.lookup('idna')` → `encodings.search_function` → `import encodings.idna` →
+  `stringprep` → `unicodedata`（`DLLs\` 下的 C 扩展）。首次连 Redis 发生在 adjust
+  线程（C++ 定时器回调）上、init 刚落定那一刻，沙箱化的 importer 在那个线程上加载扩展
+  会失败（#135 对 `importlib.reload` 记过同样的事）；`search_function` 把 ImportError
+  吞成「unknown encoding」，调用方看到的是个二手错误。下一个 tick 重连成功、模块进了
+  `sys.modules`，QMT 跨策略重跑保留 `sys.modules`，于是再也不出现——看着像偶发。
+
+  三个模块在 QMT 自带的 3.6.8 里单独都能加载，不是缺模块，是时机。现在
+  `redis_transport` 模块加载时（主线程、init 阶段、adjust 定时器还不存在）就
+  `import encodings.idna` 并 `codecs.lookup('idna')` 一次：前者让后续 `__import__`
+  在 `sys.modules` 短路、不经过 finder，后者把编码器缓存预热、adjust 线程的 lookup
+  连 `search_function` 都不调。PyInstaller 防同一个错用的就是这招。带守卫，沙箱真拒绝
+  也不会把 transport 模块带崩。
+
+  影响只是首次运行丢一个 adjust tick 的 drain（默认 100ms），请求在队列里等下一个
+  tick，什么都没丢；改的是那条带完整 traceback 的 ERROR 不再出现。
+
 - **`xtdata.get_divid_factors()` 返回 dict，不是 DataFrame**。在真 miniQMT 上实测
   `df.info()`：`Index: 19990823 to 20080707`，八列 `time` / `interest` / `stockBonus` /
   `stockGift` / `allotNum` / `allotPrice` / `gugai` / `dr`，`dtypes: float64(8)`——一行一个

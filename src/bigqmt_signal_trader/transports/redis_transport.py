@@ -22,6 +22,35 @@ import time
 import traceback
 import uuid
 
+# Pull the idna codec in NOW, on the thread that imports this module.
+#
+# socket.getaddrinfo(host) encodes the host name as 'idna'. That codec is
+# loaded lazily by codecs.lookup -> encodings.search_function ->
+# import encodings.idna -> stringprep -> unicodedata (a C extension in
+# DLLs/). Inside big QMT the first Redis connect happens on the adjust
+# thread -- a C++ timer callback -- during the first tick after init, and
+# the sandboxed importer can fail to load an extension module from there
+# (#135 noted the same for importlib.reload). search_function swallows the
+# ImportError and codecs.lookup raises "LookupError: unknown encoding: idna",
+# which took down exactly one drain tick on the first run of a strategy;
+# the next tick reconnected, the modules landed in sys.modules, and QMT
+# keeps sys.modules across re-runs, so it never showed again.
+#
+# Importing it here runs on the main thread while init() builds the
+# transport, before the adjust timer exists. Two layers: the import puts
+# the chain in sys.modules, so a later __import__ short-circuits there and
+# never reaches the sandboxed finder; the lookup primes the interpreter's
+# codec cache, so the adjust thread's codecs.lookup('idna') does not even
+# call search_function. Same trick PyInstaller uses for the same error.
+# Guarded so a sandbox that refuses this cannot take the transport module
+# down with it -- the connect path would then fail loudly on its own.
+try:
+    import codecs as _codecs
+    import encodings.idna  # noqa: F401
+    _codecs.lookup("idna")
+except (ImportError, LookupError):
+    pass
+
 from ..adapters.redis_common import decode_text
 from ..redis_rpc import (
     decode_rpc_request_payload,
