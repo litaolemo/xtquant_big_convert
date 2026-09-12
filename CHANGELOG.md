@@ -23,6 +23,20 @@
   今天（周六、终端刚重启）实盘 POSITION 缓存为空，原生行的字段形状没能当场探到；契约依据
   是上面的结构文档和 #81 的历史实测。
 
+- **`BigQmtRpcClient(redis_config=...)` 显式传的三个功能开关被配置模块覆盖**（#289，由
+  @shengyy 带离线复现报告）。构造函数开头对 host/port/password 的规则是显式参数覆盖配置
+  模块（`merged_redis_config.update(redis_config)`），但三个功能段各自违背了它：
+  `local_cache` 先读模块段、显式值只当 `.get` 的兜底；`formula_server` 用 `or` 链把模块段
+  排在显式 dict 前面，模块里只要有这个段，显式传的整个 dict 直接丢弃、连合并都没有；
+  `full_tick` 压根不读 `redis_config`，所以没有配置模块时构造开关也不起作用。报告人的
+  复现：模块三个都说 True、构造函数三个都传 False，得到 True True True；没有模块时传
+  `full_tick_cache_enabled=True` 得到 False。
+
+  现在三个段统一走 `_ClientSetting`：显式 `redis_config` > 配置模块 > 环境变量 / 默认，
+  和 host/port/password 同一个顺序。`formula_server` 改为逐键合并而不是二选一，调用方没
+  提的键保留模块的值。配置模块内部 `BIGQMT_REDIS_CONFIG` 平铺键与专用段的先后由
+  `load_client_config` 决定、本次不动。
+
 ## [0.3.39] - 2026-09-12
 
 三处修复：策略首跑那条 `unknown encoding: idna` 不再出现（#288），`xtdata.get_divid_factors()` 返回对齐 miniQMT 实测形状的 DataFrame（#287），订单诊断信息不再把转债价格截成两位小数（#282）。

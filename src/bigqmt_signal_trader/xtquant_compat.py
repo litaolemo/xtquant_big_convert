@@ -196,6 +196,48 @@ def _bool_value(value, default=False):
     return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _first_set(*values):
+    """The first value that is not None; None if all are."""
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+class _ClientSetting(object):
+    """One client feature setting: explicit ``redis_config`` first, then the
+    config module's section, then the environment / built-in default -- the
+    order the constructor already promises for host/port/password.
+
+    Issue #289: the three feature blocks each broke that in its own way.
+    ``local_cache`` read the module section first and used the explicit value
+    only as its ``.get`` fallback; ``formula_server`` ``or``-chained the module
+    section ahead of the explicit dict, so any module section discarded the
+    explicit one outright; ``full_tick`` never read ``redis_config`` at all,
+    so its constructor switch did nothing even with no module present.
+
+    ``section`` is what load_client_config hands over: the module's dedicated
+    dict (``BIGQMT_LOCAL_CACHE_CONFIG`` etc.) with the module's own
+    ``BIGQMT_REDIS_CONFIG`` flat keys already folded in. How those two rank
+    against each other inside one file is that function's business and is
+    unchanged here. Flat keys carry the section prefix
+    (``local_cache_enabled``), section keys drop it (``enabled``); a section
+    may also spell the flat key, which the old code accepted, so both are
+    looked up there.
+    """
+
+    def __init__(self, explicit, section):
+        self.explicit = dict(explicit or {})
+        self.section = dict(section or {})
+
+    def get(self, flat_key, section_key):
+        return _first_set(
+            self.explicit.get(flat_key),
+            self.section.get(section_key),
+            self.section.get(flat_key),
+        )
+
+
 def _import_optional_module(module_name):
     try:
         return importlib.import_module(module_name)
@@ -1104,57 +1146,50 @@ class BigQmtRpcClient:
             if config_download_poll is not None
             else _env_float("BIGQMT_DOWNLOAD_POLL_INTERVAL_SECONDS", 0.5)
         )
-        full_tick_cache_config = dict(client_config.get("full_tick_cache_config") or {})
+        # Precedence for the three feature sections below (#289): explicit
+        # redis_config > config module > env / default -- the order
+        # host/port/password already get above.
+        full_tick = _ClientSetting(redis_config, client_config.get("full_tick_cache_config"))
         self.full_tick_cache_config = {
             "enabled": _bool_value(
-                full_tick_cache_config.get("enabled", full_tick_cache_config.get("full_tick_cache_enabled")),
+                full_tick.get("full_tick_cache_enabled", "enabled"),
                 _env_bool("BIGQMT_FULL_TICK_CACHE_ENABLED", False),
             ),
-            "demand_ttl_seconds": float(
-                full_tick_cache_config.get("demand_ttl_seconds")
-                or full_tick_cache_config.get("full_tick_demand_ttl_seconds")
-                or _env_float("BIGQMT_FULL_TICK_DEMAND_TTL_SECONDS", 10.0)
-            ),
-            "cache_ttl_seconds": float(
-                full_tick_cache_config.get("cache_ttl_seconds")
-                or full_tick_cache_config.get("full_tick_cache_ttl_seconds")
-                or _env_float("BIGQMT_FULL_TICK_CACHE_TTL_SECONDS", 10.0)
-            ),
-            "wait_seconds": float(
-                full_tick_cache_config.get("wait_seconds")
-                or full_tick_cache_config.get("full_tick_wait_seconds")
-                or _env_float("BIGQMT_FULL_TICK_WAIT_SECONDS", 3.5)
-            ),
-            "poll_interval_seconds": float(
-                full_tick_cache_config.get("poll_interval_seconds")
-                or full_tick_cache_config.get("full_tick_poll_interval_seconds")
-                or _env_float("BIGQMT_FULL_TICK_POLL_INTERVAL_SECONDS", 0.2)
-            ),
+            "demand_ttl_seconds": float(_first_set(
+                full_tick.get("full_tick_demand_ttl_seconds", "demand_ttl_seconds"),
+                _env_float("BIGQMT_FULL_TICK_DEMAND_TTL_SECONDS", 10.0))),
+            "cache_ttl_seconds": float(_first_set(
+                full_tick.get("full_tick_cache_ttl_seconds", "cache_ttl_seconds"),
+                _env_float("BIGQMT_FULL_TICK_CACHE_TTL_SECONDS", 10.0))),
+            "wait_seconds": float(_first_set(
+                full_tick.get("full_tick_wait_seconds", "wait_seconds"),
+                _env_float("BIGQMT_FULL_TICK_WAIT_SECONDS", 3.5))),
+            "poll_interval_seconds": float(_first_set(
+                full_tick.get("full_tick_poll_interval_seconds", "poll_interval_seconds"),
+                _env_float("BIGQMT_FULL_TICK_POLL_INTERVAL_SECONDS", 0.2))),
         }
         # Client-side local market-data cache. get_market_data_ex is cache-through;
         # get_local_data falls back to Big QMT by default so a MiniQMT-style
         # download of raw history can be followed by a read in another
         # adjustment mode. Set fallback_rpc=False only for an explicitly
         # offline, cache-only client.
-        local_cache_config = dict(client_config.get("local_cache_config") or {})
+        local_cache = _ClientSetting(redis_config, client_config.get("local_cache_config"))
         self.local_cache_config = {
             "enabled": _bool_value(
-                local_cache_config.get("enabled", merged_redis_config.get("local_cache_enabled")),
+                local_cache.get("local_cache_enabled", "enabled"),
                 _env_bool("BIGQMT_LOCAL_CACHE_ENABLED", True),
             ),
             "dir": (
-                local_cache_config.get("dir")
-                or merged_redis_config.get("local_cache_dir")
+                local_cache.get("local_cache_dir", "dir")
                 or os.environ.get("BIGQMT_LOCAL_CACHE_DIR")
                 or None
             ),
             "fallback_rpc": _bool_value(
-                local_cache_config.get("fallback_rpc", merged_redis_config.get("local_cache_fallback_rpc")),
+                local_cache.get("local_cache_fallback_rpc", "fallback_rpc"),
                 _env_bool("BIGQMT_LOCAL_CACHE_FALLBACK_RPC", True),
             ),
             "format": str(
-                local_cache_config.get("format")
-                or merged_redis_config.get("local_cache_format")
+                local_cache.get("local_cache_format", "format")
                 or os.environ.get("BIGQMT_LOCAL_CACHE_FORMAT")
                 or "auto"  # parquet if pyarrow is available, else pickle
             ),
@@ -1176,11 +1211,12 @@ class BigQmtRpcClient:
         # answers reference/history reads in ~0.07ms without touching the QMT
         # python thread. Enabled by default; every miss falls back to RPC, so a
         # client that cannot reach it just runs as before.
-        formula_config = dict(
-            client_config.get("formula_server_config")
-            or merged_redis_config.get("formula_server")
-            or {}
-        )
+        # Merge, do not choose: the module's section (redis_config already
+        # folded in by load_client_config) updated by the explicit dict, key
+        # by key (#289). The old or-chain took the module section whole and
+        # never looked at the explicit dict.
+        formula_config = dict(client_config.get("formula_server_config") or {})
+        formula_config.update(redis_config.get("formula_server") or {})
         if "enabled" not in formula_config:
             formula_config["enabled"] = _env_bool("BIGQMT_FORMULA_ENABLED", True)
         self.formula_server_config = formula_config
