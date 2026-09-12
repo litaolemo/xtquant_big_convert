@@ -3,9 +3,15 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
-## [未发布]
+## [0.3.39] - 2026-09-12
+
+三处修复：策略首跑那条 `unknown encoding: idna` 不再出现（#288），`xtdata.get_divid_factors()` 返回对齐 miniQMT 实测形状的 DataFrame（#287），订单诊断信息不再把转债价格截成两位小数（#282）。
 
 ### 修复
+
+- **订单诊断信息把价格按 `%.2f` 格式化，转债的三位小数被截掉**（#282）。「委托没落地」
+  那条诊断会回显下单价格，`128.456` 显示成 `128.46`，看诊断的人拿到的价格和实际报出去
+  的不是同一个。改成 `%s` 原样输出。
 
 - **策略第一次跑，首个 adjust tick 报 `LookupError: unknown encoding: idna`**，再跑
   就没有。`socket.getaddrinfo` 把主机名按 `idna` 编码，这个编码器是懒加载的：
