@@ -24,6 +24,15 @@
   终端一致。没验证到的：模型内的 `readback_existing_rows`（需要真 ContextInfo）和 miniQMT
   在线时的 `update_usable` 路径，只有单元测试覆盖。
 
+### 修复
+
+- **`query_credit_account` 信封里的 `rows` 还是 plain dict，`rows[0].m_dAssureAsset` 抛
+  AttributeError**。#271 把账户这一族改成可属性访问的 `CompatRow`，覆盖的是走
+  `_query_account_list` 的方法；`query_credit_account`（查柜台那条路，#201）是直接
+  `client.call` 返回 `{rows, count, fresh, stale, ...}` 信封，漏掉了。信封里的行和
+  `query_credit_detail` 返回的是同一种原生信用行，同一个字段在一边能 `.m_dAssureAsset`、
+  另一边不能。现在信封不动，只把 `rows` 里每一行包成 `CompatRow`；非信封的应答原样透传。
+
 ### 文档
 
 - **README「多账号使用」一节重写**。原文说"当前架构是单账号单实例，推荐跑多个策略实例"，
