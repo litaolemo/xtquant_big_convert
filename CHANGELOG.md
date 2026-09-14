@@ -3,7 +3,9 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
-## [未发布]
+## [0.3.42] - 2026-09-14
+
+备注复用时 `order_stock` 返回别的单的合同编号（#299，由 @pujfei 带 exec 事件流水报告）：结算回找现在按本单的 stock / 方向 / 提交时刻过滤，备注不再单独充分。已成被判成在途、重试就是重复下单，这条要尽快上。
 
 ### 修复
 
