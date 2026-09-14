@@ -5,6 +5,25 @@
 
 ## [未发布]
 
+### 新增
+
+- **`probe_capabilities` 的财务下载探测把「接口暴露」和「独立更新可用」分开报**（#277 第 2 条，
+  由 @OdinCN 带终端实测报告）。原来能力表只看 `download_financial_data` 是不是 callable，
+  而大 QMT 终端里 miniQMT（58610 行情服务）不在时，SDK 函数照样在、已有财务行照样读得到，
+  真下载却报 `无法连接行情服务` —— 能力表说「可用」，财务库却更新不了。
+
+  新的 `download_probe` 块真发一次小范围下载（`000001.SZ`、`Capital`、30 天窗口，两个下载
+  函数共用一次拨号），按结果给 verdict：`update_usable` / `exposed_but_service_unreachable`
+  / `not_exposed` / `exposed_untested`；`sdk_call.error` 保留 SDK 原话；已有行的读取结果放在
+  `readback_existing_rows` 里，键名就说了读得到不等于能更新。拨号绕开 600 秒失败缓存
+  （探测量的是现在），完了再回写缓存，后面的真调用不用再付超时。服务不在时那次拨号
+  2～3 秒，`probe_capabilities` 传 `download_probe=false` 可跳过。
+
+  验证到的：用终端自带的 `xtquant.xtdata`（Python 3.11 外部进程，本机 58610 没开）跑探测，
+  报 `exposed_but_service_unreachable`、`Exception: 无法连接行情服务！`、2.05 秒，和报告人的
+  终端一致。没验证到的：模型内的 `readback_existing_rows`（需要真 ContextInfo）和 miniQMT
+  在线时的 `update_usable` 路径，只有单元测试覆盖。
+
 ### 文档
 
 - **README「多账号使用」一节重写**。原文说"当前架构是单账号单实例，推荐跑多个策略实例"，

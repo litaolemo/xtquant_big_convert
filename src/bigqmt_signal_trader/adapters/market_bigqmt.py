@@ -26,6 +26,7 @@ The split matters. Per the official docs and the ContextInfo IDE stub
 This module does not make trading decisions.
 """
 
+import datetime as _dt
 import importlib
 import time
 
@@ -1678,6 +1679,137 @@ class BigQmtMarketDataProvider:
         return self._native_or_context(
             "download_financial_data2", _via_context, stock_list, table_list or [], start_time, end_time
         )
+
+    # The financial download probe (#277). One code, one table, a ~30-day
+    # window: small enough that a working service answers in well under a
+    # second, real enough that "the function exists" and "a download actually
+    # happens" come apart.
+    DOWNLOAD_PROBE_STOCK = "000001.SZ"
+    DOWNLOAD_PROBE_TABLE = "Capital"
+    DOWNLOAD_PROBE_WINDOW_DAYS = 30
+    _DOWNLOAD_PROBE_FUNCS = ("download_financial_data", "download_financial_data2")
+
+    def probe_download_channels(self, dial=True):
+        """Tell "download API exposed" apart from "standalone update usable".
+
+        probe_capabilities used to list ``download_financial_data`` as
+        available whenever the function existed. On a Big QMT terminal whose
+        miniQMT (the 58610 xtdata service) is not running, that is exactly the
+        case that misleads (#277): the SDK function is there and callable, the
+        existing financial rows read back fine, and the download itself dies
+        with ``无法连接行情服务`` -- a reporter with a full financial library
+        and no way to refresh it. "Exists" was answering the wrong question.
+
+        So this makes one real, tiny SDK download call and reports what it
+        did. Both download functions sit on the same data service, so the dial
+        is made once (through ``download_financial_data``) and the verdict is
+        shared; a second multi-second failure would prove nothing new. The
+        dial deliberately bypasses the ``_native_dead_marks`` cache: a cached
+        failure is the memory of an earlier dial, and the probe's job is to
+        measure now. It does update the cache afterwards, so a real caller
+        arriving next does not pay the timeout again.
+
+        The read-back through ``get_financial_data`` is reported under its own
+        key precisely because it proves something different: rows already on
+        disk are readable, which says nothing about whether they can be
+        updated. That distinction is the whole point of the probe.
+        """
+        report = {
+            "probe_call": {
+                "stock_list": [self.DOWNLOAD_PROBE_STOCK],
+                "table_list": [self.DOWNLOAD_PROBE_TABLE],
+            },
+            "functions": {},
+            "sdk_call": {"attempted": False},
+            "readback_existing_rows": {},
+        }
+        today = _dt.date.today()
+        start = today - _dt.timedelta(days=self.DOWNLOAD_PROBE_WINDOW_DAYS)
+        report["probe_call"]["start_time"] = start.strftime("%Y%m%d")
+        report["probe_call"]["end_time"] = today.strftime("%Y%m%d")
+
+        try:
+            module = self._native()
+        except Exception as exc:
+            module = None
+            report["native_xtdata_error"] = "%s: %s" % (exc.__class__.__name__, exc)
+        report["native_xtdata_loaded"] = module is not None
+        context_info = getattr(self, "context_info", None)
+        for name in self._DOWNLOAD_PROBE_FUNCS:
+            report["functions"][name] = {
+                "sdk_exposed": callable(getattr(module, name, None)),
+                "contextinfo_exposed": callable(getattr(context_info, name, None)),
+            }
+
+        dial_name = self._DOWNLOAD_PROBE_FUNCS[0]
+        dial_fn = getattr(module, dial_name, None) if module is not None else None
+        if not callable(dial_fn):
+            report["sdk_call"]["reason"] = "%s is not exposed by the native xtdata SDK" % dial_name
+        elif not dial:
+            report["sdk_call"]["reason"] = "skipped on request (download_probe=false)"
+        else:
+            started = time.time()
+            call = {"attempted": True, "function": dial_name}
+            try:
+                dial_fn(stock_list=[self.DOWNLOAD_PROBE_STOCK],
+                        table_list=[self.DOWNLOAD_PROBE_TABLE],
+                        start_time=report["probe_call"]["start_time"],
+                        end_time=report["probe_call"]["end_time"])
+                call["ok"] = True
+                self._native_dead_marks().pop(dial_name, None)
+            except Exception as exc:
+                call["ok"] = False
+                call["error"] = "%s: %s" % (exc.__class__.__name__, exc)
+                self._native_dead_marks()[dial_name] = time.time()
+            call["seconds"] = round(time.time() - started, 3)
+            report["sdk_call"] = call
+
+        # Existing rows: readable is not the same as updatable, hence the key.
+        readback = {"note": "rows already on disk being readable does not mean they can be updated"}
+        try:
+            rows = self.get_financial_data(
+                [self.DOWNLOAD_PROBE_STOCK], [self.DOWNLOAD_PROBE_TABLE],
+                report["probe_call"]["start_time"], report["probe_call"]["end_time"])
+            readback["ok"] = True
+            readback["rows"] = self._count_probe_rows(rows)
+        except Exception as exc:
+            readback["ok"] = False
+            readback["error"] = "%s: %s" % (exc.__class__.__name__, exc)
+        report["readback_existing_rows"] = readback
+
+        sdk_call = report["sdk_call"]
+        for name, entry in report["functions"].items():
+            if not entry["sdk_exposed"] and not entry["contextinfo_exposed"]:
+                entry["verdict"] = "not_exposed"
+            elif not entry["sdk_exposed"]:
+                # ContextInfo has never had these on a Big QMT terminal; if a
+                # broker build does, nothing here exercised it.
+                entry["verdict"] = "contextinfo_only_untested"
+            elif not sdk_call.get("attempted"):
+                entry["verdict"] = "exposed_untested"
+            elif sdk_call.get("ok"):
+                entry["verdict"] = "update_usable"
+            else:
+                entry["verdict"] = "exposed_but_service_unreachable"
+        return report
+
+    @staticmethod
+    def _count_probe_rows(rows):
+        """Row count for whatever get_financial_data answered with.
+
+        Big QMT answers a Series / DataFrame / Panel depending on how many
+        codes and dates were asked for; the probe asks for one code over a
+        window, so a DataFrame is the usual shape and ``len`` is its row
+        count. ``empty`` catches a DataFrame that has columns and no rows.
+        """
+        if rows is None:
+            return 0
+        if getattr(rows, "empty", False) is True:
+            return 0
+        try:
+            return len(rows)
+        except TypeError:
+            return 1
 
     # Well-known sector names that Big QMT's ContextInfo recognises for
     # get_stock_list_in_sector / get_sector. Used as a fallback when the full

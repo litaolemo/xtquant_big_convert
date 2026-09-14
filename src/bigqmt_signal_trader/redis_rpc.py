@@ -863,6 +863,7 @@ class BigQmtRpcHandlers:
         info["ctypes_probe"] = self._probe_ctypes_named_pipe()
         info["thread_routing"] = self._probe_thread_routing()
         info["sector_probe"] = self._probe_sector_channels()
+        info["download_probe"] = self._probe_download_channels(params)
         info["order_watch"] = self._probe_order_watch()
         info["reply_residency"] = self._probe_reply_residency()
         return info
@@ -1350,6 +1351,25 @@ class BigQmtRpcHandlers:
             report["get_sector_list_now"] = {
                 "error": "%s: %s" % (exc.__class__.__name__, exc)}
         return report
+
+    def _probe_download_channels(self, params):
+        """财务下载通道探测（#277）：「接口暴露」和「独立更新可用」分开报。
+
+        大 QMT 终端里 miniQMT（58610 行情服务）不在时，`download_financial_data`
+        照样 callable、已有财务行照样读得到，真下载却报 `无法连接行情服务`。
+        只看函数存在性的能力表把这种终端报成「可用」，正是 #277 的报告人遇到
+        的：财务库读得到、更新不了、能力表说没问题。
+
+        这里真发一次小范围下载（一只代码、一张表、30 天窗口）看结果。传
+        `download_probe=false` 可以跳过那次拨号（服务不在时它要付 2~3 秒的
+        连接超时），此时只报暴露情况，verdict 是 `exposed_untested`。
+        """
+        flag = (params or {}).get("download_probe", True)
+        dial = str(flag).strip().lower() not in ("0", "false", "no", "off")
+        try:
+            return self.market_data.probe_download_channels(dial=dial)
+        except Exception as exc:
+            return {"error": "%s: %s" % (exc.__class__.__name__, exc)}
 
     # ------------------------------------------------------------------
     # 全推行情订阅控制（引用计数共享 ContextInfo.subscribe_whole_quote）。

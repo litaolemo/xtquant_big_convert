@@ -184,6 +184,8 @@ python -c "from bigqmt_signal_trader.xtquant_compat import configure, xtdata; co
 
 输出三部分：`qmt_globals`（下载/信用/交易全局函数是否绑定）、`contextinfo_methods`（ContextInfo 方法存在性）、`credit_probe`（信用接口只读试调结果）。
 
+另有 `download_probe`（#277）：财务下载「接口暴露」和「独立更新可用」分开报。它真发一次小范围下载（`000001.SZ`、`Capital`、30 天窗口），`functions.<名字>.verdict` 是结论：`update_usable` = 下载真的跑通；`exposed_but_service_unreachable` = SDK 函数在、行情服务不在（大 QMT 里 miniQMT 没开就是这样，`sdk_call.error` 带 SDK 原话，通常是 `无法连接行情服务`）；`not_exposed` = 哪条通道都没有。`readback_existing_rows` 是已有财务行的读取结果，**读得到不等于能更新**，所以单独一个键。服务不在时那次拨号要付 2～3 秒超时，`probe_capabilities` 传 `{"download_probe": false}` 可以跳过，此时 verdict 是 `exposed_untested`。
+
 ## 升级已有部署（`package` 模式）
 
 客户端升级只是 `pip install -U`。服务端升级是文件拷贝，有几个地方会踩坑，按这个顺序做，收盘后做。
