@@ -924,7 +924,7 @@ BIGQMT_REDIS_CONFIG = {
 - **主账号 = 策略在 QMT 里绑定的那个**。QMT 的模型交易一个实例只绑一个账号（界面选定），`BIGQMT_ACCOUNT_ID` 必须是它，否则 `passorder` 走的账号和策略绑定的对不上。
 - **交易类请求不并发**。secondary 在后台线程收请求，但 `submit` / `cancel` / 持仓委托查询都 defer 到主账号的 adjust 线程排队执行——`get_trade_detail_data` 离开主线程返回空，这是 QMT 的约束，不是桥的。
 - **撤单按 `account_id` 路由**（#171 起）。此前 `cancel` 一律用网关自己的账号，双账号里撤期货委托会用股票账号发出去。
-- **验证状态要说清楚**：本仓库维护者手上只有单账号终端，`BIGQMT_ACCOUNT_TYPE_MAP` 多于一条的路径在这里从未实跑过，dual-channel 收发、副账号的 `account_id` 注入、副账号请求被主线程 drain 这三件事靠单测和用户的 STOCK + FUTURE 部署作证。上线前用小单验一遍副账号的下单、撤单、持仓三条路。
+- **已实盘验证**：上面这份配置的形状就是一套实际跑着的 STOCK + FUTURE 部署，dual-channel 收发、副账号的 `account_id` 注入、副账号交易请求被主线程 drain 三条路都在实盘走通了。#171 合并时 CHANGELOG 写的"本仓库从未实跑过"已经不再成立。换券商或换账号类型组合时，仍建议先用小单验一遍副账号的下单、撤单、持仓。
 
 #### 方式二：多策略实例（不改代码，账号在不同客户端时的唯一选择）
 
