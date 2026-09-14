@@ -634,6 +634,18 @@ class BigQmtRpcHandlers:
         # read "" forever (issue #156 follow-up to #133). Bounded FIFO,
         # same 24h TTL as the Redis store.
         self._order_identity_local = collections.OrderedDict()
+        # Settled-id journal (#299 follow-up): remark -> OrderedDict of the
+        # order_sys_ids already handed out for it, insertion-ordered. The
+        # stock/side/not_before guards compare ARRIVAL times -- of a callback
+        # event, of an order row -- and arrival is not ownership: measured
+        # live 2026-09-14, order 1 settled through the poll while its
+        # order_callback landed a few ms later, i.e. AFTER order 2 (same
+        # remark, same stock, submitted serially) had begun; the fresh
+        # arrival timestamp passed order 2's not_before guard and order 1's
+        # already-returned id answered order 2's settlement. An id this
+        # bridge returned for a remark is that order's forever, and must
+        # never be offered to a later same-remark settlement again.
+        self._settled_sysids_by_remark = collections.OrderedDict()
         # Order settlement. Async by default: blocking here holds the QMT main
         # strategy thread, which serializes every other request behind it and
         # caps throughput at ~2 orders/sec (issue #44).
@@ -2511,6 +2523,37 @@ class BigQmtRpcHandlers:
         self._pending_settlement = None
         return settlement
 
+    # Bounded like the watch table: a remark reused all day (a grid's rungs)
+    # accumulates one entry per settled order.
+    _SETTLED_MAX_REMARKS = 2000
+    _SETTLED_MAX_PER_REMARK = 1000
+
+    def _remember_settled_sysid(self, remark, sysid):
+        """An id handed out for ``remark`` is spent; never offer it again."""
+        remark = str(remark or "").strip()
+        sysid = str(sysid or "").strip()
+        if not remark or not sysid:
+            return
+        ids = self._settled_sysids_by_remark.get(remark)
+        if ids is None:
+            ids = collections.OrderedDict()
+            self._settled_sysids_by_remark[remark] = ids
+        else:
+            self._settled_sysids_by_remark.move_to_end(remark)
+        ids[sysid] = True
+        while len(ids) > self._SETTLED_MAX_PER_REMARK:
+            ids.popitem(last=False)
+        while len(self._settled_sysids_by_remark) > self._SETTLED_MAX_REMARKS:
+            self._settled_sysids_by_remark.popitem(last=False)
+
+    def _sysid_already_settled(self, remark, sysid):
+        remark = str(remark or "").strip()
+        sysid = str(sysid or "").strip()
+        if not remark or not sysid:
+            return False
+        ids = self._settled_sysids_by_remark.get(remark)
+        return bool(ids) and sysid in ids
+
     def _apply_order_lookup(self, settlement, final=False, inline=False):
         """Look the order up by remark. True when settled, False to retry.
 
@@ -2527,8 +2570,12 @@ class BigQmtRpcHandlers:
         # Matching on the remark alone returned the most recent OTHER order
         # that carried it, and the caller then filtered every real callback
         # out by that wrong id and treated three fills as unplaced. So every
-        # candidate must also be this request's stock and side, and must not
-        # predate this submit.
+        # candidate must also be this request's stock and side, must not
+        # predate this submit, AND must not be an id this bridge already
+        # settled for this remark -- a callback's arrival time says nothing
+        # about which order it belongs to, so the previous order's callback
+        # can land after this submit began and still carry an id that is
+        # spent (live ICBC repro, 2026-09-14, seconds after #300 shipped).
         want_code = normalize_stock_code(request.stock_code)
         want_action = str(request.action or "").upper()
         watch = getattr(self, "order_watch_table", None)
@@ -2539,16 +2586,24 @@ class BigQmtRpcHandlers:
                     not_before=settlement.submitted_at)
             except Exception:
                 watched_sysid = None
+            if watched_sysid and self._sysid_already_settled(
+                    request.remark, watched_sysid):
+                watched_sysid = None  # spent id -- fall through to the poll
             if watched_sysid:
                 try:
                     settlement.result.order_sys_id = watched_sysid
                 except Exception:
                     pass
+                self._remember_settled_sysid(request.remark, watched_sysid)
                 return True
         try:
             orders = self.order_gateway.query_orders(request.account_id, "") or []
             by_remark = _rows_for_this_submit(
                 orders, request.remark, want_code, want_action, settlement.submitted_at)
+            by_remark = [
+                row for row in by_remark
+                if not self._sysid_already_settled(
+                    request.remark, str(getattr(row, "order_sys_id", "") or ""))]
             if by_remark:
                 sysid = str(getattr(by_remark[0], "order_sys_id", "") or "")
                 if sysid:
@@ -2556,6 +2611,7 @@ class BigQmtRpcHandlers:
                         settlement.result.order_sys_id = sysid
                     except Exception:
                         pass
+                    self._remember_settled_sysid(request.remark, sysid)
                     return True
                 # The row is there but m_strOrderSysID is not populated yet.
                 # Settling here publishes order_sys_id=None, the client turns

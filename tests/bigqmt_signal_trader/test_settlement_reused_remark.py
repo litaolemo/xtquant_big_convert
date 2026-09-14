@@ -231,6 +231,68 @@ class EndToEndLookupTest(unittest.TestCase):
         self.assertFalse(done)
         self.assertIsNone(sysid)
 
+    def test_settled_id_from_a_late_noted_callback_never_answers_again(self):
+        """Live repro 2026-09-14 (ICBC, seconds after #300 shipped): order 1
+        settled through the poll; its order_callback only reached the watch
+        table AFTER order 2 (same remark, same stock, serial submit) had
+        begun. The callback's arrival time passed order 2's not_before guard,
+        so order 1's already-returned id answered order 2's settlement.
+        Arrival is not ownership: a spent id must be refused."""
+        now = int(time.time())
+        gateway = _RowsGateway([_row("A", "600000.SH", order_time=now)])
+        handlers = _handlers(gateway, table=OrderWatchTable())
+
+        done1, sysid1 = _settle(handlers, "600000.SH", submitted_at=now - 1.5)
+        self.assertTrue(done1)
+        self.assertEqual("A", sysid1)
+
+        # Order 1's callback lands now -- after order 2's submit instant.
+        handlers.order_watch_table.note(
+            {"user_order_id": REMARK, "order_sys_id": "A", "status": "50",
+             "stock_code": "600000.SH", "action": "BUY"})
+        gateway.rows.append(_row("B", "600000.SH", order_time=now + 1))
+
+        done2, sysid2 = _settle(handlers, "600000.SH", submitted_at=now - 0.5)
+        self.assertTrue(done2)
+        self.assertEqual("B", sysid2, "order 2 got order 1's spent id again")
+
+    def test_poll_path_in_the_same_second_picks_the_new_row(self):
+        """Both rows fall inside one second, so the second-granularity
+        not_before guard passes the previous order's row (order 1 in second
+        N, order 2 submitted at N.x, earliest-first then prefers order 1's
+        row). The settled-id exclusion is what keeps the spent row from
+        shadowing the new one."""
+        now = int(time.time())
+        gateway = _RowsGateway([_row("A", "600000.SH", order_time=now),
+                                _row("B", "600000.SH", order_time=now + 1)])
+        handlers = _handlers(gateway, table=None)
+
+        done1, sysid1 = _settle(handlers, "600000.SH", submitted_at=now - 0.5)
+        self.assertTrue(done1)
+        self.assertEqual("A", sysid1)
+
+        done2, sysid2 = _settle(handlers, "600000.SH", submitted_at=now + 0.5)
+        self.assertTrue(done2)
+        self.assertEqual("B", sysid2, "same-second reuse returned the spent id")
+
+    def test_settled_journal_is_bounded_and_per_remark(self):
+        handlers = _handlers(_RowsGateway([]), table=None)
+        for i in range(handlers._SETTLED_MAX_PER_REMARK + 10):
+            handlers._remember_settled_sysid(REMARK, "id%d" % i)
+        self.assertEqual(handlers._SETTLED_MAX_PER_REMARK,
+                         len(handlers._settled_sysids_by_remark[REMARK]))
+        self.assertNotIn("id0",
+                         handlers._settled_sysids_by_remark[REMARK])
+        for i in range(handlers._SETTLED_MAX_REMARKS + 10):
+            handlers._remember_settled_sysid("r%d" % i, "x")
+        self.assertEqual(handlers._SETTLED_MAX_REMARKS,
+                         len(handlers._settled_sysids_by_remark))
+        self.assertNotIn(REMARK, handlers._settled_sysids_by_remark)
+        # An id under one remark does not block another remark.
+        self.assertFalse(handlers._sysid_already_settled("r0", "x"))
+        self.assertTrue(handlers._sysid_already_settled(
+            "r%d" % (handlers._SETTLED_MAX_REMARKS + 9), "x"))
+
     def test_settlement_records_the_submit_instant(self):
         from bigqmt_signal_trader.models import OrderRequest, OrderSubmitResult
         request = OrderRequest(signal_id="s", account_id="acct", action="BUY",
