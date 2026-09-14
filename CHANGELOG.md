@@ -3,7 +3,9 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
-## [未发布]
+## [0.3.41] - 2026-09-14
+
+`probe_capabilities` 的财务下载探测把「接口暴露」和「独立更新可用」分开报，模型内实盘验证 `readback_existing_rows` 读回 21 行而下载接口连不上服务（#277 / #295）；`query_credit_account` 信封里的 `rows` 补包成 `CompatRow`（#297）；README 多账号一节重写为单实例双账号，已实盘验证（#296）。
 
 ### 新增
 
