@@ -134,6 +134,47 @@ class AccountFamilyShapeTest(unittest.TestCase):
         self.assertEqual(trader.query_account_status(), ["raw", 7])
 
 
+class CreditAccountEnvelopeTest(unittest.TestCase):
+    """query_credit_account answers a dict envelope; its rows must be CompatRow.
+
+    Missed by #271: that change covered every method routed through
+    _query_account_list, but query_credit_account (the counter query, #201)
+    calls the client directly and returns ``{rows, count, fresh, ...}``.
+    The rows inside are the same native credit rows query_credit_detail
+    returns, so ``r["rows"][0].m_dAssureAsset`` raised AttributeError where
+    ``query_credit_detail(acct)[0].m_dAssureAsset`` answered.
+    """
+
+    def _trader(self, answer):
+        trader = _trader(payloads={"query_credit_account": answer})
+        return trader
+
+    def test_rows_read_by_attribute_and_by_key(self):
+        trader = self._trader({"rows": [dict(_STATUS_ROW, m_dAssureAsset=123456.78)],
+                               "count": 1, "fresh": True, "age_seconds": 1.0})
+        env = trader.query_credit_account("acct")
+
+        self.assertEqual(123456.78, env["rows"][0].m_dAssureAsset)
+        self.assertEqual(123456.78, env["rows"][0]["m_dAssureAsset"])
+        self.assertIsInstance(env["rows"][0], dict)
+
+    def test_the_envelope_fields_are_untouched(self):
+        trader = self._trader({"rows": [], "count": 0, "fresh": False,
+                               "stale": True, "age_seconds": 200.0,
+                               "dropped_stale": True, "dropped_stale_reason": "x"})
+        env = trader.query_credit_account("acct")
+
+        self.assertEqual([], env["rows"])
+        self.assertTrue(env["stale"])
+        self.assertTrue(env["dropped_stale"])
+        self.assertEqual(200.0, env["age_seconds"])
+
+    def test_a_non_envelope_answer_passes_through(self):
+        """An error string or None must not be reshaped."""
+        self.assertIsNone(self._trader(None).query_credit_account("acct"))
+        self.assertEqual("boom", self._trader("boom").query_credit_account("acct"))
+
+
 class MarketOfTest(unittest.TestCase):
     def test_it_reads_the_suffix(self):
         self.assertEqual(_market_of("600000.SH"), 0)

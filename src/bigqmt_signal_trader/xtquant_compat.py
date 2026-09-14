@@ -5721,7 +5721,16 @@ class BigQmtXtTrader:
             params["wait_seconds"] = float(wait_seconds)
         if max_age_seconds is not None:
             params["max_age_seconds"] = float(max_age_seconds)
-        return self.client.call("query_credit_account", params, account_id=account_id)
+        answer = self.client.call("query_credit_account", params, account_id=account_id)
+        # The envelope stays a dict; its rows are the same native credit rows
+        # query_credit_detail returns, and #271 made those attribute-readable
+        # (CompatRow). This path bypassed _query_account_list and was missed,
+        # so ``r["rows"][0].m_dAssureAsset`` raised where the detail path
+        # answered. Same container change, same reason.
+        if isinstance(answer, dict) and isinstance(answer.get("rows"), list):
+            answer = dict(answer)
+            answer["rows"] = [_as_compat_row(row) for row in answer["rows"]]
+        return answer
 
     def query_stk_compacts(self, account):
         return self._query_account_list(account, "query_stk_compacts")
