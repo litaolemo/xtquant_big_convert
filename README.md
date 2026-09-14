@@ -880,28 +880,72 @@ xtdata.get_local_data(["close"], ["600654.SH"], period="1d",
 
 ### 多账号使用（股票+期货 / 普通+信用）
 
-当前架构是**单账号单实例**——一个 QMT 策略进程绑定一个账号，RPC channel 按 `account_id` 隔离（`bigqmt:rpc:req:{account_id}`）。多账号场景（如股票+期货、普通+信用账户同时交易）的推荐方案是**在 QMT 里跑多个策略实例**，每个实例绑一个账号。
+两种方式。**同一个 QMT 客户端里登录了多个资金账号**（比如股票户加期货户）用方式一，一个策略实例同时服务它们；账号分属**不同客户端**（不同券商、不同机器）只能用方式二。
 
-#### 方案：多策略实例（推荐，不改代码）
+RPC channel 都按 `account_id` 隔离（`bigqmt:rpc:req:{account_id}`），客户端连哪个账号就填哪个 `account_id`，两种方式对客户端代码没有区别。
 
-**服务端（QMT 内）**：为每个账号创建一个独立的配置文件和 DRYRUN 入口。
+#### 方式一：单实例双账号（`BIGQMT_ACCOUNT_TYPE_MAP`）
+
+一个策略实例、每个账号一条 channel、共用同一套 QMT 句柄。服务端配置在单账号的基础上**多一张路由表**，其余不变：
+
+```python
+# bigqmt_signal_trader_local_config.py —— 单终端双账号：STOCK + FUTURE
+
+# 主账号：策略在 QMT 里以哪个账号加载运行，这里就填哪个。
+# 它的 channel 跑在 adjust 主线程上，所有账号的交易类请求最终都在这里执行。
+BIGQMT_ACCOUNT_ID = "你的股票账号"
+BIGQMT_ACCOUNT_TYPE = "STOCK"
+
+# 路由表：key=account_id，value=account_type（STOCK / CREDIT / FUTURE / STOCK_OPTION）。
+# 主账号也要在表里。表里除主账号外的每个 key 各起一个 secondary service，
+# 各有自己的 channel（bigqmt:rpc:req:{那个账号}）。
+# 每次请求按其 account_id 查这张表决定 account_type，再传给 QMT API。
+BIGQMT_ACCOUNT_TYPE_MAP = {
+    "你的股票账号": "STOCK",
+    "你的期货账号": "FUTURE",
+}
+
+BIGQMT_REDIS_CONFIG = {
+    "transport": "redis",
+    "host": "...", "port": 6379, "db": 5, "password": "...",
+    "account_id": BIGQMT_ACCOUNT_ID,
+    "rpc_allow_order_methods": True,      # 对这个实例上的所有账号一起生效
+    "rpc_process_in_listener": True,
+    "rpc_listener_methods": ("*",),
+    "schedule_adjust": True,
+    "schedule_adjust_interval": "500nMilliSecond",
+}
+```
+
+几点说明：
+
+- **只有 `BIGQMT_ACCOUNT_TYPE_MAP` 是桥读的键**。副账号不需要单独的变量，表里有它就够了；表为空或只有一条时，`build_multi_account_rpc_service` 原样返回单账号 service，行为零变化。
+- **`bigqmt-init` 只问一个账号**，生成的是单账号配置。双账号要在生成的文件里手工加 `BIGQMT_ACCOUNT_TYPE_MAP`。
+- **主账号 = 策略在 QMT 里绑定的那个**。QMT 的模型交易一个实例只绑一个账号（界面选定），`BIGQMT_ACCOUNT_ID` 必须是它，否则 `passorder` 走的账号和策略绑定的对不上。
+- **交易类请求不并发**。secondary 在后台线程收请求，但 `submit` / `cancel` / 持仓委托查询都 defer 到主账号的 adjust 线程排队执行——`get_trade_detail_data` 离开主线程返回空，这是 QMT 的约束，不是桥的。
+- **撤单按 `account_id` 路由**（#171 起）。此前 `cancel` 一律用网关自己的账号，双账号里撤期货委托会用股票账号发出去。
+- **验证状态要说清楚**：本仓库维护者手上只有单账号终端，`BIGQMT_ACCOUNT_TYPE_MAP` 多于一条的路径在这里从未实跑过，dual-channel 收发、副账号的 `account_id` 注入、副账号请求被主线程 drain 这三件事靠单测和用户的 STOCK + FUTURE 部署作证。上线前用小单验一遍副账号的下单、撤单、持仓三条路。
+
+#### 方式二：多策略实例（不改代码，账号在不同客户端时的唯一选择）
+
+为每个账号创建一个独立的配置文件和 DRYRUN 入口。
 
 ```python
 # bigqmt_signal_trader_local_config_stock.py  — 股票账号
 BIGQMT_ACCOUNT_ID = "你的股票账号"
+BIGQMT_ACCOUNT_TYPE = "STOCK"
 BIGQMT_REDIS_CONFIG = {
     "host": "...", "port": 6379, "db": 5, "password": "...",
     "transport": "redis",          # 或 "zmq"
-    "account_type": "STOCK",       # 股票
     # ...
 }
 
 # bigqmt_signal_trader_local_config_credit.py  — 信用账号
 BIGQMT_ACCOUNT_ID = "你的信用账号"
+BIGQMT_ACCOUNT_TYPE = "CREDIT"
 BIGQMT_REDIS_CONFIG = {
     "host": "...", "port": 6379, "db": 5, "password": "...",
     "transport": "redis",
-    "account_type": "CREDIT",      # 信用（两融）
     # ...
 }
 ```

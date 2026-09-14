@@ -3,6 +3,19 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [未发布]
+
+### 文档
+
+- **README「多账号使用」一节重写**。原文说"当前架构是单账号单实例，推荐跑多个策略实例"，
+  那是 #171 之前的话；`multi_account.py` 早已支持一个策略实例经 `BIGQMT_ACCOUNT_TYPE_MAP`
+  同时服务 STOCK + FUTURE，README 一直没跟上。现在方式一是单实例双账号，附一份按实际
+  部署整理的服务端配置；方式二保留多策略实例，注明它是账号分属不同客户端时的唯一选择。
+  写明只有 `BIGQMT_ACCOUNT_TYPE_MAP` 是桥读的键、主账号必须是策略在 QMT 里绑定的那个、
+  交易类请求 defer 到主线程、以及维护者手上没有双账号终端这条验证状态。
+
+---
+
 ## [0.3.40] - 2026-09-12
 
 两处由 @shengyy 带离线复现报告的修复：`BigQmtRpcClient(redis_config=...)` 显式传的功能开关不再被配置模块覆盖（#289）；POSITION 行缺数量字段时报错，不再补成与原生 0 无法区分的 0（#290）。
