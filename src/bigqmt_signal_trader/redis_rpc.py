@@ -494,6 +494,43 @@ def to_jsonable(value):
     return str(value)
 
 
+def _rows_for_this_submit(orders, remark, stock_code, action, submitted_at):
+    """The order rows that can be THIS submit's, earliest first.
+
+    Remark match is necessary but not sufficient (#299): the caller may have
+    reused it. A row also has to be the same stock and, when the row states
+    a side, the same side; and when the row carries an insert time it must
+    not be earlier than the second this submit happened in. Rows are then
+    ordered by insert time, earliest first, so a later reuse of the same
+    remark on the same stock (a grid's next rung, placed while this one was
+    still settling) does not shadow this one. Rows without an insert time
+    keep the terminal's order and come after the timed ones.
+    """
+    want_remark = str(remark or "").strip()
+    stock_code = normalize_stock_code(stock_code)
+    action = str(action or "").upper()
+    not_before = int(submitted_at) if submitted_at else 0
+    matched = []
+    for index, row in enumerate(orders or []):
+        if str(getattr(row, "user_order_id", "") or "").strip() != want_remark:
+            continue
+        if normalize_stock_code(getattr(row, "stock_code", "")) != stock_code:
+            continue
+        row_action = str(getattr(row, "action", "") or "").upper()
+        if row_action and action and row_action != action:
+            continue
+        order_time = 0
+        try:
+            order_time = int(getattr(row, "order_time", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+        if order_time > 0 and not_before and order_time < not_before:
+            continue
+        matched.append((order_time <= 0, order_time, index, row))
+    matched.sort(key=lambda item: item[:3])
+    return [item[3] for item in matched]
+
+
 class OrderSettlement(object):
     """One order awaiting its order_sys_id.
 
@@ -509,9 +546,9 @@ class OrderSettlement(object):
     """
 
     __slots__ = ("order_request", "result", "deadline", "attempts", "server_error",
-                 "request", "response")
+                 "request", "response", "submitted_at")
 
-    def __init__(self, order_request, result, deadline):
+    def __init__(self, order_request, result, deadline, submitted_at=None):
         self.order_request = order_request
         self.result = result
         self.deadline = deadline
@@ -519,6 +556,11 @@ class OrderSettlement(object):
         self.server_error = ""
         self.request = None
         self.response = None
+        # Wall-clock instant taken BEFORE passorder ran (#299). Anything the
+        # lookup finds that was recorded before this instant -- a watch-table
+        # entry, an order row -- belongs to an earlier order that happened to
+        # carry the same remark, never to this one.
+        self.submitted_at = time.time() if submitted_at is None else float(submitted_at)
 
 
 class CancelSettlement(object):
@@ -2418,6 +2460,10 @@ class BigQmtRpcHandlers:
         self._remember_order_identity_local(
             request.account_id, request.remark, request.strategy_name)
 
+        # Taken before passorder so every callback / row this order produces
+        # is at or after it; an entry from an earlier same-remark order is
+        # strictly before it (#299).
+        submitted_at = time.time()
         result = self.order_gateway.submit(request)
 
         # 委托后校验：确认委托是否真的进了系统。passorder 调用成功但委托没进
@@ -2445,7 +2491,8 @@ class BigQmtRpcHandlers:
                 import time as _time
                 _time.sleep(self.order_settle_timeout_seconds)
                 self._apply_order_lookup(
-                    OrderSettlement(request, result, 0.0), final=True, inline=True)
+                    OrderSettlement(request, result, 0.0, submitted_at=submitted_at),
+                    final=True, inline=True)
             except Exception:
                 pass
             return result
@@ -2453,7 +2500,8 @@ class BigQmtRpcHandlers:
         # a plain function for anyone driving handlers directly, and only the
         # service defers its reply.
         self._pending_settlement = OrderSettlement(
-            request, result, _monotonic() + self.order_settle_timeout_seconds
+            request, result, _monotonic() + self.order_settle_timeout_seconds,
+            submitted_at=submitted_at,
         )
         return result
 
@@ -2473,10 +2521,22 @@ class BigQmtRpcHandlers:
         settlement.attempts += 1
         # Fast path: QMT's order_callback already pushed the answer
         # (issue #164). A miss means nothing -- fall through to the poll.
+        # Remarks are not unique. The auto-generated "bqrpc:<uuid>" is, but a
+        # caller-supplied one is reused freely -- grid strategies, serial
+        # scripts ("串行买入600股" across three stocks and two batches, #299).
+        # Matching on the remark alone returned the most recent OTHER order
+        # that carried it, and the caller then filtered every real callback
+        # out by that wrong id and treated three fills as unplaced. So every
+        # candidate must also be this request's stock and side, and must not
+        # predate this submit.
+        want_code = normalize_stock_code(request.stock_code)
+        want_action = str(request.action or "").upper()
         watch = getattr(self, "order_watch_table", None)
         if watch is not None:
             try:
-                watched_sysid = watch.sysid_for_remark(request.remark)
+                watched_sysid = watch.sysid_for_remark(
+                    request.remark, stock_code=want_code, action=want_action,
+                    not_before=settlement.submitted_at)
             except Exception:
                 watched_sysid = None
             if watched_sysid:
@@ -2487,10 +2547,8 @@ class BigQmtRpcHandlers:
                 return True
         try:
             orders = self.order_gateway.query_orders(request.account_id, "") or []
-            by_remark = [
-                o for o in orders
-                if str(getattr(o, "user_order_id", "") or "").strip() == request.remark.strip()
-            ]
+            by_remark = _rows_for_this_submit(
+                orders, request.remark, want_code, want_action, settlement.submitted_at)
             if by_remark:
                 sysid = str(getattr(by_remark[0], "order_sys_id", "") or "")
                 if sysid:

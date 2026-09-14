@@ -41,6 +41,26 @@ class CountingGateway(DryRunOrderGateway):
         return []
 
 
+class CallbackOnSubmitGateway(CountingGateway):
+    """passorder returns, then QMT's order_callback lands -- #164's real order.
+
+    The settlement lookup runs on the tick after the submit, so the table
+    entry it finds was always written after passorder. A test that noted the
+    event before submitting modelled an impossible sequence, and #299's
+    not-before guard rightly rejects an entry older than the submit.
+    """
+
+    def __init__(self, table, event):
+        super().__init__()
+        self.table = table
+        self.event = event
+
+    def submit(self, request):
+        result = super().submit(request)
+        self.table.note(self.event)
+        return result
+
+
 class TableSemanticsTest(unittest.TestCase):
     def test_learns_both_directions(self):
         table = OrderWatchTable()
@@ -94,11 +114,12 @@ class _Service(unittest.TestCase):
 
 class SubmitFastPathTest(_Service):
     def test_settles_from_the_table_without_polling(self):
-        gateway = CountingGateway()
+        table = OrderWatchTable()
+        gateway = CallbackOnSubmitGateway(table, {
+            "user_order_id": "ord-1", "order_sys_id": "635076953", "status": "50",
+            "stock_code": "601398.SH", "action": "BUY"})
         redis_client, service, handlers = self._service(gateway)
-        handlers.order_watch_table = OrderWatchTable()
-        handlers.order_watch_table.note({
-            "user_order_id": "ord-1", "order_sys_id": "635076953", "status": "50"})
+        handlers.order_watch_table = table
 
         service.enqueue_payload({
             "request_id": "ord-1", "account_id": "acct", "method": "order_stock",

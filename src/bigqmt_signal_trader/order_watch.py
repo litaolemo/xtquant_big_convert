@@ -29,7 +29,10 @@ class OrderWatchTable(object):
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._by_remark = collections.OrderedDict()     # remark -> (ts, sysid)
+        # remark -> (ts, sysid, stock_code, action). One slot per remark:
+        # a reused remark overwrites, and the reader guards with the
+        # dimensions and a not-before instant (#299).
+        self._by_remark = collections.OrderedDict()
         self._status_by_sysid = collections.OrderedDict()  # sysid -> (ts, status)
 
     def note(self, event):
@@ -38,12 +41,14 @@ class OrderWatchTable(object):
             remark = str(event.get("user_order_id") or event.get("remark") or "").strip()
             sysid = str(event.get("order_sys_id") or "").strip()
             status = str(event.get("status") or "").strip()
+            stock_code = str(event.get("stock_code") or "").strip().upper()
+            action = str(event.get("action") or "").strip().upper()
             if not sysid:
                 return  # a pre-sysid event teaches nothing (#152's window)
             now = time.time()
             with self._lock:
                 if remark:
-                    self._by_remark[remark] = (now, sysid)
+                    self._by_remark[remark] = (now, sysid, stock_code, action)
                     self._by_remark.move_to_end(remark)
                 if status:
                     self._status_by_sysid[sysid] = (now, status)
@@ -55,8 +60,16 @@ class OrderWatchTable(object):
         except Exception:
             pass
 
-    def sysid_for_remark(self, remark):
-        """The order_sys_id QMT assigned to this remark, or None."""
+    def sysid_for_remark(self, remark, stock_code=None, action=None, not_before=None):
+        """The order_sys_id QMT assigned to this remark, or None.
+
+        The remark alone is not enough (#299): a reused remark makes this
+        slot hold whichever order carried it last. So the caller states what
+        it is settling -- ``stock_code`` and ``action`` must match what the
+        callback said, and the entry must have been learned at or after
+        ``not_before`` (the submit instant). An entry from before the submit
+        is an earlier order's; a miss here just falls through to the poll.
+        """
         remark = str(remark or "").strip()
         if not remark:
             return None
@@ -64,11 +77,19 @@ class OrderWatchTable(object):
             entry = self._by_remark.get(remark)
             if entry is None:
                 return None
-            ts, sysid = entry
+            ts, sysid = entry[0], entry[1]
+            entry_code = entry[2] if len(entry) > 2 else ""
+            entry_action = entry[3] if len(entry) > 3 else ""
             if time.time() - ts > self.TTL_SECONDS:
                 self._by_remark.pop(remark, None)
                 return None
-            return sysid
+        if not_before is not None and ts < float(not_before):
+            return None
+        if stock_code and entry_code and entry_code != str(stock_code).strip().upper():
+            return None
+        if action and entry_action and entry_action != str(action).strip().upper():
+            return None
+        return sysid
 
     def stats(self):
         """Counts only -- how much the callbacks have taught this table.
