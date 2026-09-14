@@ -862,6 +862,47 @@ def _start_rpc_service(context_info, app, config):
     return _rpc_service
 
 
+def _adjust_interval_seconds(config):
+    """schedule_adjust_interval as seconds, or None when unparseable."""
+    text = str(config.get("schedule_adjust_interval") or "3000nMilliSecond").strip().lower()
+    digits = ""
+    for ch in text:
+        if ch.isdigit() or ch == ".":
+            digits += ch
+        else:
+            break
+    unit = text[len(digits):].strip()
+    if unit.startswith("n"):
+        unit = unit[1:]
+    scale = {"millisecond": 0.001, "ms": 0.001, "second": 1.0, "s": 1.0,
+             "minute": 60.0, "m": 60.0, "hour": 3600.0, "h": 3600.0}.get(unit)
+    if not digits or scale is None:
+        return None
+    try:
+        return float(digits) * scale
+    except ValueError:
+        return None
+
+
+def _drain_budget_seconds(config, rpc_config):
+    """How long one adjust tick may keep the strategy thread draining (#303).
+
+    ``rpc.drain_budget_seconds`` when set; else one tick interval, never
+    under 0.5s. A 100ms tick gets 0.5s -- a couple of passorders, then the
+    thread goes back to QMT and the replies go out. A 3s tick keeps 3s, the
+    same work per tick as the old unbounded batch. 0 or a negative value
+    disables the bound.
+    """
+    explicit = rpc_config.get("drain_budget_seconds")
+    if explicit is not None and str(explicit).strip() != "":
+        value = float(explicit)
+        return value if value > 0 else None
+    interval = _adjust_interval_seconds(config)
+    if interval is None:
+        return None
+    return max(0.5, interval)
+
+
 def _drain_rpc_service(config):
     if _rpc_service is None:
         return 0
@@ -870,7 +911,12 @@ def _drain_rpc_service(config):
     processed = 0
     if hasattr(_rpc_service, "drain_request_queue"):
         processed += _rpc_service.drain_request_queue(max_items=max_items)
-    processed += _rpc_service.drain_pending(max_items=max_items)
+    try:
+        processed += _rpc_service.drain_pending(
+            max_items=max_items, budget_seconds=_drain_budget_seconds(config, rpc_config))
+    except TypeError:
+        # A service object from before the budget (a partial reload).
+        processed += _rpc_service.drain_pending(max_items=max_items)
     if _quote_subscription_service is not None:
         try:
             _quote_subscription_service[0].reap_expired()

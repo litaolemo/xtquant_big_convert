@@ -33,6 +33,7 @@ RPC_REVISION = "20260715-execution-snapshot-v1"
 READ_METHODS = {
     "ping",
     "get_deployment_info",
+    "get_request_outcome",
     "probe_capabilities",
     "probe_order_identity",
     "get_ticks",
@@ -2554,11 +2555,16 @@ class BigQmtRpcHandlers:
         ids = self._settled_sysids_by_remark.get(remark)
         return bool(ids) and sysid in ids
 
-    def _apply_order_lookup(self, settlement, final=False, inline=False):
+    def _apply_order_lookup(self, settlement, final=False, inline=False, orders_cache=None):
         """Look the order up by remark. True when settled, False to retry.
 
         MUST run on the main strategy thread -- get_trade_detail_data returns
         empty anywhere else.
+
+        ``orders_cache`` (account_id -> rows) lets one settle pass share a
+        single ORDER snapshot across every pending settlement (#303). A
+        final lookup always reads fresh: its verdict is "not in the system",
+        and that must not rest on a list fetched for someone else.
         """
         request = settlement.order_request
         settlement.attempts += 1
@@ -2597,7 +2603,13 @@ class BigQmtRpcHandlers:
                 self._remember_settled_sysid(request.remark, watched_sysid)
                 return True
         try:
-            orders = self.order_gateway.query_orders(request.account_id, "") or []
+            orders = None
+            if orders_cache is not None and not final:
+                orders = orders_cache.get(request.account_id)
+            if orders is None:
+                orders = self.order_gateway.query_orders(request.account_id, "") or []
+                if orders_cache is not None:
+                    orders_cache[request.account_id] = orders
             by_remark = _rows_for_this_submit(
                 orders, request.remark, want_code, want_action, settlement.submitted_at)
             by_remark = [
@@ -3245,8 +3257,22 @@ class RedisPubSubRpcService:
         debug_log_limit=0,
         print_prefix="[bigqmt_rpc]",
         transport=None,
+        expire_margin_seconds=1.0,
+        settle_interval_seconds=0.25,
     ):
         self.listen_redis = redis_client
+        # A request past the client's own deadline is not dispatched (#303).
+        # The client states its wait in the envelope; the server measures the
+        # age from the moment it received the request, so no clock is shared.
+        # The margin covers the transport leg the server cannot see plus one
+        # passorder: refuse a little early rather than place an order whose
+        # caller has already gone.
+        self.expire_margin_seconds = max(0.0, float(expire_margin_seconds))
+        # How often drain_pending pauses a batch to settle and reply. With
+        # passorder at ~200ms, a 20-order batch is 4s in which nobody -- not
+        # even the first order, done at 0.2s -- gets an answer.
+        self.settle_interval_seconds = max(0.0, float(settle_interval_seconds))
+        self._expired_request_count = 0
         self.redis = response_redis_client or redis_client
         self.handlers = handlers
         self.account_id = str(account_id or "")
@@ -3425,6 +3451,9 @@ class RedisPubSubRpcService:
 
     def enqueue_payload(self, raw_payload):
         payload = self._loads(raw_payload)
+        # Server clock, at receipt. The age the request reaches when the
+        # adjust thread finally picks it up is measured from here.
+        payload.setdefault("_received_at", time.time())
         if self._should_process_in_listener(payload):
             self.process_request(payload)
             return
@@ -3530,6 +3559,12 @@ class RedisPubSubRpcService:
         # so draining until empty would keep re-picking them and spin one adjust
         # tick into many lookups per order.
         batch = min(int(max_items), self._pending_settlements.qsize())
+        # One ORDER snapshot per account per pass, fetched on the first
+        # settlement that misses the callback fast path and reused by the
+        # rest. It was one get_trade_detail_data per pending order per tick:
+        # a 20-order burst on a day with hundreds of rows cost 20 full
+        # conversions of the day's list every 100ms (#303).
+        orders_cache = {}
         for _ in range(batch):
             try:
                 settlement = self._pending_settlements.get_nowait()
@@ -3540,7 +3575,8 @@ class RedisPubSubRpcService:
                 if isinstance(settlement, CancelSettlement):
                     done = self.handlers._apply_cancel_lookup(settlement, final=expired)
                 else:
-                    done = self.handlers._apply_order_lookup(settlement, final=expired)
+                    done = self.handlers._apply_order_lookup(
+                        settlement, final=expired, orders_cache=orders_cache)
             except Exception:
                 done = True  # never strand a submitted order in the queue
             if not done:
@@ -3553,6 +3589,14 @@ class RedisPubSubRpcService:
                 response["server_error"] = settlement.server_error
             response["handled_at"] = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
+                request = settlement.request or {}
+                self._remember_order_response(
+                    (str(request.get("account_id") or self.account_id or ""),
+                     str(request.get("request_id") or "")),
+                    response, state="settled")
+            except Exception:
+                pass
+            try:
                 self._publish_response(settlement.request, response)
             except Exception:
                 pass
@@ -3562,11 +3606,27 @@ class RedisPubSubRpcService:
     def pending_settlement_count(self):
         return self._pending_settlements.qsize()
 
-    def drain_pending(self, max_items=20):
+    def drain_pending(self, max_items=20, budget_seconds=None):
+        """Run queued requests on the adjust thread, then settle.
+
+        ``budget_seconds`` bounds how long this tick keeps the strategy
+        thread (#303). Twenty orders at ~200ms each held it for 4s: QMT's
+        own callbacks could not land, so every settlement fell to the slow
+        query, and the first order's reply -- ready at 0.2s -- left with the
+        twentieth's. What does not fit stays queued for the next tick; at
+        least one request always runs. None keeps the old unbounded batch.
+        Every ``settle_interval_seconds`` of work the batch pauses to settle
+        and reply, so early orders answer while later ones still run.
+        """
         # Settle carry-overs from earlier ticks before taking on new work.
         self.settle_pending_orders()
         processed = 0
+        started = _monotonic()
+        last_settle = started
+        budget = None if budget_seconds is None else max(0.0, float(budget_seconds))
         for _ in range(int(max_items)):
+            if budget is not None and processed and _monotonic() - started >= budget:
+                break
             try:
                 request = self.pending.get_nowait()
             except queue.Empty:
@@ -3578,6 +3638,11 @@ class RedisPubSubRpcService:
                 )
             self.process_request(request)
             processed += 1
+            if (self.settle_interval_seconds
+                    and self._pending_settlements.qsize()
+                    and _monotonic() - last_settle >= self.settle_interval_seconds):
+                self.settle_pending_orders()
+                last_settle = _monotonic()
         # Settle again so an order submitted in THIS drain still replies on this
         # tick. One lookup, no sleep -- if QMT has not assigned the id yet we
         # simply retry next tick rather than holding the thread (issue #44).
@@ -3627,13 +3692,100 @@ class RedisPubSubRpcService:
         existing = store.get(key)
         if existing is not None:
             return existing
-        store[key] = {"at": now, "response": None}
+        store[key] = {"at": now, "response": None, "state": "dispatching"}
         return None
 
-    def _remember_order_response(self, key, response):
+    def _remember_order_response(self, key, response, state=None):
         store = getattr(self, "_order_requests", None)
         if store is not None and key in store:
             store[key]["response"] = response
+            if state:
+                store[key]["state"] = state
+
+    # Cancels run however late they arrive: a late cancel is harmless and is
+    # exactly what a caller who gave up on it still wants. A late submit is
+    # the opposite -- the caller has already decided it did not happen.
+    _EXPIRY_EXEMPT_METHODS = frozenset(["cancel_order", "cancel_orders_batch"])
+
+    def _client_deadline(self, request):
+        """When this request's caller stops listening, on the server clock.
+
+        None when the envelope does not say (a client older than #303) --
+        such a request is never refused, exactly as before.
+        """
+        try:
+            timeout = float(request.get("timeout_seconds") or 0)
+            received_at = float(request.get("_received_at") or 0)
+        except (TypeError, ValueError):
+            return None
+        if timeout <= 0 or received_at <= 0:
+            return None
+        margin = min(self.expire_margin_seconds, timeout * 0.25)
+        return received_at + timeout - margin
+
+    def _expired_before_dispatch(self, request, method):
+        if self._canonical(method) in self._EXPIRY_EXEMPT_METHODS:
+            return None
+        deadline = self._client_deadline(request)
+        if deadline is None:
+            return None
+        now = time.time()
+        if now < deadline:
+            return None
+        return now - float(request.get("_received_at") or now)
+
+    def _refuse_expired(self, request, response, method, waited, order_key):
+        """Reply RequestExpired without dispatching (#303).
+
+        Orders run one at a time on the QMT strategy thread, ~200ms each.
+        Thirty-two concurrent order_stock calls with a 6s timeout: the first
+        twenty fill the first drain, the rest wait for the next tick, time
+        out at 6s -- and were then placed anyway, minutes after the caller
+        had logged them as failed. The caller's timeout must mean what it
+        says: after it, nothing it asked for happens.
+        """
+        self._expired_request_count += 1
+        response["error"] = (
+            "RequestExpired: queued %.1fs on the server, past the client's "
+            "%.1fs timeout; NOT dispatched (no order was placed). Orders run "
+            "serially on the QMT strategy thread -- lower the concurrency "
+            "or raise timeout_seconds." % (waited, float(request.get("timeout_seconds") or 0)))
+        response["_t_reply"] = time.time()
+        if order_key is not None:
+            self._remember_order_response(order_key, response, state="refused")
+        if self._expired_request_count <= 5 or self._expired_request_count % 100 == 0:
+            print("%s refused expired request method=%s request_id=%s waited=%.1fs (total %d)"
+                  % (self.print_prefix, method, response.get("request_id"), waited,
+                     self._expired_request_count))
+        try:
+            self._publish_response(request, response)
+        except Exception:
+            pass
+        return response
+
+    def _request_outcome(self, params, account_id=None):
+        """What became of an order request, by request_id (#303).
+
+        For a caller whose order_stock timed out. Read on the listener thread,
+        so it answers even while the adjust thread is deep in a batch.
+
+            unknown      never picked up (still queued -- it will be refused
+                         when it is, being past its deadline -- or dropped)
+            dispatching  passorder is running right now
+            dispatched   passorder returned; the order id is being looked up
+            settled      replied; ``response`` is what the caller missed
+            refused      past its deadline before dispatch; nothing placed
+        """
+        request_id = str((params or {}).get("request_id") or "").strip()
+        if not request_id:
+            raise ValueError("request_id is required")
+        account_id = str(account_id or (params or {}).get("account_id") or self.account_id or "")
+        store = getattr(self, "_order_requests", None) or {}
+        entry = store.get((account_id, request_id))
+        if entry is None:
+            return {"request_id": request_id, "state": "unknown", "response": None}
+        return {"request_id": request_id, "state": entry.get("state") or "dispatching",
+                "response": entry.get("response")}
 
     def process_request(self, request):
         request = dict(request or {})
@@ -3693,11 +3845,17 @@ class RedisPubSubRpcService:
             # return without guessing (#104).
             "_t_recv": time.time(),
         }
+        waited = self._expired_before_dispatch(request, method)
+        if waited is not None:
+            return self._refuse_expired(request, response, method, waited, order_key)
         try:
             if self.account_id and account_id and account_id != self.account_id:
                 raise PermissionError("account_id mismatch")
             _t0 = time.perf_counter() if method == "ping" else 0.0
-            result = self.handlers.handle(method, request.get("params") or {})
+            if method == "get_request_outcome":
+                result = self._request_outcome(request.get("params") or {}, account_id)
+            else:
+                result = self.handlers.handle(method, request.get("params") or {})
             _t1 = time.perf_counter() if method == "ping" else 0.0
             response["data"] = to_jsonable(result)
             response["ok"] = True
@@ -3717,13 +3875,13 @@ class RedisPubSubRpcService:
                 self._pending_settlements.put(settlement)
                 self._deferred_count += 1
                 if order_key is not None:
-                    self._remember_order_response(order_key, response)
+                    self._remember_order_response(order_key, response, state="dispatched")
                 return response
         except Exception as exc:
             response["error"] = "%s: %s" % (exc.__class__.__name__, exc)
         response["_t_reply"] = time.time()
         if order_key is not None:
-            self._remember_order_response(order_key, response)
+            self._remember_order_response(order_key, response, state="settled")
         _t_pub0 = time.perf_counter() if method == "ping" else 0.0
         try:
             self._publish_response(request, response)
@@ -3840,10 +3998,11 @@ def call_redis_rpc(
     timeout_seconds=3.0,
     ttl_seconds=60,
     transport="queue",
+    request_id=None,
 ):
     """Small external client helper for tests and admin scripts."""
 
-    request_id = uuid.uuid4().hex
+    request_id = str(request_id or uuid.uuid4().hex)
     request_channel = request_channel_template.format(account_id=account_id)
     request_queue = request_queue_template.format(account_id=account_id)
     response_channel = response_channel_template.format(account_id=account_id, request_id=request_id)
@@ -3859,6 +4018,9 @@ def call_redis_rpc(
         "reply_list": response_list,
         "reply_key": response_key,
         "ttl_seconds": ttl_seconds,
+        # How long this caller waits. The server refuses, rather than runs,
+        # an order it only gets to after that (#303).
+        "timeout_seconds": float(timeout_seconds),
     }
     payload = encode_rpc_request_payload(request)
     if str(transport or "queue").lower() in ("queue", "list", "blpop"):

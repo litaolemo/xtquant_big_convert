@@ -60,6 +60,10 @@ BIGQMT_REDIS_CONFIG = {
     "rpc_background_threads": True,
     "schedule_adjust": True,
     "schedule_adjust_interval": "100nMilliSecond",
+    # How long one adjust tick may keep the strategy thread running queued
+    # RPC requests (#303). Unset = one adjust interval, never under 0.5s;
+    # what does not fit waits for the next tick. 0 disables the bound.
+    # "drain_budget_seconds": 0.5,
     # The default mode calls get_full_tick through RPC. Enable this cache only
     # if full-market payloads are too large for your latency/CPU budget.
     # When a client calls get_full_tick, it renews demand for 10 seconds.

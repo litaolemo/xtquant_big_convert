@@ -1565,6 +1565,7 @@ python test_all_apis.py
 | `RuntimeError: passorder is not available in Big QMT runtime` | QMT 没注入 API 全局 —— 这个文件被当成**普通脚本**执行了 | 加到**模型交易**里运行，别在策略编辑器窗口点运行；检查没勾「独立 python 进程」 |
 | `server_error: passorder submitted but order not found in system` | 委托没进系统。最常见是 QMT 模型交易的**运行模式是「模拟」**（默认值）—— `passorder` 内部撮合，永远到不了券商 | 运行模式改**实盘** |
 | `order_gateway is not configured` | 策略 `init` 挂了 | 看启动日志找真正的异常 |
+| `RequestExpired: ... NOT dispatched` / `TimeoutError: ... The bridge did NOT place this order` | **并发下单撞上串行 `passorder`**（每笔 ~200ms，在 QMT 策略线程上一笔一笔跑）：轮到这单时已过你的超时，桥**拒绝而没下**（#303） | 可安全重试；降并发或加大 `timeout_seconds`。超时后客户端会自动问 `get_request_outcome`，报错里写明下了没下 |
 
 **最常见的是第一条。** 一句话确认：
 

@@ -1292,7 +1292,15 @@ class BigQmtRpcClient:
                 self._formula_router_instance = _Disabled()
         return self._formula_router_instance
 
-    def call(self, method, params=None, account_id=None, timeout_seconds=None, use_formula=True):
+    def call_tracked(self, method, params=None, account_id=None, request_id=None,
+                     timeout_seconds=None):
+        """``call`` under a request_id the caller chose, so it can ask the
+        server what became of the request after a timeout (#303)."""
+        return self.call(method, params, account_id=account_id,
+                         timeout_seconds=timeout_seconds, request_id=request_id)
+
+    def call(self, method, params=None, account_id=None, timeout_seconds=None, use_formula=True,
+             request_id=None):
         target_account = str(account_id or self.account_id or "")
         if not target_account:
             raise ValueError(_missing_account_id_message())
@@ -1336,11 +1344,14 @@ class BigQmtRpcClient:
             # envelope the same way call_redis_rpc does.
             request = {
                 "schema_version": 1,
-                "request_id": uuid.uuid4().hex,
+                "request_id": str(request_id or uuid.uuid4().hex),
                 "account_id": target_account,
                 "method": method,
                 "params": params or {},
                 "ttl_seconds": 60,
+                # How long we wait. A server that only reaches this request
+                # after that refuses it instead of running it (#303).
+                "timeout_seconds": float(wait_seconds),
             }
             response = transport.send_request(request, wait_seconds)
         else:
@@ -1350,6 +1361,7 @@ class BigQmtRpcClient:
                 method=method,
                 params=params or {},
                 timeout_seconds=wait_seconds,
+                request_id=request_id,
             )
         if not response.get("ok"):
             raise RpcServerRepliedError(
@@ -4696,13 +4708,93 @@ class BigQmtXtTrader:
         }
         if not wait_settlement:
             payload["wait_settlement"] = False
+        tracked = getattr(self.client, "call_tracked", None)
+        if tracked is None:
+            # A client that cannot name its request (a test double): the
+            # pre-#303 contract, where a timeout is honestly unknown.
+            try:
+                return self.client.call("order_stock", payload, account_id=account_id) or {}
+            except TimeoutError as exc:
+                raise TimeoutError(
+                    "order_stock rpc timeout; user_order_id=%s. Query orders/trades before retrying to avoid duplicate orders. %s"
+                    % (user_order_id, exc)
+                )
+        request_id = uuid.uuid4().hex
         try:
-            return self.client.call("order_stock", payload, account_id=account_id) or {}
+            return tracked("order_stock", payload, account_id=account_id,
+                           request_id=request_id) or {}
         except TimeoutError as exc:
+            return self._order_stock_after_timeout(request_id, account_id, user_order_id, exc)
+
+    # After a timed-out order_stock: how long to keep asking the server what
+    # became of it, and how often. Covers the server's own settlement wait
+    # (order_settle_timeout_seconds, 3s) with room to spare.
+    ORDER_TIMEOUT_FOLLOWUP_SECONDS = 5.0
+    ORDER_TIMEOUT_FOLLOWUP_INTERVAL_SECONDS = 0.5
+
+    def _order_stock_after_timeout(self, request_id, account_id, user_order_id, exc):
+        """Turn "timed out, state unknown" into an answer (#303).
+
+        Under a burst the bridge runs orders one at a time, so a request can
+        outlive its caller's patience. The server keeps every order request's
+        outcome for ten minutes, and ``get_request_outcome`` reads it on the
+        listener thread -- reachable even while the adjust thread is busy.
+
+            settled     the reply we missed: return it as if it had arrived
+            refused     past its deadline before dispatch: NOT placed
+            unknown     never picked up: it will be refused when it is (it is
+                        past its deadline), so NOT placed either
+            dispatched  passorder ran, the id is still being looked up: keep
+                        asking for a few seconds, then say so
+
+        A server without the method (older than #303) makes the query fail;
+        that falls through to the old message, which was honest about not
+        knowing.
+        """
+        deadline = time.time() + float(self.ORDER_TIMEOUT_FOLLOWUP_SECONDS)
+        last_state = None
+        while True:
+            try:
+                outcome = self.client.call(
+                    "get_request_outcome", {"request_id": request_id},
+                    account_id=account_id, timeout_seconds=2.0) or {}
+            except Exception:
+                outcome = None
+            if not isinstance(outcome, dict) or "state" not in outcome:
+                break
+            last_state = str(outcome.get("state") or "")
+            if last_state == "settled":
+                response = outcome.get("response") or {}
+                if not response.get("ok"):
+                    raise RpcServerRepliedError(
+                        response.get("error") or "Big QMT RPC failed: order_stock")
+                server_error = str(response.get("server_error") or "")
+                if server_error:
+                    raise RpcServerRepliedError(
+                        "Big QMT order_stock server_error: %s" % server_error)
+                return _restore_jsonable(response.get("data")) or {}
+            if last_state in ("refused", "unknown"):
+                raise TimeoutError(
+                    "order_stock rpc timeout; user_order_id=%s. The bridge did NOT place "
+                    "this order (%s before dispatch): safe to retry, ideally with less "
+                    "concurrency or a longer timeout -- orders run one at a time on the "
+                    "QMT strategy thread. %s"
+                    % (user_order_id,
+                       "refused as expired" if last_state == "refused" else "never picked up",
+                       exc))
+            if time.time() >= deadline:
+                break
+            time.sleep(self.ORDER_TIMEOUT_FOLLOWUP_INTERVAL_SECONDS)
+        if last_state in ("dispatched", "dispatching"):
             raise TimeoutError(
-                "order_stock rpc timeout; user_order_id=%s. Query orders/trades before retrying to avoid duplicate orders. %s"
-                % (user_order_id, exc)
-            )
+                "order_stock rpc timeout; user_order_id=%s. passorder DID run for this "
+                "order but QMT had not assigned its id when we stopped waiting: it is "
+                "live. Find it by remark before retrying, or a retry is a duplicate. %s"
+                % (user_order_id, exc))
+        raise TimeoutError(
+            "order_stock rpc timeout; user_order_id=%s. Query orders/trades before retrying to avoid duplicate orders. %s"
+            % (user_order_id, exc)
+        )
 
     def _async_order_worker(self):
         """Drain queued async orders; never fires user callbacks itself.

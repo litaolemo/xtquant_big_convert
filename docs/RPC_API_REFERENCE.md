@@ -33,6 +33,18 @@
 - **用途**：探活、确认 RPC 服务在线与归属账号。
 - **实测延迟**：Redis ~13ms（p50）。
 
+### `get_request_outcome`
+- **参数**：`request_id`(str, 必填)——当初那次下单请求的信封 `request_id`
+- **返回**：`{"request_id": ..., "state": ..., "response": ...}`，`state` 取值：
+  - `unknown`：服务端还没轮到它（仍在队列里——轮到时已过期限，会被拒绝——或已丢弃），**没下单**
+  - `dispatching`：`passorder` 正在跑
+  - `dispatched`：`passorder` 已返回，合同编号还在回找
+  - `settled`：已答复，`response` 就是调用方错过的那份回复
+  - `refused`：轮到执行时已过客户端期限，被拒绝，**没下单**
+- **用途**：`order_stock` 超时后问「那张单到底下没下」（#303）。只读、跑在收包线程，adjust
+  线程忙着也能答；客户端兼容层的 `order_stock` 超时后会自动问一次。服务端只记下单类请求，
+  保留 10 分钟。
+
 ---
 
 ## 2. 行情快照
@@ -495,6 +507,11 @@ FormulaServer 直连不认这个参数，带上它会强制回落到 RPC 桥（�
   - `account_id`(可选) `strategy_name` `signal_id` `remark`/`order_remark`
 - **返回**：`{"order_sys_id":..., "user_order_id":...}`
 - **实现**：`passorder(op_type, combo_type, account, code, price_type, price, volume, ..., quicktrade=2)`。
+- **期限**：信封里的 `timeout_seconds`（客户端 `call` 自动带上）是调用方等多久。服务端按自己
+  收到请求的时刻计龄，轮到执行时已过期限（留 1s 余量，最多期限的 1/4）的下单请求**拒绝
+  而不执行**，`error` 以 `RequestExpired` 开头并明确写「没下单」（#303）。下单在 QMT 策略
+  线程上串行跑（每笔约 200ms），并发数 × 每笔耗时超过超时就会撞上这条——降并发或加大
+  超时。撤单不受此限。
 
 ### `cancel_order`
 - **别名**：`cancel_order_stock` / `cancel_order_stock_sysid`
@@ -555,5 +572,7 @@ RPC 响应统一为 `{"ok": bool, "data": ..., "error": "..."}`：
 - `ok=False`：`error` 为错误信息。常见：
   - `rpc method is not allowed: X` —— 方法不在白名单（`rpc_listener_methods` 配置）。
   - `order rpc methods are disabled` —— 下单未开启。
+  - `RequestExpired: queued Xs on the server, past the client's Ys timeout; NOT dispatched` ——
+    轮到执行时已过调用方的超时，**没有下单**（#303）；可安全重试，最好降并发或加大超时。
   - `ContextInfo.X is not available` —— 该 ContextInfo 方法在当前 QMT 版本不存在。
   - `无法连接行情服务` —— 原生 xtdata SDK 连不上（仅 sector_list/holidays 的 SDK 路径）。

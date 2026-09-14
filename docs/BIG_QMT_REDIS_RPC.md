@@ -350,6 +350,25 @@ print(response)
 > `adjust` 不是 QMT 内置回调。QMT 只自动调 `init`/`handlebar`;`handlebar` 里 `return
 > adjust(...)`,加上我们 `run_time("adjust", interval)` 注册的定时器,构成 RPC 队列的 drain 节奏。
 
+### 每拍 drain 的时间预算与过期拒绝（#303）
+
+下单在 adjust 线程上串行跑（`passorder` 实测 ~200ms/笔）。一拍取 20 笔一口气跑完再结算,
+第一笔 0.2s 就完成、回复却和第 20 笔一起 4s 后才发,线程被占住的这 4s 里 QMT 的
+`order_callback` 也落不下来。所以:
+
+- **时间预算**:`drain_pending(budget_seconds=...)` 跑够预算就把剩下的留到下一拍(每拍至少
+  跑一笔)。策略文件默认取**一个 adjust 间隔、最少 0.5s**;`rpc.drain_budget_seconds` 可改,
+  `0` 关。批内每 0.25s 结算一次并发回复,早完成的单先走。
+- **过期拒绝**:客户端 `call` 在信封里带 `timeout_seconds`,服务端收到时打时间戳。轮到执行
+  时已过客户端期限(留 1s 余量,最多期限的 1/4)的请求**拒绝而不执行**,回 `RequestExpired`。
+  下单类请求这条最要紧——客户端 6s 放弃了、桥第二拍照样 `passorder`,就是「记成失败的单
+  几秒后出现在柜台」。撤单不拒(晚到的撤单无害);不带 `timeout_seconds` 的旧客户端不受影响。
+- **结算共用快照**:一次结算遍历按账号只查一次 `get_trade_detail_data`(~1s),N 笔待结算不再
+  是 N 次。
+- **超时后问结果**:`get_request_outcome(request_id)` 是只读方法、跑在收包线程,adjust 忙着
+  也能答;客户端 `order_stock` 超时后自动问,把「不知道下没下」变成「没下,可重试」或
+  「下了,编号在这」。
+
 ### 尾延迟 = 大 QMT 终端占 GIL(不是本代码)
 
 `gil_probe` 探针显示进程周期性被卡 ~490ms,但 `adjust_phase` 每段都 <50ms —— 即**尾延迟来自

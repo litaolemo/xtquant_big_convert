@@ -130,9 +130,9 @@ class MultiAccountRpcServiceManager:
             if hasattr(s, "drain_request_queue")
         )
 
-    def drain_pending(self, max_items=20):
+    def drain_pending(self, max_items=20, budget_seconds=None):
         return sum(
-            s.drain_pending(max_items)
+            s.drain_pending(max_items, budget_seconds=budget_seconds)
             for s in self._services
             if hasattr(s, "drain_pending")
         )
