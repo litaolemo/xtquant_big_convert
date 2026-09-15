@@ -96,13 +96,74 @@ class TriggerGatesTest(unittest.TestCase):
         self.assertEqual(list(frame["open"]), [10.0])            # Monday's open
         self.assertEqual(list(frame["close"]), [11.5])           # latest close
 
-    def test_a_window_covering_the_period_does_not_trigger(self):
+    def test_a_window_covering_the_period_still_reconciles(self):
+        # #307: a window covering the whole period is no longer an exemption
+        # -- the covered answer was measured wrong too (partial-days and the
+        # zero-volume form). 6763 != 1000+2000, so the bar is rebuilt.
         data = {"000001.SZ": _weekly_frame(6763, 11.0, 10.2, 10.9, 10.8, 7000.0)}
 
         out, calls = self._resynth(data, start_time="20260907")
 
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(list(out["000001.SZ"]["volume"]), [3000])
+
+    def test_a_covered_bar_that_already_agrees_is_left_untouched(self):
+        # The daily sum is 3000 and the bar already says 3000: no rewrite.
+        data = {"000001.SZ": _weekly_frame(3000, 11.9, 9.9, 10.0, 11.5, 33100.0)}
+
+        out, calls = self._resynth(data, start_time="20260907")
+
+        self.assertEqual(len(calls), 1)          # the reconciliation read
+        self.assertEqual(list(out["000001.SZ"]["volume"]), [3000])
+        self.assertEqual(list(out["000001.SZ"]["open"]), [10.0])
+
+    def test_a_zero_volume_ongoing_bar_is_rebuilt(self):
+        # #307: the 09:26 rescue answer carries no period accumulation.
+        data = {"000001.SZ": _weekly_frame(0, 11.9, 9.9, 10.0, 11.5, 0.0)}
+
+        out, calls = self._resynth(data, start_time="20260907")
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(list(out["000001.SZ"]["volume"]), [3000])
+
+    def test_a_frame_without_a_volume_column_falls_back_to_rebuild(self):
+        # Cannot prove agreement without the column: rebuild (the original
+        # #226 behaviour for such frames).
+        frame = _frame([WEEK_LABEL], {"close": [10.8]})
+        data = {"000001.SZ": frame}
+
+        out, calls = self._resynth(data, start_time="20260907")
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(list(out["000001.SZ"]["close"]), [11.5])
+
+    def test_a_missing_ongoing_bar_is_appended(self):
+        # #307 mid-session form: the answer drops the current period's bar
+        # entirely (the last row is finalized history) while the window
+        # covers the period -- append the ongoing bar from the dailies.
+        frame = _weekly_frame(6763, 11.0, 10.2, 10.9, 10.8, 7000.0)
+        frame.index = ["20260906"]              # last week, finalized
+        data = {"000001.SZ": frame}
+
+        out, calls = self._resynth(data, start_time="20260907")
+
+        self.assertEqual(len(calls), 1)
+        frame = out["000001.SZ"]
+        self.assertEqual(list(frame.index), ["20260906", WEEK_LABEL])
+        self.assertEqual(list(frame["volume"]), [6763, 3000])
+        self.assertEqual(list(frame["close"]), [10.8, 11.5])
+
+    def test_a_missing_ongoing_bar_is_not_appended_when_the_window_skips_it(self):
+        # A window that starts inside the current period asked for a slice,
+        # not the period: keep the honest finalized answer.
+        frame = _weekly_frame(6763, 11.0, 10.2, 10.9, 10.8, 7000.0)
+        frame.index = ["20260906"]
+        data = {"000001.SZ": frame}
+
+        out, calls = self._resynth(data, start_time="20260908")
+
         self.assertEqual(calls, [])
-        self.assertEqual(list(out["000001.SZ"]["volume"]), [6763])
+        self.assertEqual(list(out["000001.SZ"].index), ["20260906"])
 
     def test_a_finalized_bar_does_not_trigger(self):
         # Last week's bar (label 20260906) does not contain today.
@@ -198,9 +259,11 @@ class SessionGateTest(unittest.TestCase):
     def test_the_gate(self):
         self.assertTrue(_in_trading_session(TODAY))                       # Tue 13:30
         self.assertTrue(_in_trading_session(dt.datetime(2026, 9, 8, 9, 30)))
+        self.assertTrue(_in_trading_session(dt.datetime(2026, 9, 8, 9, 26)))   # #307
+        self.assertTrue(_in_trading_session(dt.datetime(2026, 9, 8, 9, 15)))
         self.assertFalse(_in_trading_session(dt.datetime(2026, 9, 8, 15, 6)))
         self.assertFalse(_in_trading_session(dt.datetime(2026, 9, 5, 13, 30)))  # Sat
-        self.assertFalse(_in_trading_session(dt.datetime(2026, 9, 8, 9, 29)))
+        self.assertFalse(_in_trading_session(dt.datetime(2026, 9, 8, 9, 14)))
 
 
 if __name__ == "__main__":

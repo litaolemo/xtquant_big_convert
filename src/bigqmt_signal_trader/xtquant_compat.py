@@ -1607,12 +1607,16 @@ _RESYNTH_NOTICE = {"shown": False}
 
 
 def _in_trading_session(now):
-    """Weekday inside the continuous-auction window (with a settle margin
-    after close). After the close the ongoing multi-day bar is finalized and
-    passes through untouched (#226's after-close control)."""
+    """Weekday inside the day session (auction open through the settle
+    margin after close). The resynth used to start at 09:30, but the
+    zero-volume ongoing bar was measured at 09:26 (#307): the terminal's
+    rescue serves a synthesized period bar right after the auction match,
+    before continuous trading opens. After the close the ongoing multi-day
+    bar is finalized and passes through untouched (#226's after-close
+    control)."""
     if now.weekday() > 4:
         return False
-    return _dt.time(9, 30) <= now.time() <= _dt.time(15, 5)
+    return _dt.time(9, 15) <= now.time() <= _dt.time(15, 5)
 
 
 def _now():
@@ -2193,11 +2197,27 @@ class BigQmtXtData:
         filters the returned rows -- this rebuild is what makes the bridge
         match that.
 
-        Structural triggers only, never a value guess: the period is in
-        RESYNTH_ONGOING_PERIODS, the last bar's natural period contains today,
-        the request window cuts into the period (start_time past its start),
-        and the clock is inside a weekday session -- after close the bar is
-        finalized and passes through untouched.
+        Two result-driven triggers on top of the original #226 window shape
+        (both from #307, measured live on terminal build 2.0.8.300):
+
+        * reconcile -- the last bar IS the ongoing period: its volume is
+          checked against the daily sum of that period, whatever the window
+          shape. The zero-volume form was measured at 09:26 right after the
+          auction match (the rescue's synthesized bar carries no period
+          accumulation) and the partial-days form is the original #226
+          truncation; a window covering the whole period is NO LONGER an
+          exemption, because the covered answer was measured wrong too. A
+          bar that already agrees passes through untouched, so the one
+          extra daily read is the only cost on a healthy terminal.
+        * append -- the last bar is finalized history but the request window
+          covers the current period (start <= its start) and that period has
+          daily bars: the MISSING ongoing bar is appended, synthesized from
+          the dailies. Measured mid-session: the in-session answer simply
+          drops the current period's bar.
+
+        Guards kept: multi-day periods only, an explicit start_time, the
+        clock inside the day session (09:15..15:05), nothing after the close
+        when the bar is finalized.
 
         Degrades like the preClose backfill (#166): a failed or empty daily
         read keeps the terminal's answer and warns once; nothing raises.
@@ -2211,30 +2231,49 @@ class BigQmtXtData:
         if not _in_trading_session(now):
             return data
         today = now.strftime("%Y%m%d")
+        start_day = _digits_only(start_text)[:8]
+        end_day = _digits_only(str(end_time or ""))[:8]
+        current_start = RESYNTH_PERIOD_STARTS[period](today)
+        if current_start is None:
+            return data
+        # A window "covers" the ongoing period only when BOTH ends straddle
+        # it: reading pure history (an end inside a past period) never asked
+        # for the ongoing bar, so appending one there would invent data.
+        covers_current = start_day <= current_start and (
+            not end_day or end_day >= current_start)
 
-        targets = {}
+        reconcile, append = {}, {}
         for code, frame in data.items():
             labels = _frame_bar_labels(frame)
             if not labels:
+                # No rows at all: append when the window covers the period.
+                if covers_current:
+                    append[code] = current_start
                 continue
             label = labels[-1]
             period_start = RESYNTH_PERIOD_STARTS[period](label)
             period_end = _period_end_label(period, label)
             if period_start is None or period_end is None:
                 continue
-            if not (period_start <= today <= period_end):
-                continue          # the last bar is finalized history
-            if _digits_only(start_text)[:8] <= period_start:
-                continue          # the window already covers the period
-            targets[code] = period_start
-        if not targets:
+            if period_start <= today <= period_end:
+                # The ongoing bar itself: reconcile against the daily sum
+                # regardless of the window shape (#307).
+                reconcile[code] = period_start
+                continue
+            if today > period_end and covers_current:
+                # Finalized history where the ongoing bar should also be:
+                # append it from the period's dailies (#307 missing form).
+                append[code] = current_start
+        if not reconcile and not append:
             return data
 
+        wanted = sorted(set(reconcile) | set(append))
+        first = min(reconcile.values()) if reconcile else current_start
         try:
             daily = self.get_market_data_ex(
                 field_list=["open", "high", "low", "close", "volume", "amount"],
-                stock_list=sorted(targets), period="1d",
-                start_time=min(targets.values()), end_time=today, count=-1,
+                stock_list=wanted, period="1d",
+                start_time=first, end_time=today, count=-1,
                 dividend_type=dividend_type, fill_data=False,
                 timeout_seconds=timeout_seconds, use_formula=use_formula,
                 backfill_pre_close=False, resynth_ongoing_multiday=False,
@@ -2245,18 +2284,68 @@ class BigQmtXtData:
             log.warning("ongoing %s bar rebuild skipped: %s", period, exc)
             return data
 
-        rebuilt = 0
-        for code, period_start in targets.items():
+        rebuilt = appended = 0
+        for code, period_start in reconcile.items():
             frame = data.get(code)
             daily_frame = daily.get(code) if isinstance(daily, dict) else None
             summary = self._sum_daily_bars(daily_frame, period_start, today)
             if summary is None:
                 continue
+            if not self._last_bar_disagrees(frame, summary):
+                continue          # already the daily sum: leave it untouched
             if self._write_last_bar(frame, summary):
                 rebuilt += 1
-        if rebuilt:
-            self._notice_resynth_ongoing(period, rebuilt)
+        for code, period_start in append.items():
+            frame = data.get(code)
+            daily_frame = daily.get(code) if isinstance(daily, dict) else None
+            summary = self._sum_daily_bars(daily_frame, period_start, today)
+            if summary is None:
+                continue          # no dailies in the period yet: nothing to add
+            label = _period_end_label(period, period_start)
+            if label is None:
+                continue
+            if self._append_ongoing_bar(frame, label, summary):
+                appended += 1
+        if rebuilt or appended:
+            self._notice_resynth_ongoing(period, rebuilt + appended, appended)
         return data
+
+    @staticmethod
+    def _last_bar_disagrees(frame, summary):
+        """True when the last bar's volume differs from the daily sum.
+
+        Volume is the reconciliation key (#307): every broken form measured
+        so far -- the 09:26 zero-volume rescue bar, the #226 window
+        truncation, a partial-days synthesis -- shows up there. A frame that
+        never asked for the volume column cannot be proved right; reporting
+        disagreement keeps the rebuild as the fallback for those.
+        """
+        try:
+            values = list(frame["volume"])
+        except Exception:
+            return True          # no volume column: cannot prove agreement
+        if not values:
+            return True
+        wanted = summary.get("volume")
+        if wanted is None:
+            return False         # nothing to reconcile against
+        current = _bar_float(values[-1])
+        if current is None:
+            return True
+        return abs(current - wanted) > max(1.0, abs(wanted) * 1e-6)
+
+    @staticmethod
+    def _append_ongoing_bar(frame, label, summary):
+        """Append the missing ongoing bar, only into columns the frame has."""
+        row = {name: value for name, value in summary.items()
+               if value is not None and name in list(frame.columns)}
+        if not row:
+            return False
+        try:
+            frame.loc[label] = row
+            return True
+        except Exception:
+            return False
 
     @staticmethod
     def _sum_daily_bars(frame, period_start, today):
@@ -2314,18 +2403,19 @@ class BigQmtXtData:
         return wrote
 
     @staticmethod
-    def _notice_resynth_ongoing(period, count):
+    def _notice_resynth_ongoing(period, count, appended=0):
         """Say once that ongoing bars are rebuilt here, not answered by QMT."""
         if _RESYNTH_NOTICE["shown"]:
             return
         _RESYNTH_NOTICE["shown"] = True
         try:
             log.info(
-                "the ongoing %s bar(s) of %d code(s) were rebuilt from the "
-                "period's daily bars (issue #226): big QMT synthesizes them "
-                "from the request window, miniQMT from all local data. Pass "
-                "resynth_ongoing_multiday=False to serve the raw window "
-                "answer.", period, count)
+                "%d ongoing %s bar(s) were reconciled from the period's "
+                "daily bars and %d missing one(s) appended (issues #226 and "
+                "#307): big QMT synthesizes them from the request window or "
+                "drops them mid-session, miniQMT serves the period's "
+                "accumulation. Pass resynth_ongoing_multiday=False to serve "
+                "the raw answer.", count - appended, period, appended)
         except Exception:
             pass
 
@@ -2475,17 +2565,24 @@ class BigQmtXtData:
         dividend_type="none",
         fill_data=True,
         data_dir=None,
+        resynth_ongoing_multiday=True,
     ):
         """Read bars from the CLIENT-side local cache — no RPC to Big QMT.
 
         Returns a dict {code: DataFrame}. A cache-missed code is omitted, unless
         local_cache_fallback_rpc is enabled (then it is fetched + cached over RPC).
+
+        The cache-less RPC branch answers from the terminal's local files and
+        gets the same ongoing multi-day reconciliation get_market_data_ex has
+        (#226/#307): with the cache off this is THE read callers use for
+        trusted local data, and the terminal's synthesized-period answer drops
+        or zeroes the ongoing bar there just the same.
         """
         codes = [str(c) for c in (stock_list or []) if str(c or "").strip()]
         cache = self._local_cache()
         if cache is None:
             # Cache disabled -> behave like a plain RPC local-data read.
-            return self._call(
+            data = self._call(
                 "get_local_data",
                 field_list=_as_list(field_list),
                 stock_list=codes,
@@ -2497,6 +2594,24 @@ class BigQmtXtData:
                 fill_data=fill_data,
                 data_dir=data_dir,
             )
+            if (resynth_ongoing_multiday
+                    and str(period or "") in RESYNTH_ONGOING_PERIODS):
+                # The raw local read answers a bare frame for one code and a
+                # {code: frame} dict for several (#307 was reported through
+                # the dict shape); wrap the single-code frame so both get the
+                # same reconciliation, then unwrap.
+                single = None
+                payload = data
+                if not isinstance(data, dict) and codes:
+                    single = codes[0]
+                    payload = {single: data}
+                if isinstance(payload, dict) and payload:
+                    payload = self._resynth_ongoing_multiday_bars(
+                        payload, period=period, start_time=start_time,
+                        end_time=end_time, dividend_type=dividend_type,
+                    )
+                data = payload.get(single) if single is not None else payload
+            return data
         fields = list(field_list or [])
         result = {}
         missing = []
