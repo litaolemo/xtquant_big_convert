@@ -71,4 +71,4 @@ where = ["src"]
 include = ["bigqmt_signal_trader*", "bigqmt_backtest*", "xtquant*"]
 
 [tool.setuptools.package-data]
-bigqmt_signal_trader = ["*.md"]
+bigqmt_signal_trader = ["*.md", "_singlefile/*.txt"]

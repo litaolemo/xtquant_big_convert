@@ -165,11 +165,10 @@ class EmbeddedContentTest(unittest.TestCase):
         sys.path.insert(0, TOOLS)
         import build_single_file
 
+        top_dir, package_dir = build_single_file.resolve_source_dirs()
         with self.assertRaises(SystemExit):
             build_single_file.collect_package(
-                build_single_file.PACKAGE_DIR,
-                os.path.join(build_single_file.ROOT, "src"),
-                excluded=("redis_common.py",))
+                package_dir, top_dir, excluded=("redis_common.py",))
 
     def test_constant_backfill_survives_the_indentation_pass(self):
         """The flat builder re-indents sources into function bodies; the #76

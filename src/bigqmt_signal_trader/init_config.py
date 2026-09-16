@@ -25,6 +25,7 @@ never reaches argv or a file on disk, and this tool keeps that arrangement.
 import getpass
 import os
 import subprocess
+import tempfile
 import sys
 
 
@@ -451,15 +452,62 @@ def _write(path, text, encoding="utf-8"):
         pass
 
 
+def _materialize_packaged_builder(script):
+    """Unpack the wheel-shipped copy of tools/<script> to a temp dir.
+
+    The single-file builders live in tools/ in a source checkout, which a pip
+    install does not ship; the wheel carries byte-identical copies as package
+    data (bigqmt_signal_trader/_singlefile/*.txt) so bigqmt-init's single-file
+    options work from a plain ``pip install`` too. Returns the materialized
+    path, or None when the packaged copy is absent.
+    """
+    try:
+        import pkgutil
+        data = pkgutil.get_data(
+            "bigqmt_signal_trader", "_singlefile/%s.txt" % script)
+    except Exception:
+        data = None
+    if not data:
+        return None
+    tmpdir = tempfile.mkdtemp(prefix="bigqmt-builder-")
+    # The flat builder imports its redis sibling; unpack both so the sibling
+    # import resolves no matter which one was asked for.
+    for name in {script, BUILDERS["single_file"][0]}:
+        payload = pkgutil.get_data(
+            "bigqmt_signal_trader", "_singlefile/%s.txt" % name)
+        if payload:
+            with open(os.path.join(tmpdir, name), "wb") as handle:
+                handle.write(payload)
+    return os.path.join(tmpdir, script)
+
+
 def build_single_file(repo_root, deployment, answers, out_path=None):
     """Run the matching builder and bake the answers into its config block."""
     script, default_name, encoding = BUILDERS[deployment]
     builder = os.path.join(repo_root, "tools", script)
     if not os.path.exists(builder):
+        builder = _materialize_packaged_builder(script)
+    if builder is None:
         raise ValueError(
-            "builder not found: %s (run this from a source checkout)" % builder)
+            "builder %s not found: it is neither at %s nor inside the installed "
+            "package (bigqmt_signal_trader/_singlefile). Upgrade "
+            "xtquant-big-convert, or pass --repo-root pointing at a source "
+            "checkout." % (script, os.path.join(repo_root, "tools", script)))
     target = out_path or os.path.join(os.getcwd(), default_name)
     env = dict(os.environ, BIGQMT_BUILD_OUT=target)
+    try:
+        import bigqmt_signal_trader as _pkg
+        package_parent = os.path.dirname(os.path.dirname(os.path.abspath(_pkg.__file__)))
+    except Exception:
+        package_parent = ""
+    if package_parent:
+        # The builder subprocess resolves the embedded sources by importing
+        # bigqmt_signal_trader; make sure it finds THIS installation's copy
+        # (pip layout, site-packages on the interpreter but not for a bare
+        # subprocess in some test setups).
+        env["PYTHONPATH"] = os.pathsep.join(
+            part for part in (package_parent, os.environ.get("PYTHONPATH", ""))
+            if part)
     completed = subprocess.run(
         [sys.executable, builder], env=env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
