@@ -922,6 +922,16 @@ def _drain_rpc_service(config):
             _quote_subscription_service[0].reap_expired()
         except Exception as exc:
             _log_err("quote_push", "reap failed: %s" % exc)
+    # #310 warm-up subscriptions (terminals whose get_full_tick answers only
+    # subscribed codes) are dropped once idle; getattr-guarded so a package
+    # from before the warm-up still drains.
+    prune = getattr(getattr(_rpc_service, "market_data", None),
+                    "prune_tick_subscriptions", None)
+    if callable(prune):
+        try:
+            prune()
+        except Exception as exc:
+            _log_err("full_tick", "warm-up prune failed: %s" % exc)
     return processed
 
 

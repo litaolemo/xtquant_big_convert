@@ -3,6 +3,27 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [未发布]
+
+### 修复
+
+- **江海证券大 QMT 2.1.19.0 上 `get_full_tick` 对任何代码都返回 `{}`**（#310）。该终端的
+  `ContextInfo.get_full_tick` 只回答**已订阅**的代码：没订阅的代码不报错，直接没有条目，
+  单代码和 `["SH"]` 整市场都一样；ping / 持仓 / `get_market_data_ex` 全部正常，看上去像
+  桥的回归。报告者实测 `subscribe_whole_quote(["600052.SH"])` 后再问就有完整五档。现在
+  `get_ticks` 在原生快照**漏掉了请求的代码**时，才对漏掉的代码（市场 token 按 token 订，
+  不按展开后的股票清单订）做一次 `subscribe_whole_quote`，然后重读直到出现或等满 2 秒
+  （`TICK_SUBSCRIBE_WAIT_SECONDS`）；同一批代码之后的调用直接读，不再等。已订阅仍然没有
+  条目的代码（停牌 / 退市 / 未开盘）按原样返回，不重复订、不重复等。订阅 300 秒没被
+  `get_full_tick` 碰过就 `unsubscribe_quote` 掉（`prune_tick_subscriptions`，adjust 循环
+  每拍调一次，包内也在下次 `get_ticks` 时懒回收）。国金的构建会回答未订阅代码，所以
+  在那里这条路径从不触发（有测试钉住）。
+
+  **未验证**：本机是国金 2.1.19.0，原生 `get_full_tick` 不需要订阅，所以订阅后到快照出现
+  的实际延迟、以及 `subscribe_whole_quote(["SH"])` 在江海构建上是否足以让整市场快照出现，
+  只能由 #310 的报告者在其终端上确认。
+
+
 ## [0.3.44] - 2026-09-15
 
 ### 新增

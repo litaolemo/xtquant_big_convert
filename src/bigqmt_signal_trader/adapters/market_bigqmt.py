@@ -39,6 +39,12 @@ from ..quote_utils import find_code_payload, is_option_code, latest_quote_row
 log = get_logger("market")
 
 
+def _ignore_tick_push(data):
+    """Callback for the #310 warm-up subscriptions: the snapshot is read back
+    with get_full_tick, so the pushes themselves are not needed."""
+    return None
+
+
 MARKET_CODES = {"SH", "SZ", "BJ", "HK"}
 
 # A market token asks QMT for every instrument the exchange lists, and stocks
@@ -934,6 +940,11 @@ class BigQmtMarketDataProvider:
         """
         requested = list(codes or [])
         normalized_codes = [normalize_market_or_stock_code(code) for code in requested]
+        # What the caller asked for, tokens still tokens: this is what gets
+        # subscribed if the terminal answers only subscribed codes (#310). The
+        # expanded stock listing below is the wrong unit for that -- one
+        # whole-quote subscription on "SH" covers it.
+        subscribe_targets = list(normalized_codes)
         # Default to stocks. A market token lists every instrument the exchange
         # carries and stocks are 8.7% of it, so the old default made everyone pay
         # 7.5s for a 0.9s answer. types=["all"] restores the full listing.
@@ -956,6 +967,7 @@ class BigQmtMarketDataProvider:
         data = self.context_info.get_full_tick(normalized_codes) or {}
         if not isinstance(data, dict):
             return data or {}
+        data = self._recover_unsubscribed_ticks(subscribe_targets, normalized_codes, data)
 
         # Full Big-QMT 2.1.19.0 can return no entry from get_full_tick for an
         # explicitly requested .SHO/.SZO contract even while its tick stream is
@@ -1010,6 +1022,153 @@ class BigQmtMarketDataProvider:
             (original_by_upper.get(str(key).upper(), key), value)
             for key, value in data.items()
         )
+
+    # Issue #310: on Jianghai big-QMT 2.1.19.0, ContextInfo.get_full_tick
+    # answers only codes that hold a live quote subscription. An unsubscribed
+    # code yields no entry -- not an error -- so a ticking terminal returned {}
+    # for every explicit code and for whole-market tokens alike, while ping,
+    # positions and get_market_data_ex were all fine. subscribe_whole_quote on
+    # the code and asking again a few seconds later produced the full
+    # five-level book. Guojin's build answers unsubscribed codes, so this path
+    # only runs when the native call left a requested code unanswered: a
+    # terminal that never does that never subscribes anything here.
+    #
+    # Subscriptions are held per request batch and dropped after
+    # TICK_SUBSCRIBE_IDLE_SECONDS without a get_full_tick that touched them;
+    # pruning happens on the next get_ticks call and, when the strategy loop
+    # wires it, from prune_tick_subscriptions on every adjust tick.
+    TICK_SUBSCRIBE_WAIT_SECONDS = 2.0
+    TICK_SUBSCRIBE_POLL_SECONDS = 0.1
+    TICK_SUBSCRIBE_IDLE_SECONDS = 300.0
+
+    def _tick_subscription_state(self):
+        state = getattr(self, "_tick_subscription_state_dict", None)
+        if state is None:
+            import threading
+            state = self._tick_subscription_state_dict = {
+                "lock": threading.RLock(),
+                "groups": [],        # [handle, set(codes), last_used]
+                "by_code": {},       # code -> group
+            }
+        return state
+
+    @staticmethod
+    def _tick_unanswered(targets, data):
+        """Requested codes the snapshot has no entry for. A market token counts
+        as answered when any key carries its suffix."""
+        answered = {str(key).upper() for key in (data or {})}
+        missing = []
+        for code in targets:
+            text = str(code)
+            if text in EXCHANGE_TOKENS:
+                suffix = "." + text
+                if not any(key.endswith(suffix) for key in answered):
+                    missing.append(text)
+            elif text.upper() not in answered:
+                missing.append(text)
+        return missing
+
+    def tick_subscription_status(self):
+        """Read-only view of the #310 warm-up subscriptions, for diagnostics."""
+        state = self._tick_subscription_state()
+        now = time.monotonic()
+        with state["lock"]:
+            return [
+                {"handle": handle, "codes": sorted(codes),
+                 "idle_seconds": round(now - last_used, 1)}
+                for handle, codes, last_used in state["groups"]
+            ]
+
+    def prune_tick_subscriptions(self, now=None):
+        """Unsubscribe warm-up groups idle longer than TICK_SUBSCRIBE_IDLE_SECONDS.
+        Returns the number of groups closed. Safe to call from the adjust loop."""
+        state = getattr(self, "_tick_subscription_state_dict", None)
+        if state is None:
+            return 0
+        now = time.monotonic() if now is None else now
+        idle = float(self.TICK_SUBSCRIBE_IDLE_SECONDS)
+        expired = []
+        with state["lock"]:
+            keep = []
+            for group in state["groups"]:
+                if now - group[2] > idle:
+                    expired.append(group)
+                    for code in group[1]:
+                        state["by_code"].pop(code, None)
+                else:
+                    keep.append(group)
+            state["groups"] = keep
+        unsubscribe = getattr(self.context_info, "unsubscribe_quote", None)
+        for handle, codes, _last_used in expired:
+            try:
+                if callable(unsubscribe):
+                    unsubscribe(handle)
+            except Exception as exc:
+                log.warning("full tick warm-up unsubscribe(%s) failed for %s: %s",
+                            handle, sorted(codes), exc)
+        return len(expired)
+
+    def _recover_unsubscribed_ticks(self, targets, query_codes, data):
+        """Subscribe the requested codes the snapshot left unanswered, then
+        re-read until they appear or TICK_SUBSCRIBE_WAIT_SECONDS elapses.
+
+        Only codes with no warm-up subscription yet are subscribed and waited
+        for. A code that is already subscribed and still unanswered is QMT's
+        answer (halted, delisted, pre-open) and is returned as such without
+        another wait, so a warm terminal pays nothing per call.
+        """
+        subscribe = getattr(self.context_info, "subscribe_whole_quote", None)
+        if not callable(subscribe):
+            return data
+        missing = self._tick_unanswered(targets, data)
+        state = self._tick_subscription_state()
+        now = time.monotonic()
+        self.prune_tick_subscriptions(now)
+        with state["lock"]:
+            by_code = state["by_code"]
+            for code in targets:
+                group = by_code.get(str(code))
+                if group is not None:
+                    group[2] = now
+            fresh = [code for code in missing if code not in by_code]
+        if not fresh:
+            return data
+        try:
+            handle = subscribe(list(fresh), callback=_ignore_tick_push)
+            value = int(handle)
+        except Exception as exc:
+            value = -1
+            handle = exc
+        if value <= 0:
+            if not getattr(self, "_tick_subscribe_warned", False):
+                self._tick_subscribe_warned = True
+                log.warning("full tick warm-up subscribe_whole_quote(%s) failed: %r",
+                            fresh, handle)
+            return data
+        with state["lock"]:
+            group = [value, set(fresh), now]
+            state["groups"].append(group)
+            for code in fresh:
+                state["by_code"][code] = group
+        deadline = now + float(self.TICK_SUBSCRIBE_WAIT_SECONDS)
+        poll = float(self.TICK_SUBSCRIBE_POLL_SECONDS)
+        while True:
+            time.sleep(poll)
+            retry = self.context_info.get_full_tick(query_codes) or {}
+            if isinstance(retry, dict) and retry:
+                merged = dict(data)
+                merged.update(retry)
+                data = merged
+                if not self._tick_unanswered(fresh, data):
+                    break
+            if time.monotonic() >= deadline:
+                break
+        still_missing = self._tick_unanswered(fresh, data)
+        log.info("full tick warm-up: subscribed %s (handle %s), %s after %.1fs",
+                 fresh, value,
+                 "all answered" if not still_missing else "still empty: %s" % still_missing,
+                 time.monotonic() - now)
+        return data
 
     def get_instrument(self, code):
         normalized = normalize_stock_code(code)
