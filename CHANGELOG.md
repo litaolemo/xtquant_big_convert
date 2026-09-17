@@ -3,7 +3,9 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
-## [未发布]
+## [0.3.47] - 2026-09-17
+
+三条：方式一多账号副账号的委托/成交回调（#320/#322，按事件账号选频道 + 副账号轮询合成事件，闸门 2 在顶层策略文件要重启）、Redis 后台 BRPOP 存活时 adjust 不再抢 LPOP（#321，@wsmh）、部署脚本 redis zip 校验 + 原子下载（#323，@karlthas007，含两个分支 bug 的跟修）。
 
 ### 修复
 
