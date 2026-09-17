@@ -925,7 +925,10 @@ def _drain_rpc_service(config):
     # #310 warm-up subscriptions (terminals whose get_full_tick answers only
     # subscribed codes) are dropped once idle; getattr-guarded so a package
     # from before the warm-up still drains.
-    prune = getattr(getattr(_rpc_service, "market_data", None),
+    # The provider hangs off the handlers (service.handlers.market_data); the
+    # service itself has no market_data, so reading it there found None and
+    # the adjust-loop prune never ran.
+    prune = getattr(getattr(getattr(_rpc_service, "handlers", None), "market_data", None),
                     "prune_tick_subscriptions", None)
     if callable(prune):
         try:

@@ -215,3 +215,39 @@ class PruneTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AdjustLoopPruneHookTest(unittest.TestCase):
+    """_drain_rpc_service reaches the provider through service.handlers.
+    The first cut read ``service.market_data`` -- an attribute the service
+    does not have -- so the periodic prune silently never ran."""
+
+    def test_the_strategy_drain_calls_prune_on_the_handlers_provider(self):
+        import bigqmt_signal_trader_strategy as strategy
+
+        calls = []
+
+        class Provider(object):
+            def prune_tick_subscriptions(self):
+                calls.append(1)
+                return 0
+
+        class Handlers(object):
+            market_data = Provider()
+
+        class Service(object):
+            handlers = Handlers()
+
+            def drain_request_queue(self, max_items=20):
+                return 0
+
+            def drain_pending(self, max_items=20, budget_seconds=None):
+                return 0
+
+        saved = strategy._rpc_service
+        strategy._rpc_service = Service()
+        try:
+            strategy._drain_rpc_service({})
+        finally:
+            strategy._rpc_service = saved
+        self.assertEqual([1], calls, "prune_tick_subscriptions was not reached")
