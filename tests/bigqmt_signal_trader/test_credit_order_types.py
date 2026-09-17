@@ -161,14 +161,15 @@ class RpcAcceptanceTest(unittest.TestCase):
                 {"order_type": getattr(xtconstant, name)})
             self.assertEqual(action, expected, name)
 
-    def test_cash_repayment_asks_for_an_explicit_action(self):
+    def test_cash_repayment_is_accepted_without_an_action(self):
+        """It used to demand one; MiniQMT's order_stock cannot pass one
+        (#314). The recorded side is bookkeeping, not what passorder gets."""
         handlers = self._handlers()
 
-        with self.assertRaises(ValueError) as caught:
-            handlers._order_action_from_params(
-                {"order_type": xtconstant.CREDIT_DIRECT_CASH_REPAY})
+        action = handlers._order_action_from_params(
+            {"order_type": xtconstant.CREDIT_DIRECT_CASH_REPAY})
 
-        self.assertIn("no implicit buy/sell side", str(caught.exception))
+        self.assertIn(action, ("BUY", "SELL"))
 
     def test_an_explicit_action_still_wins(self):
         handlers = self._handlers()

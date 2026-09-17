@@ -23,6 +23,19 @@
   的实际延迟、以及 `subscribe_whole_quote(["SH"])` 在江海构建上是否足以让整市场快照出现，
   只能由 #310 的报告者在其终端上确认。
 
+- **归还融资走 MiniQMT 写法被拒：`order_type 32 has no implicit buy/sell side; pass action explicitly`**
+  （#314，@fengzhizialex）。#103 让 直接还款（32 / 45）必须显式传 `action`，理由是它没有证券腿、
+  猜方向不对。但 MiniQMT 的 `order_stock(acc, code, order_type, volume, price_type, price,
+  strategy, remark)` 签名里根本没有 `action`——按官方写法 `order_stock(acc, code,
+  CREDIT_DIRECT_CASH_REPAY, 金额, FIX_PRICE, 0, ...)` 归还融资，兼容层无处可传，等于这条
+  路根本走不通。行权 / 锁定 / 解锁（56-59）同样。
+
+  方向本来只用于记账：送进 `passorder` 的是原始 opType（32 → 32，45 → 75），和方向无关。
+  现在无方向类型不传 `action` 也接受，记账方向记 `SELL`；结算回找对这些类型**不按方向过滤**
+  ——终端那一行报成哪边都认，不会再因为记账方向和终端不一致而在 3 秒后报「order not found
+  in system」。显式传了 `action` 仍以传的为准；有方向的类型（融资买入 27、卖券还款 31 等）
+  行为不变。
+
 ## [0.3.45] - 2026-09-16
 
 ### 修复

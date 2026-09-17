@@ -2368,25 +2368,24 @@ class BigQmtRpcHandlers:
         if order_type in SELL_ORDER_TYPES:
             return "SELL"
         # Credit operations carry their side in the type itself (issue #103).
-        # 直接还款 moves cash rather than securities and has no side, so it
-        # still needs an explicit action rather than being guessed at.
+        # 直接还款 (32/45) moves cash rather than securities and has no side.
+        # It used to demand an explicit action -- but MiniQMT's order_stock
+        # has no action parameter, so the compat caller could never supply
+        # one and 归还融资 was simply unusable (#314). The side is bookkeeping
+        # only: passorder gets the raw opType, and the settlement lookup does
+        # not filter sideless types by side.
         credit = _credit_action_of(raw)
         if credit:
             return credit
         if _credit_optype_of(raw) is not None:
-            raise ValueError(
-                "order_type %s has no implicit buy/sell side; pass action "
-                "explicitly" % raw)
+            return _sideless_default_action()
         # Futures (0-15) and ETF option (50-59) opTypes carry the side in the
-        # type itself. 行权/锁定 (56-59) do not, so they fall through to the
-        # same "pass action explicitly" rejection as 直接还款.
+        # type itself. 行权/锁定 (56-59) do not; same treatment as 直接还款.
         passthrough = _passthrough_action_of(raw)
         if passthrough:
             return passthrough
         if _passthrough_optype_of(raw) is not None:
-            raise ValueError(
-                "order_type %s has no implicit buy/sell side; pass action "
-                "explicitly" % raw)
+            return _sideless_default_action()
         if raw in (None, ""):
             raise ValueError("action or order_type is required")
         # An order_type WAS supplied and was not recognised. Saying "required"
@@ -2602,6 +2601,11 @@ class BigQmtRpcHandlers:
         # spent (live ICBC repro, 2026-09-14, seconds after #300 shipped).
         want_code = normalize_stock_code(request.stock_code)
         want_action = str(request.action or "").upper()
+        if _is_sideless_order_type(getattr(request, "order_type", None)):
+            # 直接还款 / 行权 / 锁定 have no side (#314): the recorded action
+            # is a bookkeeping default, and whatever side the terminal's row
+            # reports must not disqualify it.
+            want_action = ""
         watch = getattr(self, "order_watch_table", None)
         if watch is not None:
             try:
@@ -3140,6 +3144,24 @@ def _credit_optype_of(order_type):
         return credit_optype_of(order_type)
     except Exception:
         return None
+
+
+def _is_sideless_order_type(order_type):
+    try:
+        from bigqmt_signal_trader.adapters.order_bigqmt import is_sideless_order_type
+
+        return is_sideless_order_type(order_type)
+    except Exception:
+        return False
+
+
+def _sideless_default_action():
+    try:
+        from bigqmt_signal_trader.adapters.order_bigqmt import SIDELESS_DEFAULT_ACTION
+
+        return SIDELESS_DEFAULT_ACTION
+    except Exception:
+        return "SELL"
 
 
 def _passthrough_optype_of(order_type):

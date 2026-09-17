@@ -182,12 +182,15 @@ class RpcActionResolutionTest(unittest.TestCase):
                 handlers._order_action_from_params({"order_type": op_type}),
                 expected, "opType %d (%s)" % (op_type, name))
 
-    def test_directionless_op_types_demand_an_explicit_action(self):
+    def test_directionless_op_types_get_a_bookkeeping_side(self):
+        """They used to demand an explicit action; MiniQMT's order_stock has
+        no such parameter, so that made them unreachable (#314). The side
+        recorded is bookkeeping only -- passorder gets the raw opType."""
         handlers = _handlers()
         for op_type in (56, 57, 58, 59):
-            with self.assertRaises(ValueError) as ctx:
-                handlers._order_action_from_params({"order_type": op_type})
-            self.assertIn("no implicit buy/sell side", str(ctx.exception))
+            self.assertIn(handlers._order_action_from_params({"order_type": op_type}),
+                          ("BUY", "SELL"))
+            self.assertEqual(handlers._forwarded_order_type({"order_type": op_type}), op_type)
 
     def test_explicit_action_wins_for_directionless_types(self):
         handlers = _handlers()

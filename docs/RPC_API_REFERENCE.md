@@ -508,6 +508,12 @@ FormulaServer 直连不认这个参数，带上它会强制回落到 RPC 桥（�
   - `account_id`(可选) `strategy_name` `signal_id` `remark`/`order_remark`
 - **返回**：`{"order_sys_id":..., "user_order_id":...}`
 - **实现**：`passorder(op_type, combo_type, account, code, price_type, price, volume, ..., quicktrade=2)`。
+- **信用 / 期权类型**：`order_type` 传 MiniQMT 常量即可（`CREDIT_FIN_BUY`=27 融资买入 …
+  `CREDIT_DIRECT_CASH_REPAY`=32 直接还款，专项 40-45 出去时改成大 QMT 的 70-75；ETF 期权
+  50-59、期货 0-15 原样透传）。有方向的类型不用传 `action`，桥按类型定；**直接还款（32/45）、
+  行权/锁定（56-59）没有买卖方向**，也不用传（#314）——记账方向记 `SELL`，`passorder` 收到的仍
+  是原始 opType。归还融资按 MiniQMT 写法：`order_stock(acc, 任一代码占位, CREDIT_DIRECT_CASH_REPAY,
+  还款金额, FIX_PRICE, 0, strategy, remark)`，金额走 `volume`，价格填 0。
 - **期限**：信封里的 `timeout_seconds`（客户端 `call` 自动带上）是调用方等多久。服务端按自己
   收到请求的时刻计龄，轮到执行时已过期限（留 1s 余量，最多期限的 1/4）的下单请求**拒绝
   而不执行**，`error` 以 `RequestExpired` 开头并明确写「没下单」（#303）。下单在 QMT 策略

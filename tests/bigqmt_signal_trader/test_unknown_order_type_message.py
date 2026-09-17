@@ -96,10 +96,14 @@ class StillWorksTest(unittest.TestCase):
             handlers._order_action_from_params(
                 {"order_type": xtconstant.CREDIT_FIN_BUY}), "BUY")
 
-    def test_cash_repayment_still_asks_for_an_action(self):
-        message = _error({"order_type": xtconstant.CREDIT_DIRECT_CASH_REPAY})
+    def test_cash_repayment_no_longer_asks_for_an_action(self):
+        """#314: the compat order_stock has no action parameter to pass."""
+        handlers = _handlers()
 
-        self.assertIn("no implicit buy/sell side", message)
+        self.assertIn(
+            handlers._order_action_from_params(
+                {"order_type": xtconstant.CREDIT_DIRECT_CASH_REPAY}),
+            ("BUY", "SELL"))
 
     def test_an_explicit_action_still_wins(self):
         handlers = _handlers()
