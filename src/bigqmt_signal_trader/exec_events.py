@@ -407,6 +407,11 @@ def format_raw_snapshot(kind, obj):
     )
 
 
+def event_account_id(obj):
+    """The account a native order / deal object names, or "" (#320)."""
+    return str(_attr(obj, ["m_strAccountID", "account_id"], "") or "").strip()
+
+
 def normalize_order_event(order, account_id=""):
     """Build a JSON-able order event dict from a Big QMT orderInfo object."""
     direction = _extract_direction(order)

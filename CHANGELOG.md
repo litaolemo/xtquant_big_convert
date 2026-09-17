@@ -7,6 +7,19 @@
 
 ### 修复
 
+- **方式一多账号下副账号的 `on_stock_order` / `on_stock_trade` 收不到**（#320 @JinHaoran、#322
+  @shihaibi——同一件事，#322 把两道闸门都点出来了）。闸门 2：事件按**配置的主账号**发到
+  `bigqmt:order_events:<主账号>`，副账号客户端订的是自己的频道，主账号客户端也当它是主账号
+  的单——现在按回报对象自带的 `m_strAccountID` 选频道，配置账号只作兜底。闸门 1：大 QMT 的
+  `order_callback` / `deal_callback` 只回绑定账号的，副账号的委托成交进程里根本看不到，也没有
+  MiniQMT 那种 `subscribe(account)`——新增 `secondary_exec_poll`：多账号管理器在 adjust 拍上
+  对每个副账号轮询 `get_trade_detail_data`（ORDER / DEAL，主线程才答得出），委托按
+  `(合同编号, 状态, 成交量)` 变化发一次、成交按成交编号发一次，经同一套 normalizer 发到该账号
+  自己的频道，废单同样补发 `on_order_error`。启动后第一次轮询只建基线不发（重启不回放当天）。
+  默认每 1 秒一次，`rpc.secondary_exec_poll_seconds` 可调、0 关；延迟一个轮询间隔，一个间隔内
+  连跳多个状态只发最后一个。单账号部署不建轮询器，行为不变。闸门 2 在顶层策略文件里，
+  **需要重启策略**；轮询器在包内。没有双账号终端可实测，请报告者部署后用副账号下一笔验证。
+
 - **Redis 后台 BRPOP 存活时，adjust 线程不要再 LPOP 同一条请求队列**。``rpc_background_threads=True`` 时 ``_queue_loop`` 已经在消费 ``bigqmt:rpc:queue:*``；adjust 上的 ``drain_request_queue`` 再用 LPOP 会把 ``get_market_data_ex`` 等读请求抢到 QMT 主线程，实测把 100ms 节拍拖到 0.6–1.8s。后台线程活着就跳过 LPOP，线程挂了才回落 LPOP。（#321，@wsmh）
 
 - **`deploy_qmt_bridge.ps1` 第 3 步 redis zip 下载：校验 + 原子改名**（#323，@karlthas007）：

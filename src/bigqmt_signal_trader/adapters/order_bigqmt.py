@@ -654,6 +654,17 @@ class BigQmtOrderGateway:
         ok = cancel_func(order_ref.order_sys_id, aid, account_type, self.context_info)
         return CancelResult(success=bool(ok), message="" if ok else "cancel returned false")
 
+    def query_native_rows(self, account_id, kind, strategy_name=""):
+        """The terminal's own ORDER / DEAL rows for ``account_id``, unconverted.
+
+        For the secondary-account exec-event poller (#320): the rows are the
+        same objects the callbacks deliver, so they go through the same
+        normalizers. Main thread only, like every get_trade_detail_data.
+        """
+        query = self._require_query_func()
+        account_type = self._resolve_account_type(account_id)
+        return query(account_id, account_type, str(kind or "ORDER").upper(), strategy_name) or []
+
     def query_orders(self, account_id, strategy_name):
         return self.query_orders_strict(account_id, strategy_name)
 

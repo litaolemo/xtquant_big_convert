@@ -76,13 +76,16 @@ class MultiAccountRpcServiceManager:
     identically.
     """
 
-    def __init__(self, services, handlers):
+    def __init__(self, services, handlers, exec_poller=None):
         self._services = services
         self.handlers = handlers
         self._primary = services[0]
         self.account_id = services[0].account_id
         self.redis = services[0].redis
         self.listen_redis = services[0].listen_redis
+        # QMT calls order_callback / deal_callback for the bound (primary)
+        # account only; the secondaries' events come from polling (#320).
+        self.exec_poller = exec_poller
 
     def start(self):
         for s in self._services:
@@ -131,11 +134,22 @@ class MultiAccountRpcServiceManager:
         )
 
     def drain_pending(self, max_items=20, budget_seconds=None):
-        return sum(
+        processed = sum(
             s.drain_pending(max_items, budget_seconds=budget_seconds)
             for s in self._services
             if hasattr(s, "drain_pending")
         )
+        poller = self.exec_poller
+        if poller is not None:
+            try:
+                poller.poll()
+            except Exception as e:
+                logger.error("multi_account: secondary exec poll failed: %s", e)
+        return processed
+
+    def secondary_exec_poll_status(self):
+        poller = self.exec_poller
+        return poller.status() if poller is not None else None
 
     def __getattr__(self, name):
         return getattr(self._primary, name)
@@ -186,7 +200,43 @@ def build_multi_account_rpc_service(context_info, app, config, build_single_fn):
         len(services),
         primary.account_id[:3],
     )
-    return MultiAccountRpcServiceManager(services, primary.handlers)
+    poller = _build_secondary_exec_poller(
+        context_info, primary, [s.account_id for s in services[1:]], config)
+    return MultiAccountRpcServiceManager(services, primary.handlers, exec_poller=poller)
+
+
+def _build_secondary_exec_poller(context_info, primary, secondary_accounts, config):
+    """The #320 poller, or None when exec events are off / no redis sink /
+    the gateway cannot read native rows / the interval is 0."""
+    exec_config = dict(config.get("exec_events") or {})
+    enabled = exec_config.get("enabled", True)
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() not in ("0", "false", "no", "off", "")
+    if not enabled or not secondary_accounts:
+        return None
+    rpc_config = dict(config.get("rpc") or {})
+    try:
+        interval = float(rpc_config.get("secondary_exec_poll_seconds", 1.0))
+    except (TypeError, ValueError):
+        interval = 1.0
+    if interval <= 0:
+        return None
+    gateway = getattr(primary.handlers, "order_gateway", None)
+    query_rows = getattr(gateway, "query_native_rows", None)
+    sink = getattr(primary, "redis", None)
+    if not callable(query_rows) or sink is None:
+        logger.warning("multi_account: secondary exec poll unavailable (gateway=%s sink=%s)",
+                       type(gateway).__name__, sink is not None)
+        return None
+    from .secondary_exec_poll import SecondaryExecPoller, build_row_publisher
+
+    publish = build_row_publisher(sink, context_info=context_info, identity_redis=sink)
+    poller = SecondaryExecPoller(
+        secondary_accounts, query_rows, publish, interval_seconds=interval,
+        log=lambda text: logger.warning("multi_account: %s", text))
+    logger.info("multi_account: secondary exec poll every %.1fs for %s",
+                interval, [a[:3] + "***" for a in poller.accounts])
+    return poller
 
 
 def _build_secondary(primary, account_id, config):
