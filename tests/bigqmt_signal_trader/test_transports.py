@@ -406,5 +406,49 @@ class MysqlTransportTest(unittest.TestCase):
             server.stop()
 
 
+class RedisAdjustDrainTest(unittest.TestCase):
+    def test_redis_adjust_lpop_skipped_when_brpop_thread_alive(self):
+        """Background BRPOP owns the list; adjust LPOP must not steal it."""
+        from bigqmt_signal_trader.transports.redis_transport import RedisTransport
+
+        class _AliveThread(object):
+            def is_alive(self):
+                return True
+
+        class _FailRedis(object):
+            def lpop(self, key):
+                raise AssertionError("adjust LPOP should not run while BRPOP owns %s" % key)
+
+        transport = RedisTransport.__new__(RedisTransport)
+        transport.print_prefix = "[test]"
+        transport.account_id = "acct"
+        transport.request_queue_template = "bigqmt:rpc:queue:{account_id}"
+        transport.listen_redis = _FailRedis()
+        transport.on_raw_payload = None
+        transport._queue_thread = _AliveThread()
+        self.assertEqual(0, transport.drain_request_queue(max_items=20))
+
+    def test_redis_adjust_lpop_runs_when_brpop_thread_dead(self):
+        """If the BRPOP thread is gone, LPOP remains the adjust fallback."""
+        from bigqmt_signal_trader.transports.redis_transport import RedisTransport
+
+        class _DeadThread(object):
+            def is_alive(self):
+                return False
+
+        class _EmptyRedis(object):
+            def lpop(self, key):
+                return None
+
+        transport = RedisTransport.__new__(RedisTransport)
+        transport.print_prefix = "[test]"
+        transport.account_id = "acct"
+        transport.request_queue_template = "bigqmt:rpc:queue:{account_id}"
+        transport.listen_redis = _EmptyRedis()
+        transport.on_raw_payload = None
+        transport._queue_thread = _DeadThread()
+        self.assertEqual(0, transport.drain_request_queue(max_items=20))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -349,6 +349,23 @@ class RedisTransport(RpcTransport):
 
     # -- non-background drain helpers (used by the strategy adjust thread) -
     def drain_request_queue(self, max_items=20):
+        """Non-blocking LPOP fallback used when the BRPOP loop is off.
+
+        ``rpc_background_threads=True`` already owns this Redis list via
+        ``_queue_loop``. LPOP on the adjust thread would steal read RPCs
+        such as ``get_market_data_ex`` onto QMT's main thread and stall the
+        100ms cadence (observed drain 0.6-1.8s). Skip while that thread is
+        alive; if it dies, LPOP becomes the fallback.
+        """
+        queue_thread = self._queue_thread
+        if queue_thread is not None and queue_thread.is_alive():
+            if not getattr(self, "_skip_adjust_queue_drain_logged", False):
+                print(
+                    "%s skip adjust LPOP drain; background BRPOP owns %s"
+                    % (self.print_prefix, self.request_queue)
+                )
+                self._skip_adjust_queue_drain_logged = True
+            return 0
         processed = 0
         for _ in range(int(max_items)):
             try:

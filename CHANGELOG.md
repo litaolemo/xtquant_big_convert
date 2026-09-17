@@ -7,6 +7,8 @@
 
 ### 修复
 
+- **Redis 后台 BRPOP 存活时，adjust 线程不要再 LPOP 同一条请求队列**。``rpc_background_threads=True`` 时 ``_queue_loop`` 已经在消费 ``bigqmt:rpc:queue:*``；adjust 上的 ``drain_request_queue`` 再用 LPOP 会把 ``get_market_data_ex`` 等读请求抢到 QMT 主线程，实测把 100ms 节拍拖到 0.6–1.8s。后台线程活着就跳过 LPOP，线程挂了才回落 LPOP。
+
 - **江海证券大 QMT 2.1.19.0 上 `get_full_tick` 对任何代码都返回 `{}`**（#310）。该终端的
   `ContextInfo.get_full_tick` 只回答**已订阅**的代码：没订阅的代码不报错，直接没有条目，
   单代码和 `["SH"]` 整市场都一样；ping / 持仓 / `get_market_data_ex` 全部正常，看上去像
