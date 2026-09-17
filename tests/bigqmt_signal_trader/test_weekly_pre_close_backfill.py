@@ -295,7 +295,11 @@ class ItStaysOutOfTheWayTest(unittest.TestCase):
             dividend_type="none")
 
         self.assertEqual(xtdata.client.requests_for("1d"), [])
-        self.assertEqual(_pre_close(data["000001.SZ"])["20260731"], 0.0)
+        # No daily lookup happened. The zero itself is now patched by the
+        # row-level lag fill (278de3f: previous bar's close, for periods
+        # without an exact source) -- a different mechanism from this one,
+        # which is why 20260831 reads last month's close, not a daily value.
+        self.assertEqual(_pre_close(data["000001.SZ"])["20260831"], 11.63)
 
     def test_it_can_be_turned_off(self):
         xtdata = _xtdata()

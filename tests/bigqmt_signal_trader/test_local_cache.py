@@ -385,7 +385,7 @@ class LocalCacheClientTest(unittest.TestCase):
         self.assertEqual(params["dividend_type"], "front_ratio")
         self.assertEqual(
             params["field_list"],
-            ["time", "open", "high", "low", "close", "volume", "amount", "openInterest"],
+            ["time", "open", "high", "low", "close", "volume", "amount", "openInterest", "preClose"],
         )
 
 
