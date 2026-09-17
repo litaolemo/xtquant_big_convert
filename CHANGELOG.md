@@ -3,7 +3,9 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
-## [未发布]
+## [0.3.46] - 2026-09-17
+
+四个 issue 一起：江海 QMT `get_full_tick` 只回答已订阅代码（#310）、归还融资走 MiniQMT 写法被拒（#314）、方式一多账号副账号行情无回调（#315）、`278de3f` 的 preClose lag 兜底收窄并修回 11 个测试。
 
 ### 修复
 
