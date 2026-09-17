@@ -23,6 +23,18 @@
   的实际延迟、以及 `subscribe_whole_quote(["SH"])` 在江海构建上是否足以让整市场快照出现，
   只能由 #310 的报告者在其终端上确认。
 
+## [0.3.45] - 2026-09-16
+
+### 修复
+
+- **`bigqmt-init` 的单文件部署选项在 pip 安装下必失败**（用户实测截图反馈）：安装包不带
+  `tools/` 生成器，而 `init_config` 按源码检出布局解析路径（`site-packages` 的上三级，
+  实测去找了 `miniconda3/Lib/tools/build_single_file.py`），直接报
+  "builder not found: ... (run this from a source checkout)"。现在 builder 脚本以包数据形式
+  打进 wheel（`bigqmt_signal_trader/_singlefile/*.txt`，与 tools/ 原件逐字节一致由测试钉住），
+  `bigqmt-init` 优先用源码检出的 tools/、缺失时解包内副本；builder 自身也学会双布局寻源
+  （仓库 src/ 优先，pip 安装布局用 `import bigqmt_signal_trader` 定位），子进程带对
+  PYTHONPATH。单文件部署不再要求源码检出。
 
 ## [0.3.44] - 2026-09-15
 

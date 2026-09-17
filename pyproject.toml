@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xtquant-big-convert"
-version = "0.3.44"
+version = "0.3.45"
 description = "Big QMT RPC bridge and MiniQMT-compatible adapter layer (redis/zmq/mysql transports)"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -71,4 +71,4 @@ where = ["src"]
 include = ["bigqmt_signal_trader*", "bigqmt_backtest*", "xtquant*"]
 
 [tool.setuptools.package-data]
-bigqmt_signal_trader = ["*.md"]
+bigqmt_signal_trader = ["*.md", "_singlefile/*.txt"]
