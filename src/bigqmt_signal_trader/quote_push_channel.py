@@ -77,9 +77,13 @@ class QuotePushChannel(object):
 
 
 class ZmqQuotePushChannel(QuotePushChannel):
-    def __init__(self, bind_address=None, connect_address=None, context=None, print_prefix="[bigqmt_quote_push]"):
+    def __init__(self, bind_address=None, connect_address=None, context=None, print_prefix="[bigqmt_quote_push]", extra_bind_addresses=None):
         self.bind_address = bind_address
         self.connect_address = connect_address
+        # A zmq client derives the PUB address from ITS account's RPC port
+        # (+1). A multi-account bridge binds the one PUB socket to every
+        # account's address as well (#315); a zmq socket may bind several.
+        self.extra_bind_addresses = [str(a) for a in (extra_bind_addresses or []) if a and str(a) != str(bind_address)]
         self.print_prefix = print_prefix
         self._zmq = None
         self._context = context
@@ -105,6 +109,11 @@ class ZmqQuotePushChannel(QuotePushChannel):
             raise ValueError("bind_address is required to start a publisher")
         self._pub = ctx.socket(zmq.PUB)
         self._pub.bind(self.bind_address)
+        for address in self.extra_bind_addresses:
+            try:
+                self._pub.bind(address)
+            except Exception as exc:
+                print("%s zmq extra bind failed address=%s: %s" % (self.print_prefix, address, exc))
         self._running = True
 
     def publish(self, topic, data):
@@ -194,19 +203,38 @@ class ZmqQuotePushChannel(QuotePushChannel):
                 pass
 
 
+def _unique_accounts(values):
+    seen = []
+    for value in values:
+        text = str(value or "")
+        if text and text not in seen:
+            seen.append(text)
+    return seen
+
+
 class RedisQuotePushChannel(QuotePushChannel):
-    def __init__(self, redis_client, account_id="", channel_template="bigqmt:quote_push:{account_id}:{topic}", print_prefix="[bigqmt_quote_push]"):
+    def __init__(self, redis_client, account_id="", channel_template="bigqmt:quote_push:{account_id}:{topic}", print_prefix="[bigqmt_quote_push]", account_ids=None):
         self.redis = redis_client
         self.account_id = str(account_id or "")
         self.channel_template = channel_template
         self.print_prefix = print_prefix
+        # Every account this publisher speaks for (#315). The channel is
+        # keyed by account, and a single-instance multi-account bridge
+        # (BIGQMT_ACCOUNT_TYPE_MAP) serves several: a client configured with
+        # the secondary account subscribes bigqmt:quote_push:<secondary>:*,
+        # its subscribe RPC lands on the shared handlers and succeeds, and
+        # every push went to bigqmt:quote_push:<primary>:* -- "subscribed,
+        # no callbacks". Market data is not account-specific, so publish
+        # once per account. The client role uses account_id alone.
+        self.account_ids = _unique_accounts([self.account_id] + list(account_ids or []))
         self._running = False
         self._pubsub = None
         self._thread = None
         self._subscriber_stop = threading.Event()
 
-    def _channel(self, topic):
-        return self.channel_template.format(account_id=self.account_id, topic=topic)
+    def _channel(self, topic, account_id=None):
+        return self.channel_template.format(
+            account_id=self.account_id if account_id is None else account_id, topic=topic)
 
     # -- server side ---------------------------------------------------------
     def start_publisher(self):
@@ -215,10 +243,11 @@ class RedisQuotePushChannel(QuotePushChannel):
 
     def publish(self, topic, data):
         payload = encode_push_payload({"combo_key": topic, "data": data})
-        try:
-            self.redis.publish(self._channel(topic), payload)
-        except Exception as exc:
-            print("%s redis publish failed: %s" % (self.print_prefix, exc))
+        for account_id in self.account_ids or [self.account_id]:
+            try:
+                self.redis.publish(self._channel(topic, account_id), payload)
+            except Exception as exc:
+                print("%s redis publish failed: %s" % (self.print_prefix, exc))
 
     # -- client side ---------------------------------------------------------
     def start_subscriber(self, topics, on_msg):

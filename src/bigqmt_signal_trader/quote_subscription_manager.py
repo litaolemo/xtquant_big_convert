@@ -351,24 +351,31 @@ def build_quote_subscription_service(
     enabled=True,
     heartbeat_timeout_seconds=30.0,
     time_func=None,
+    account_ids=None,
 ):
     """Assemble the server-side whole-quote service: a ContextInfo-backed source,
     a push channel matching the RPC transport, and a QuoteSubscriptionManager
     wired so big-QMT pushes publish to the channel. Returns ``(manager, channel)``
     or ``None`` when disabled. The caller starts the channel publisher and feeds
-    ``manager.reap_expired`` from the scheduler loop."""
+    ``manager.reap_expired`` from the scheduler loop.
+
+    ``account_ids``: every account this bridge serves. None reads
+    ``BIGQMT_ACCOUNT_TYPE_MAP`` (the single-instance multi-account table,
+    #315), so a secondary account's client gets the push on ITS channel."""
     if not enabled:
         return None
     from .quote_push_channel import RedisQuotePushChannel, ZmqQuotePushChannel
 
     source = ContextInfoQuoteSource(context_info)
     transport_name = str(transport_name or "redis").lower()
+    served = _served_account_ids(account_id, account_ids)
     if transport_name == "zmq":
         bind_address = zmq_bind_address or _default_quote_push_zmq_bind(account_id)
-        channel = ZmqQuotePushChannel(bind_address=bind_address)
+        extra = [_default_quote_push_zmq_bind(other) for other in served if other != str(account_id or "")]
+        channel = ZmqQuotePushChannel(bind_address=bind_address, extra_bind_addresses=extra)
         push_endpoint = bind_address
     else:
-        channel = RedisQuotePushChannel(redis_client, account_id=account_id)
+        channel = RedisQuotePushChannel(redis_client, account_id=account_id, account_ids=served)
         push_endpoint = ""
     manager = QuoteSubscriptionManager(
         source,
@@ -378,6 +385,24 @@ def build_quote_subscription_service(
         push_endpoint=push_endpoint,
     )
     return manager, channel
+
+
+def _served_account_ids(primary_account_id, account_ids=None):
+    """The accounts a push must reach: the primary plus, by default, every
+    key of BIGQMT_ACCOUNT_TYPE_MAP. Order: primary first, then the map's."""
+    if account_ids is None:
+        try:
+            from .account_type_map import get_account_type_map
+
+            account_ids = list(get_account_type_map() or {})
+        except Exception:
+            account_ids = []
+    served = []
+    for value in [primary_account_id] + list(account_ids):
+        text = str(value or "")
+        if text and text not in served:
+            served.append(text)
+    return served
 
 
 def _default_quote_push_zmq_bind(account_id):

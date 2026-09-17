@@ -36,6 +36,14 @@
   in system」。显式传了 `action` 仍以传的为准；有方向的类型（融资买入 27、卖券还款 31 等）
   行为不变。
 
+- **方式一多账号（`BIGQMT_ACCOUNT_TYPE_MAP` 单实例）下，副账号的全推行情「订阅成功但无回调」**
+  （#315，@JinHaoran）。推送通道按账号命名：服务端只往 `bigqmt:quote_push:<主账号>:<topic>`
+  发，而按副账号配置的客户端订的是 `bigqmt:quote_push:<副账号>:<topic>`。副账号的
+  `subscribe_whole_quote` 走自己的请求通道落到共用的 handlers、正常返回 seq，所以不报错——
+  推送只是发到了没人听的频道。行情不分账号，现在发布端替桥服务的每个账号各发一份
+  （redis 每账号一次 `publish`；zmq 的 PUB socket 多绑一个副账号的地址）。账号列表默认读
+  `BIGQMT_ACCOUNT_TYPE_MAP`，单账号部署形状不变。客户端不用改。
+
 ## [0.3.45] - 2026-09-16
 
 ### 修复
