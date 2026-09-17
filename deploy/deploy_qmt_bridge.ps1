@@ -162,23 +162,29 @@ function Test-RedisZip([string]$Path) {
         finally { $archive.Dispose() }
     } catch { return $false }
 }
+$explicitZip = [bool]$RedisZip
 if (-not $RedisZip) { $RedisZip = $zip }
 if (-not (Test-RedisZip $RedisZip)) {
+    # An explicitly passed archive is the caller's: never download over it.
+    # The default path is ours: missing means first run, broken means an
+    # interrupted download -- both go to the download below.
+    if ($explicitZip) {
+        if (-not (Test-Path $RedisZip)) { throw "RedisZip not found: $RedisZip" }
+        throw "RedisZip is not a valid redis archive (must contain redis-server.exe): $RedisZip"
+    }
     New-Item -ItemType Directory -Force $rdir | Out-Null
-    if ($RedisZip -eq $zip -and (Test-Path $RedisZip)) {
+    if (Test-Path $RedisZip) {
         Info "removing incomplete redis archive: $RedisZip"
         Remove-Item -LiteralPath $RedisZip -Force
     }
-    elseif (-not (Test-Path $RedisZip)) {
-        throw "RedisZip not found: $RedisZip"
-    }
-    else {
-        throw "RedisZip is not a valid redis archive (must contain redis-server.exe): $RedisZip"
-    }
     $downloadZip = "$zip.download"
+    # Windows PowerShell 5.1 (what the README runs this with) has no
+    # if-expression: `(if ...)` inside an array is parsed as a command
+    # named "if". Pick the source first, then build the argument list.
+    $source = "https://github.com/tporadowski/redis/releases/download/v5.0.14/Redis-x64-5.0.14.zip"
+    if ($RedisUrl) { $source = $RedisUrl }
     $dlArgs = @("-L","--connect-timeout","20","--retry","3","--retry-delay","2","--max-time","1800",
-      "-o",$downloadZip,
-      (if ($RedisUrl) { $RedisUrl } else { "https://github.com/tporadowski/redis/releases/download/v5.0.14/Redis-x64-5.0.14.zip" }))
+      "-o",$downloadZip,$source)
     if ($Proxy) { $dlArgs = @("-x",$Proxy) + $dlArgs }
     & curl.exe @dlArgs
     if ($LASTEXITCODE -ne 0 -or -not (Test-RedisZip $downloadZip)) {

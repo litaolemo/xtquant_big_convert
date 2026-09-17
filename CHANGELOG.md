@@ -3,13 +3,27 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [未发布]
+
+### 修复
+
+- **Redis 后台 BRPOP 存活时，adjust 线程不要再 LPOP 同一条请求队列**。``rpc_background_threads=True`` 时 ``_queue_loop`` 已经在消费 ``bigqmt:rpc:queue:*``；adjust 上的 ``drain_request_queue`` 再用 LPOP 会把 ``get_market_data_ex`` 等读请求抢到 QMT 主线程，实测把 100ms 节拍拖到 0.6–1.8s。后台线程活着就跳过 LPOP，线程挂了才回落 LPOP。（#321，@wsmh）
+
+- **`deploy_qmt_bridge.ps1` 第 3 步 redis zip 下载：校验 + 原子改名**（#323，@karlthas007）：
+  下载中断留下的半截 zip 不再被当成好的——`Test-RedisZip` 打开归档确认含 `redis-server.exe`；
+  curl 先写到 `.download` 并带 `--retry 3 --max-time 1800`，校验通过才改名到位；新增 `-RedisUrl`
+  指定镜像源。合并后修了它的两个分支 bug（Windows PowerShell 5.1 下逐分支跑过）：
+  全新机器不传 `-RedisZip` 时默认路径不存在被当成「文件没找到」直接 throw，下载根本不会
+  执行；下载参数里的 `(if ($RedisUrl) {...} else {...})` 在 5.1 不是表达式，报
+  `The term 'if' is not recognized`。现在只有显式传的 `-RedisZip` 缺失/损坏才报错，默认路径
+  缺失或损坏一律走下载；源地址先赋变量再进参数数组。
+
+
 ## [0.3.46] - 2026-09-17
 
 四个 issue 一起：江海 QMT `get_full_tick` 只回答已订阅代码（#310）、归还融资走 MiniQMT 写法被拒（#314）、方式一多账号副账号行情无回调（#315）、`278de3f` 的 preClose lag 兜底收窄并修回 11 个测试。
 
 ### 修复
-
-- **Redis 后台 BRPOP 存活时，adjust 线程不要再 LPOP 同一条请求队列**。``rpc_background_threads=True`` 时 ``_queue_loop`` 已经在消费 ``bigqmt:rpc:queue:*``；adjust 上的 ``drain_request_queue`` 再用 LPOP 会把 ``get_market_data_ex`` 等读请求抢到 QMT 主线程，实测把 100ms 节拍拖到 0.6–1.8s。后台线程活着就跳过 LPOP，线程挂了才回落 LPOP。
 
 - **江海证券大 QMT 2.1.19.0 上 `get_full_tick` 对任何代码都返回 `{}`**（#310）。该终端的
   `ContextInfo.get_full_tick` 只回答**已订阅**的代码：没订阅的代码不报错，直接没有条目，
