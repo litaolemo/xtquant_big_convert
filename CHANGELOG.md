@@ -3,9 +3,17 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
-## [未发布]
+## [0.3.49] - 2026-09-18
+
+五条修复：合成回落帧补 `suspendFlag` 列（#331/#332，@yucejade）、日期窗合成回落裁头部垫行（#335，@yucejade）、方式一多账号在 zmq 下副账号起不来（#334，@simonfantasy）、同机多客户端进程订全推行情互相拆台（sub_id 折进 pid）、归还融资金额放错槽位时报错说清（#330）。
 
 ### 修复
+
+- **合成回落帧缺 `suspendFlag` 列**（#331 / #332，@yucejade）。回落 servant（`ContextInfo.get_market_data`）
+  一混入 `suspendFlag` 整请求 0 行，所以那条路给不出这列；MiniQMT 全字段有它，下游 `df["suspendFlag"]`
+  KeyError、自己 concat 补出 NaN 再 `int()` 直接崩。现在只在帧缺列且调用方要了这列（`field_list` 空或点名）
+  时建列填 0，已有列不动，显式清单不多出列——边界与 #318 的 preClose 一致。0 是形状契约默认值，
+  不是合成周期的真实停牌标志。
 
 - **同机多个客户端进程订全推行情互相拆台**。`client_id` 默认是每用户一份持久化文件
   （`~/.cache/bigqmt/quote_client_id`），两个进程共用它，`sub_id` 又各自从 1 数起——服务端按
