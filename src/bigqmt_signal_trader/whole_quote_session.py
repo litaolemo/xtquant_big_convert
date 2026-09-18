@@ -11,6 +11,7 @@ subscription does not by itself deliver an initial full snapshot — callers lay
 a ``get_full_tick`` prime on top (done in ``BigQmtXtData.subscribe_whole_quote``).
 """
 
+import os
 import threading
 
 
@@ -214,8 +215,20 @@ class WholeQuoteClientSession(object):
         self._subscriber_active = True
         self._subscribed_topics = active
 
+    # sub_ids carry the process id. The server keys a subscription by
+    # (client_id, sub_id), and client_id is by default one persisted file per
+    # user (~/.cache/bigqmt/quote_client_id) -- so two client processes on
+    # one machine shared it, both minted sub_id 1, 2, ..., and the server saw
+    # ONE subscriber: process B's unsubscribe / heartbeat lapse tore down
+    # process A's subscription. Folding the pid in keeps the ids distinct
+    # across processes while staying an int, which is what MiniQMT returns
+    # and what callers hand back to unsubscribe_quote. A restarted process
+    # gets fresh ids; its old ones lapse with the heartbeat, and the shared
+    # QMT-side subscription (refcounted per combo) never drops in between.
+    SUB_ID_PID_STRIDE = 1000000
+
     def _next_sub_id(self):
         if self._sub_id_func is not None:
             return self._sub_id_func()
         self._seq += 1
-        return self._seq
+        return os.getpid() * self.SUB_ID_PID_STRIDE + self._seq

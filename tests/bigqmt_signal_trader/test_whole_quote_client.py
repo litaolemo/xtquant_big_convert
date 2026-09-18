@@ -282,3 +282,44 @@ class WholeQuoteSessionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SubIdsAreUniqueAcrossProcessesTest(unittest.TestCase):
+    """Two client processes on one machine share the persisted client_id by
+    default; the server keys subscriptions by (client_id, sub_id), so
+    per-process counters 1, 2, 3 collided and one process's unsubscribe
+    tore down the other's. The pid is folded into the id."""
+
+    def _session(self):
+        from bigqmt_signal_trader.whole_quote_session import WholeQuoteClientSession
+        calls = []
+
+        def rpc(method, params):
+            calls.append((method, dict(params)))
+            return {"combo_key": "SH", "topic": "SH", "push_endpoint": ""}
+
+        class Channel(object):
+            def start_subscriber(self, topics, on_msg):
+                pass
+
+            def stop(self):
+                pass
+
+        return WholeQuoteClientSession(rpc, Channel(), client_id="shared"), calls
+
+    def test_the_id_carries_the_pid_and_stays_an_int(self):
+        import os
+        session, calls = self._session()
+        first = session.subscribe_whole_quote(["SH"], callback=lambda d: None)
+        second = session.subscribe_whole_quote(["SZ"], callback=lambda d: None)
+        self.assertIsInstance(first, int)
+        self.assertEqual(os.getpid(), first // session.SUB_ID_PID_STRIDE)
+        self.assertEqual(first + 1, second)
+        self.assertEqual(first, calls[0][1]["sub_id"])
+
+    def test_unsubscribe_sends_the_same_id(self):
+        session, calls = self._session()
+        sub_id = session.subscribe_whole_quote(["SH"], callback=lambda d: None)
+        session.unsubscribe_quote(sub_id)
+        self.assertEqual(("unsubscribe_whole_quote", sub_id),
+                         (calls[-1][0], calls[-1][1]["sub_id"]))

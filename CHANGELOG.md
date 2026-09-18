@@ -3,6 +3,18 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [未发布]
+
+### 修复
+
+- **同机多个客户端进程订全推行情互相拆台**。`client_id` 默认是每用户一份持久化文件
+  （`~/.cache/bigqmt/quote_client_id`），两个进程共用它，`sub_id` 又各自从 1 数起——服务端按
+  `(client_id, sub_id)` 计数，把两个进程看成一个订阅者：B 退订或心跳断掉，A 的订阅一起被拆。
+  现在 `sub_id` 折进进程号（仍是 int，MiniQMT 的返回形状不变，`unsubscribe_quote` 照传），
+  同机多进程各算各的；跨机器共用同一份配置时仍建议各设 `BIGQMT_QUOTE_CLIENT_ID`。README 加
+  「多个客户端同时用一座桥」一节，说清三条通道各自的多消费者行为和吞吐共享。
+
+
 ## [0.3.48] - 2026-09-18
 
 可转债：`get_full_tick` 的 `types` 认 `cbond`，转股 / 回售走 passorder 80-83（`convert_bond` / `sell_back_bond`，未实盘验证，请先 1 张试）；`xtquant.xtdata` shim 的 `get_full_tick` 补转发 `types`（#327，@karlthas007）。

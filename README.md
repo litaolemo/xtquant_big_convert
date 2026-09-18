@@ -371,6 +371,16 @@ xtdata.unsubscribe_quote(seq)
 
 **验证**：实盘交易日验证 1/20/50/100 只标的，3s 推送节奏稳定，零丢失零乱序；多客户端共享/退订隔离/同客户端多 sub_id 全过；服务端重启恢复（42s 中断后验证两次）。另在完整大 QMT 2.1.19.0 盘中验证显式 `.SHO` 快照、500ms 实时推送及 ETF+期权混合组合。详见 [docs/SUBSCRIBE_WHOLE_QUOTE_PUSH.md](docs/SUBSCRIBE_WHOLE_QUOTE_PUSH.md) 和 [docs/SUBSCRIBE_WHOLE_QUOTE_LIVE_VERIFICATION.md](docs/SUBSCRIBE_WHOLE_QUOTE_LIVE_VERIFICATION.md)。
 
+### 多个客户端同时用一座桥
+
+可以，redis 模式天然支持多消费者，三条通道各自的机制：
+
+| 通道 | 多客户端怎么工作 | 注意 |
+|---|---|---|
+| **RPC 查询**（行情快照、持仓、委托、下单） | 每个请求带自己的 `request_id`，回复写到 `bigqmt:rpc:resp:<账号>:<request_id>`，互不串。N 个进程同时 `query_stock_positions` / `get_full_tick` 都行 | **吞吐是共享的**：服务端串行处理（交易类查询排在 adjust 线程上一次一个），谁都不排队的前提是总量不大。多个消费者各自每秒拉一次全市场 `get_full_tick(["SH"])`（~1s 一次）会互相拖慢；这种让一个进程拉、其余订阅它，或开 `full_tick_cache` |
+| **全推行情**（`subscribe_whole_quote`） | 服务端按 `(client_id, sub_id)` 引用计数，同一组合只在 QMT 订一次；推送走 redis pub/sub，**订同一 topic 的所有客户端都收到**；最后一个退订才真退 | 0.3.49 前同机多进程有坑：`client_id` 默认是每用户一份持久化文件，两个进程共用它、`sub_id` 又都从 1 数起，服务端看成一个订阅者，B 退订会把 A 的也拆掉。现在 `sub_id` 带进程号，不再撞；**跨机器**共用同一份配置时仍请各设 `BIGQMT_QUOTE_CLIENT_ID` |
+| **委托/成交回报**（`on_stock_order` 等） | redis stream + pub/sub 按账号广播，每个客户端各起自己的监听线程，都收到全量事件 | 事件是按账号而不是按客户端的：A 下的单 B 也会收到回报，按 `order_remark` / `strategy_name` 自己过滤 |
+
 ### 全市场快照的品种过滤（`types`）
 
 **市场令牌返回的是交易所挂牌的全部标的，股票只占一小部分。** 实测上交所 `"SH"` 共 **26744** 个标的，其中股票 **2315 只（8.7%）**，其余是债券（36%）、回购等。QMT 的耗时严格线性、约 **0.29ms/只**，所以全量要 7.4s，只取股票 0.9s。
