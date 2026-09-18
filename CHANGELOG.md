@@ -14,6 +14,24 @@
   同机多进程各算各的；跨机器共用同一份配置时仍建议各设 `BIGQMT_QUOTE_CLIENT_ID`。README 加
   「多个客户端同时用一座桥」一节，说清三条通道各自的多消费者行为和吞吐共享。
 
+- **方式一多账号在 zmq 下副账号起不来**（#334，@simonfantasy）。`_build_secondary` 只有 redis 一条路：
+  zmq 部署下给副账号套了个 redis client 为 None 的 RedisTransport，监听线程死于
+  `'NoneType' object has no attribute 'pubsub'`；能 import redis 的环境则在没人跑的
+  127.0.0.1:6379 上空转。现在 zmq 部署给副账号建自己的 zmq 端点：端口按**副账号**派生——
+  和按该账号配置的 zmq 客户端派生连接地址的规则一致，客户端不用改；host 继承主账号
+  `bind_address` 的，不会退回 loopback。pipe / mysql / shm 没有按账号的寻址，副账号拒建并
+  记日志，不再建在死 client 上。#320 的副账号回报轮询在 zmq 下改走全推通道发（`exec:*`
+  topic），不再因没有 redis sink 而关掉。
+- **归还融资：金额填错槽位时报错说清楚**（#330，@fengzhizialex）。调用方把还款金额放在 `price`、
+  `order_volume` 传了可用资金——`passorder` 的直接还款金额走 **volume 槽（整数元）**，price 被
+  忽略，于是 volume 不到 1 元时报一句干巴巴的 `volume must be positive`，凑够了又按 volume
+  还款。现在 32/45 的这条错误直接写明"金额走 order_volume、price 忽略、你传的是什么"，
+  price>0 时服务端记一条日志。行为没变（一直是 volume），只是把规则说到报错里。
+- **合成回落的日期窗请求也裁头部垫行**（#335，@yucejade）。`count=-1` + `start_time` 早于终端本地
+  覆盖时，servant 把未覆盖的月份垫成"四价 = 窗口内第一根真实收盘、量额 0"的行，形态合法、
+  消费方无法分辨（601318.SH 1mon 从 20250901 起三根 68.40 垫行）；此前只有 count 请求裁。
+  现在日期窗一律裁头部连续垫行，MiniQMT 对未覆盖月份也不返回行。回落 servant 按默认
+  `skip_paused=True` 调，真停牌周期本就不出行，所以这里的平价零量行只能是垫行。
 
 ## [0.3.48] - 2026-09-18
 

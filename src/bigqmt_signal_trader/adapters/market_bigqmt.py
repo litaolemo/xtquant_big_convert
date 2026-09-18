@@ -1394,7 +1394,19 @@ class BigQmtMarketDataProvider:
             # short of it was never padded, so trimming its head would drop
             # real bars. Verified live -- 1y count=10 comes back as exactly 10
             # rows, 7 of them pad.
-            if count > 0 and len(pairs) >= count:
+            #
+            # A date window (count=-1 with a start_time) is padded the same
+            # way when the window starts before the terminal's local coverage
+            # (#335: 601318.SH 1mon from 20250901 with 1d data anchored at
+            # 2025-12-10 -- three head rows flat at 68.40, the first real
+            # close, zero turnover; MiniQMT returns no rows for those months).
+            # There is no count to fall short of, so every leading flat
+            # zero-turnover row at the head of a window is pad. The servant
+            # is called with its default skip_paused=True, so a genuinely
+            # suspended period does not come back as a row here in the first
+            # place -- the only flat zero-turnover rows it produces are pad.
+            window_request = count <= 0 and bool(str(kwargs.get("start_time") or "").strip())
+            if (count > 0 and len(pairs) >= count) or window_request:
                 pad = _leading_synthetic_bars([row for _label, row in pairs])
                 if pad:
                     trimmed += pad

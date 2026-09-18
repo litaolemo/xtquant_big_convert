@@ -2476,7 +2476,22 @@ class BigQmtRpcHandlers:
         if not request.stock_code:
             raise ValueError("stock_code is required")
         if request.volume <= 0:
+            if _is_cash_repay_order_type(request.order_type):
+                # #330: the caller put the amount in price. Big QMT's
+                # passorder carries 直接还款's amount in the VOLUME slot
+                # (integer yuan) and ignores price; MiniQMT's signature
+                # has no other slot for it either.
+                raise ValueError(
+                    "直接还款 (order_type %s): the repayment amount goes in "
+                    "order_volume as integer yuan, price is ignored -- got "
+                    "order_volume=%r price=%r. Example: order_stock(acc, code, "
+                    "CREDIT_DIRECT_CASH_REPAY, 10000, FIX_PRICE, 0, ...)"
+                    % (request.order_type, params.get("volume", params.get("order_volume")),
+                       params.get("price")))
             raise ValueError("volume must be positive")
+        if _is_cash_repay_order_type(request.order_type) and request.price > 0:
+            print("%s 直接还款: amount=%d taken from order_volume; price=%r is ignored "
+                  "by passorder (#330)" % ("[bigqmt_rpc]", request.volume, request.price))
 
         try:
             from .exec_events import remember_order_identity
@@ -3158,6 +3173,14 @@ def _convertible_optype_of(order_type):
         return convertible_optype_of(order_type)
     except Exception:
         return None
+
+
+def _is_cash_repay_order_type(order_type):
+    """直接还款 (MiniQMT 32 / 45): the amount rides in the volume slot."""
+    try:
+        return int(order_type) in (32, 45)
+    except (TypeError, ValueError):
+        return False
 
 
 def _is_sideless_order_type(order_type):

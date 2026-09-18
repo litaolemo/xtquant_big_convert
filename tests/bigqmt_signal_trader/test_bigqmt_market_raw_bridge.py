@@ -786,3 +786,64 @@ class SynthRescueRealPandasTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# 601318.SH 1mon from 20250901 on a terminal whose 1d data starts 2025-12-10
+# (#335): the servant pads the three uncovered months flat at the first real
+# close (68.40) with zero turnover. MiniQMT returns no rows for them.
+_MONTHLY_WINDOW_PADDED = [
+    ("20250930", 68.40, 68.40, 68.40, 68.40, 0.0, 0.0),
+    ("20251031", 68.40, 68.40, 68.40, 68.40, 0.0, 0.0),
+    ("20251130", 68.40, 68.40, 68.40, 68.40, 0.0, 0.0),
+    ("20251231", 66.10, 69.80, 65.20, 68.40, 9100000.0, 6.1e10),
+    ("20260131", 68.40, 70.10, 64.90, 66.30, 8700000.0, 5.8e10),
+]
+
+
+class DateWindowPaddingTest(unittest.TestCase):
+    """#335: a date-window request (count=-1, start_time) is padded at the
+    head exactly like a count request, and used to keep the pad."""
+
+    def _provider(self, **kwargs):
+        context = TerminalContext(**kwargs)
+        return context, BigQmtMarketDataProvider(context)
+
+    def test_head_padding_of_a_date_window_is_dropped(self):
+        context, provider = self._provider(bars=_MONTHLY_WINDOW_PADDED)
+
+        data = provider.get_market_data_ex(
+            field_list=[], stock_list=["601318.SH"], period="1mon",
+            start_time="20250901", end_time="20260131", count=-1,
+            dividend_type="none", fill_data=False)
+
+        frame = data["601318.SH"]
+        self.assertEqual(["20251231", "20260131"], [row[0] for row in frame["records"]])
+        self.assertEqual(3, _partial_of(frame)["padding_rows_dropped"])
+
+    def test_a_window_of_nothing_but_padding_is_no_data(self):
+        context, provider = self._provider(bars=_MONTHLY_WINDOW_PADDED[:3])
+
+        data = provider.get_market_data_ex(
+            field_list=[], stock_list=["601318.SH"], period="1mon",
+            start_time="20250901", end_time="20251130", count=-1)
+
+        self.assertEqual([], data["601318.SH"]["records"])
+
+    def test_a_request_with_neither_count_nor_start_time_is_left_alone(self):
+        """No window to pad towards: nothing is trimmed."""
+        context, provider = self._provider(bars=_MONTHLY_WINDOW_PADDED)
+
+        data = provider.get_market_data_ex(
+            field_list=[], stock_list=["601318.SH"], period="1mon", count=-1)
+
+        self.assertEqual(5, len(data["601318.SH"]["records"]))
+        self.assertEqual(0, _partial_of(data["601318.SH"])["padding_rows_dropped"])
+
+    def test_a_short_count_answer_is_still_not_trimmed(self):
+        """The count path keeps its guard: short of count means unpadded."""
+        context, provider = self._provider(bars=_MONTHLY_WINDOW_PADDED)
+
+        data = provider.get_market_data_ex(
+            field_list=[], stock_list=["601318.SH"], period="1mon", count=10)
+
+        self.assertEqual(5, len(data["601318.SH"]["records"]))

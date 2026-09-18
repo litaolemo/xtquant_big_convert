@@ -183,3 +183,46 @@ class SettlementIgnoresTheSideTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AmountSlotTest(unittest.TestCase):
+    """#330: the caller put the repayment amount in price and a dummy in
+    volume. passorder carries 直接还款's amount in the VOLUME slot and
+    ignores price -- the error must say so, in terms of the caller's
+    parameters, instead of a bare "volume must be positive"."""
+
+    def test_a_zero_volume_names_the_right_slot(self):
+        handlers = _handlers(_Passorder())
+        with self.assertRaises(ValueError) as caught:
+            handlers.handle("order_stock", {
+                "stock_code": "600000.SH", "order_type": xtconstant.CREDIT_DIRECT_CASH_REPAY,
+                "order_volume": 0, "price_type": xtconstant.FIX_PRICE, "price": 8077.0})
+        message = str(caught.exception)
+        self.assertIn("order_volume", message)
+        self.assertIn("price is ignored", message)
+        self.assertIn("8077.0", message)
+
+    def test_a_fractional_cash_balance_as_volume_is_the_same_mistake(self):
+        """cash_avail=0.85 -> int -> 0: what the report hit first."""
+        handlers = _handlers(_Passorder())
+        with self.assertRaises(ValueError) as caught:
+            handlers.handle("order_stock", {
+                "stock_code": "600000.SH", "order_type": xtconstant.CREDIT_DIRECT_CASH_REPAY,
+                "order_volume": 0.85, "price_type": xtconstant.FIX_PRICE, "price": 8077.0})
+        self.assertIn("integer yuan", str(caught.exception))
+
+    def test_the_amount_in_volume_goes_through_and_price_is_dropped(self):
+        passorder = _Passorder()
+        handlers = _handlers(passorder)
+        handlers.handle("order_stock", {
+            "stock_code": "600000.SH", "order_type": xtconstant.CREDIT_DIRECT_CASH_REPAY,
+            "order_volume": 8077, "price_type": xtconstant.FIX_PRICE, "price": 1923.85})
+        self.assertEqual(8077, passorder.calls[0]["volume"])
+
+    def test_an_ordinary_order_keeps_the_plain_message(self):
+        handlers = _handlers(_Passorder())
+        with self.assertRaises(ValueError) as caught:
+            handlers.handle("order_stock", {
+                "stock_code": "600000.SH", "order_type": xtconstant.STOCK_BUY,
+                "order_volume": 0, "price_type": xtconstant.FIX_PRICE, "price": 10.0})
+        self.assertEqual("volume must be positive", str(caught.exception))
