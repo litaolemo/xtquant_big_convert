@@ -398,7 +398,7 @@ xtdata.get_full_tick(["600000.SH"])               # 显式代码不受影响
 | `etf` | 沪深ETF | 1696 |
 | `fund` | 沪深基金 | 2249 |
 | `index` | 沪深指数 | 609 |
-| `convertible` | 沪深转债 | 320 |
+| `convertible`（别名 `cbond` / `cb`） | 沪深转债 | 320 |
 | `all` | 不收窄，返回交易所全部标的 | 26744（SH） |
 
 **关键在于请求时就收窄，而不是拿回来再过滤**——事后过滤仍要付 QMT 对每个多余标的的 0.29ms。板块清单由 FormulaServer 直连提供（实测 13ms）并按运行缓存，相对省下的时间可以忽略。
@@ -1034,7 +1034,7 @@ xt_trader.cancel_order_stock(acc, order_id)   # 撤单送回的是原始字符�
 
 ### 本项目的扩展（MiniQMT 没有）
 
-这些不是兼容项，是多出来的：`order_stock_result()`（返回完整 dict 而非单个 id）、`order_stock_batch()`、`wait_async_orders()`、`ipo_subscribe_all()`、`sync_deployment()`、`get_deployment_info()`、`query_execution_snapshot()`、`local_cache_stats()`。
+这些不是兼容项，是多出来的：`order_stock_result()`（返回完整 dict 而非单个 id）、`order_stock_batch()`、`wait_async_orders()`、`ipo_subscribe_all()`、`sync_deployment()`、`get_deployment_info()`、`query_execution_snapshot()`、`local_cache_stats()`、`convert_bond()` / `sell_back_bond()`（可转债转股 / 回售，大 QMT passorder opType 80-83，按账户类型自动选普通户/信用户编号；`order_stock` 直接传 80-83 也认）。
 
 ---
 

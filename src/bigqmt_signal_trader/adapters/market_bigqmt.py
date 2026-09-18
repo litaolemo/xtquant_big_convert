@@ -76,6 +76,10 @@ SECTOR_BY_TYPE = {
     "etf": "沪深ETF",
     "index": "沪深指数",
     "convertible": "沪深转债",
+    # Aliases for the same sector: what people actually type.
+    "cbond": "沪深转债",
+    "cb": "沪深转债",
+    "convertible_bond": "沪深转债",
 }
 
 

@@ -3,6 +3,20 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [未发布]
+
+### 新增
+
+- **可转债：`get_full_tick` 市场令牌的 `types` 认 `cbond`**（用户提议）。`convertible`（沪深转债）
+  早就有，加 `cbond` / `cb` / `convertible_bond` 三个别名指向同一板块。
+- **可转债转股 / 回售**（用户提议，MiniQMT 没有、大 QMT 有）。`xt_trader.convert_bond(account, code,
+  张数)` 和 `xt_trader.sell_back_bond(account, code, 张数)`，按 `account.account_type` 选大 QMT 的
+  passorder opType：普通户 转股 80 / 回售 81，信用户 82 / 83；返回和 `order_stock` 一样的 order_id。
+  `order_stock` 直接传 80-83 也认（原样透传，没有买卖方向，价格送 0）。MiniQMT 的
+  `OPT_CONVERT_BONDS=51` 是委托记录里的操作码、在 passorder 编号里是卖出平仓，**不**当别名收。
+  没有转债持仓可实测，且转股不可撤销——请先用 1 张验证。
+
+
 ## [0.3.47] - 2026-09-17
 
 三条：方式一多账号副账号的委托/成交回调（#320/#322，按事件账号选频道 + 副账号轮询合成事件，闸门 2 在顶层策略文件要重启）、Redis 后台 BRPOP 存活时 adjust 不再抢 LPOP（#321，@wsmh）、部署脚本 redis zip 校验 + 原子下载（#323，@karlthas007，含两个分支 bug 的跟修）。

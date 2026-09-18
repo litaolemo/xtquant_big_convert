@@ -262,7 +262,38 @@ _ETF_OPTION_SELL_SIDE = frozenset({
 SIDELESS_ORDER_TYPES = frozenset({
     _XC.CREDIT_DIRECT_CASH_REPAY, _XC.CREDIT_DIRECT_CASH_REPAY_SPECIAL,   # 32 / 45
     56, 57, 58, 59,
+    80, 81, 82, 83,                                                       # 可转债 转股 / 回售
 })
+
+# 可转债转股 / 回售，passorder 的 opType（大 QMT 内置 API 参考 10.1）：
+#   80 普通账户转股   81 普通账户回售   82 信用账户转股   83 信用账户回售
+# MiniQMT 没有对应的 order_stock 类型（它的 OPT_CONVERT_BONDS=51 是委托记录里的
+# 操作码，和 passorder 的 51 卖出平仓撞号，不能拿来当 order_type）。这里按大 QMT
+# 的编号收，原样透传；没有买卖方向。
+CONVERTIBLE_CONVERT_STOCK = 80
+CONVERTIBLE_SELL_BACK_STOCK = 81
+CONVERTIBLE_CONVERT_CREDIT = 82
+CONVERTIBLE_SELL_BACK_CREDIT = 83
+CONVERTIBLE_OP_TYPES = frozenset({80, 81, 82, 83})
+
+
+def convertible_optype_of(order_type):
+    """可转债转股/回售的 passorder opType，不是则 None。"""
+    try:
+        value = int(order_type)
+    except (TypeError, ValueError):
+        return None
+    return value if value in CONVERTIBLE_OP_TYPES else None
+
+
+def convertible_optype_for(action, account_type):
+    """opType for ``action`` ("convert" / "sell_back") on an account type."""
+    credit = str(account_type or "").strip().upper() == "CREDIT"
+    if str(action or "").strip().lower() in ("convert", "转股"):
+        return CONVERTIBLE_CONVERT_CREDIT if credit else CONVERTIBLE_CONVERT_STOCK
+    if str(action or "").strip().lower() in ("sell_back", "sellback", "回售"):
+        return CONVERTIBLE_SELL_BACK_CREDIT if credit else CONVERTIBLE_SELL_BACK_STOCK
+    raise ValueError("convertible action must be 'convert' or 'sell_back', got %r" % (action,))
 SIDELESS_DEFAULT_ACTION = SignalAction.SELL.value
 
 
@@ -531,7 +562,14 @@ class BigQmtOrderGateway:
         raw_order_type = getattr(request, "order_type", None)
         credit_optype = credit_optype_of(raw_order_type)
         passthrough_optype = passthrough_optype_of(raw_order_type)
-        if credit_optype is not None:
+        convertible_optype = convertible_optype_of(raw_order_type)
+        if convertible_optype is not None:
+            # 转股 / 回售: the number already says which account book it is
+            # for (80/81 普通, 82/83 信用). Forward as-is; the caller (or the
+            # compat layer's convert_bond / sell_back_bond) picked it from the
+            # account type.
+            op_type = convertible_optype
+        elif credit_optype is not None:
             # A credit operation carries more than a side: mapping it back to
             # BUY/SELL would turn 融资买入 into an ordinary buy, which is the
             # bug behind issue #103 -- worse than the rejection it replaced,

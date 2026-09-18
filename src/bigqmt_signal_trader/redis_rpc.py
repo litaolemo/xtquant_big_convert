@@ -2386,6 +2386,9 @@ class BigQmtRpcHandlers:
             return passthrough
         if _passthrough_optype_of(raw) is not None:
             return _sideless_default_action()
+        # 可转债 转股 / 回售 (80-83): no side either.
+        if _convertible_optype_of(raw) is not None:
+            return _sideless_default_action()
         if raw in (None, ""):
             raise ValueError("action or order_type is required")
         # An order_type WAS supplied and was not recognised. Saying "required"
@@ -2426,6 +2429,8 @@ class BigQmtRpcHandlers:
         if _credit_optype_of(raw) is not None:
             return raw
         if _passthrough_optype_of(raw) is not None:
+            return raw
+        if _convertible_optype_of(raw) is not None:
             return raw
         return None
 
@@ -3142,6 +3147,15 @@ def _credit_optype_of(order_type):
         from bigqmt_signal_trader.adapters.order_bigqmt import credit_optype_of
 
         return credit_optype_of(order_type)
+    except Exception:
+        return None
+
+
+def _convertible_optype_of(order_type):
+    try:
+        from bigqmt_signal_trader.adapters.order_bigqmt import convertible_optype_of
+
+        return convertible_optype_of(order_type)
     except Exception:
         return None
 

@@ -5974,6 +5974,39 @@ class BigQmtXtTrader:
     def query_account_status(self, account=None):
         return self._query_account_list(account, "query_account_status")
 
+    # -- 可转债 转股 / 回售（大 QMT 有、MiniQMT 没有）-----------------------
+    def convert_bond(self, account, stock_code, volume, strategy_name="", order_remark=""):
+        """可转债转股：把 ``volume`` 张转债转成正股（大 QMT passorder opType 80 / 82）。
+
+        MiniQMT 没有这个操作。账户类型决定编号：普通户 80，信用户 82，按
+        ``account.account_type``（StockAccount 的第二个参数）选。返回和
+        ``order_stock`` 一样的 order_id；没有买卖方向，`price` 送 0。
+        转股不可撤销，请先核对代码是转债代码、数量是张数。
+        """
+        return self._convertible_op("convert", account, stock_code, volume,
+                                    strategy_name, order_remark)
+
+    def sell_back_bond(self, account, stock_code, volume, strategy_name="", order_remark=""):
+        """可转债回售：把 ``volume`` 张转债按回售条款卖回发行人（opType 81 / 83）。
+
+        同 ``convert_bond``：普通户 81，信用户 83，按账户类型选；只在回售
+        申报期内有效，其余时间柜台会拒。
+        """
+        return self._convertible_op("sell_back", account, stock_code, volume,
+                                    strategy_name, order_remark)
+
+    def _convertible_op(self, action, account, stock_code, volume, strategy_name, order_remark):
+        from .adapters.order_bigqmt import convertible_optype_for
+
+        account_type = _account_type_name(getattr(account, "account_type", None)) \
+            or getattr(self, "_declared_account_type", "") or "STOCK"
+        op_type = convertible_optype_for(action, account_type)
+        data = self.order_stock_result(
+            account, stock_code, op_type, int(volume), 11, 0.0,
+            strategy_name, order_remark,
+        )
+        return self._order_id(data.get("order_sys_id"))
+
     def query_credit_detail(self, account):
         """信用账户明细，读终端缓存的信用账号对象（同步）。
 
