@@ -1095,11 +1095,50 @@ def _ensure_preclose_from_lag(df, field_list=None, period=None):
         return df
 
 
+def _ensure_suspend_flag_column(df, field_list=None):
+    """suspendFlag 列形状兜底: 空 field_list(=全字段)或点名时, 缺列则补 0。
+
+    合成回落帧(``synth_period_primary_empty``, #237)的 servant
+    (ContextInfo.get_market_data)只服务 OHLCV+amount 六列, 实测把
+    suspendFlag 混进请求会让整个请求 0 行, 所以服务端给不出这列——
+    MiniQMT 的同请求却带全部 11 列。下游按 MiniQMT 习惯读
+    ``df["suspendFlag"]`` 会 KeyError; 自己 concat 补列会拿到 NaN,
+    对它做整数转换直接 ValueError。
+
+    与 ``_ensure_preclose_from_lag`` 的缺列分支同一条边界: 只在调用方
+    要了这列(field_list 为空或点了 suspendFlag)时补列, 显式点名清单
+    不多出列。值填 0 与该函数对停牌/无数据帧的处理一致(避免下游
+    KeyError); 注意 0 是形状契约的默认值, 不是合成周期的真实停牌
+    标志——真值需要按日线聚合(suspendFlag 在日线 RPC 有真值), 可作
+    后续增强, 同 preClose 的 #166 精确回填之于 lag 的关系。
+    """
+    try:
+        if not hasattr(df, "columns"):
+            return df
+        if "suspendFlag" in df.columns:
+            return df
+        requested = [str(f) for f in (field_list or [])]
+        if requested and "suspendFlag" not in requested:
+            return df
+        out = df.copy()
+        out["suspendFlag"] = 0
+        return out
+    except Exception:
+        return df
+
+
+def _ensure_kline_columns(df, field_list=None, period=None):
+    """K 线可选列的形状兜底组合: preClose(lag) 之后补 suspendFlag。"""
+    return _ensure_suspend_flag_column(
+        _ensure_preclose_from_lag(df, field_list=field_list, period=period),
+        field_list=field_list)
+
+
 def _normalize_market_data_result(data, field_list=None, period=None):
     if not isinstance(data, dict):
-        return _ensure_preclose_from_lag(data, field_list=field_list, period=period)
+        return _ensure_kline_columns(data, field_list=field_list, period=period)
     return {
-        code: _ensure_preclose_from_lag(
+        code: _ensure_kline_columns(
             _normalize_market_data_frame(frame, field_list=field_list),
             field_list=field_list, period=period)
         for code, frame in data.items()
@@ -2676,9 +2715,9 @@ class BigQmtXtData:
                     )
                 data = payload.get(single) if single is not None else payload
             if isinstance(data, dict):
-                return {code: _ensure_preclose_from_lag(frame, field_list=field_list, period=period)
+                return {code: _ensure_kline_columns(frame, field_list=field_list, period=period)
                         for code, frame in data.items()}
-            return _ensure_preclose_from_lag(data, field_list=field_list, period=period)
+            return _ensure_kline_columns(data, field_list=field_list, period=period)
         fields = list(field_list or [])
         result = {}
         missing = []
@@ -2697,7 +2736,7 @@ class BigQmtXtData:
                 df = fetched.get(code)
                 if df is not None and getattr(df, "shape", (0,))[0] > 0:
                     result[code] = self._select_fields(
-                        _ensure_preclose_from_lag(
+                        _ensure_kline_columns(
                             _normalize_market_data_frame(df, field_list=fields),
                             field_list=fields, period=period),
                         fields,
