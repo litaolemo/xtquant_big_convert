@@ -16,6 +16,12 @@
   `OPT_CONVERT_BONDS=51` 是委托记录里的操作码、在 passorder 编号里是卖出平仓，**不**当别名收。
   没有转债持仓可实测，且转股不可撤销——请先用 1 张验证。
 
+### 修复
+
+- **`xtquant.xtdata` shim 的 `get_full_tick` 不转发 `types`**（#327，@karlthas007）：走 shim 的旧代码
+  `xtdata.get_full_tick(["SH"], types=[...])` 报 `unexpected keyword argument 'types'`，收窄能力用不上。
+  现在原样转发。
+
 
 ## [0.3.47] - 2026-09-17
 
