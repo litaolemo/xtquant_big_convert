@@ -3,7 +3,9 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
-## [未发布]
+## [0.3.48] - 2026-09-18
+
+可转债：`get_full_tick` 的 `types` 认 `cbond`，转股 / 回售走 passorder 80-83（`convert_bond` / `sell_back_bond`，未实盘验证，请先 1 张试）；`xtquant.xtdata` shim 的 `get_full_tick` 补转发 `types`（#327，@karlthas007）。
 
 ### 新增
 
