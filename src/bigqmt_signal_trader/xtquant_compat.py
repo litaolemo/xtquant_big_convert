@@ -2785,6 +2785,60 @@ class BigQmtXtData:
         except Exception:
             return False
 
+    @staticmethod
+    def _is_placeholder_frame(frame):
+        """One code's frame is a no-trade placeholder: every bar has
+        ``volume == 0`` and ``suspendFlag == 1``.
+
+        Big QMT answers a window it has no local bars for with placeholder
+        bars rather than an empty frame, and the fill differs by build. The
+        国金 terminal fills zeros (the all-zero shape ``_is_all_zero_any``
+        catches). A 华泰 terminal on 0.3.40 filled the previous close into
+        open/high/low/close instead (#339, @wolfeee: 002594.SZ 1m from
+        20260918 answered 150 bars dated 20260919 -- a Saturday -- all at
+        84.3, volume 0, suspendFlag 1). Nonzero prices slip past the
+        all-zero detector, so the heal never fired and the caller was handed
+        a day of flat fake bars with nothing said. Both columns are required:
+        a frame without ``suspendFlag`` (the FormulaServer six-column path)
+        never matches, and one nonzero volume anywhere means real trades.
+        """
+        cols = getattr(frame, "columns", None)
+        if cols is None:
+            return False
+        cols = list(cols)
+        if "volume" not in cols or "suspendFlag" not in cols:
+            return False
+        if len(frame) == 0:
+            return False
+        try:
+            return bool((frame["volume"] == 0).all() and (frame["suspendFlag"] == 1).all())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_placeholder_all(data):
+        """Every served frame is a placeholder (see ``_is_placeholder_frame``).
+
+        ``all`` rather than ``any`` on purpose: a genuinely suspended stock
+        answers the same shape truthfully, and one of those inside a
+        portfolio read must not turn the whole read into a per-call heal
+        (download + sleep + re-read). Every code flat at once is the
+        raw-store-not-populated signal, the same reasoning as the majority
+        guard on the none-adjusted branch.
+        """
+        try:
+            cols = getattr(data, "columns", None)
+            if cols is not None:
+                return BigQmtXtData._is_placeholder_frame(data)
+            if isinstance(data, dict) and data:
+                frames = [v for v in data.values() if getattr(v, "columns", None) is not None]
+                if not frames:
+                    return False
+                return all(BigQmtXtData._is_placeholder_frame(v) for v in frames)
+            return False
+        except Exception:
+            return False
+
     def _ensure_server_raw(self, codes, period, start_time, end_time):
         """Trigger a server-side raw download so adjusted bars can be computed."""
         try:
@@ -2815,13 +2869,20 @@ class BigQmtXtData:
     def _heal_adjusted(self, method, params, data, wait_seconds=2.0, timeout_seconds=None):
         """Self-heal reads served from an unready raw store: if the adjusted
         pull came back all-zero, or a none-adjusted pull came back missing
-        most requested codes, trigger a server-side raw download, wait for
-        async landing, retry once."""
+        most requested codes, or every code came back as a no-trade
+        placeholder frame (#339), trigger a server-side raw download, wait
+        for async landing, retry once."""
         dividend_type = str(params.get("dividend_type") or "none").lower()
         codes = list(params.get("stock_list") or params.get("stock_code") or [])
         if not codes:
             return data
-        if dividend_type in ("", "none"):
+        if self._is_placeholder_all(data):
+            # Applies on both branches: the placeholder fill is a raw-store
+            # answer, not an adjustment artefact, so a none-adjusted read
+            # gets the same flat bars -- and those codes count as *served*,
+            # which is why the missing-majority guard below never sees them.
+            pass
+        elif dividend_type in ("", "none"):
             # None-adjusted bars are never zero-filled, so the all-zero
             # detector does not apply -- a *missing* code means the server
             # has no raw bars for it at all. Big QMT's raw store is not
@@ -2847,8 +2908,27 @@ class BigQmtXtData:
         )
         time.sleep(wait_seconds)
         if timeout_seconds is not None:
-            return self.client.call(method, params, timeout_seconds=timeout_seconds)
-        return self._call(method, **params)
+            healed = self.client.call(method, params, timeout_seconds=timeout_seconds)
+        else:
+            healed = self._call(method, **params)
+        if self._is_placeholder_all(healed):
+            # The download did not change the answer: either the terminal
+            # has no data to download for this window (a real suspension,
+            # or the reporter's terminal where the download RPC itself
+            # answers False, #339) -- say so rather than hand back a flat
+            # frame that reads like bars.
+            log.warning(
+                "%s %s %s %s~%s: every bar is volume 0 / suspendFlag 1 after a "
+                "server-side download and retry. These are Big QMT placeholder "
+                "bars, not trades -- the terminal has no local %s data for this "
+                "window. Check download_history_data2 on this terminal "
+                "(probe_capabilities -> qmt_globals) or download the period in "
+                "the terminal's 数据管理 first.",
+                method, ",".join(codes[:5]) + (",..." if len(codes) > 5 else ""),
+                params.get("period", "1d"), params.get("start_time", ""),
+                params.get("end_time", ""), params.get("period", "1d"),
+            )
+        return healed
 
     def _pull_and_cache(self, codes, period, start_time, end_time, count, dividend_type="none"):
         """Fetch codes over RPC (get_market_data_ex already caches them)."""
