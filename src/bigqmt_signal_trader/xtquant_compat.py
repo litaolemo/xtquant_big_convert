@@ -4144,14 +4144,25 @@ class BigQmtXtTrader:
         return 0
 
     def connect(self):
-        if self.client.account_id:
-            pong = self.client.call("ping")
-            self._note_server_account_type(pong)
-            mismatch = warn_on_version_mismatch(pong)
-            if mismatch and auto_sync_enabled():
-                self.sync_deployment()
-        self._fire_account_status()
-        return 0
+        try:
+            if self.client.account_id:
+                pong = self.client.call("ping")
+                self._note_server_account_type(pong)
+                mismatch = warn_on_version_mismatch(pong)
+                if mismatch and auto_sync_enabled():
+                    self.sync_deployment()
+            self._fire_account_status()
+            return 0
+        except Exception:
+            # connect 失败必须拆掉 start() 拉起的事件监听线程。否则它持有的
+            # Redis pubsub 订阅(每实例 4 个 exec 事件频道)随丢弃的实例永久
+            # 留在服务端: 调用方重连风暴每次重试泄漏一个, 实测单日 8000+ 个
+            # subscribe 连接, 逼近 maxclients 后整个 Redis 拒绝新连接。
+            try:
+                self.stop()
+            except Exception:
+                log.exception("connect failed and event listener teardown failed")
+            raise
 
     def sync_deployment(self, dry_run=False):
         """Push this client's package into the QMT python directory.
