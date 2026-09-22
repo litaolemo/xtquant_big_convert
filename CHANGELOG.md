@@ -3,7 +3,9 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
-## [未发布]
+## [0.3.54] - 2026-09-22
+
+港股通：同一个账号几种类型，`BIGQMT_ACCOUNT_TYPE` 可写列表，客户端 `StockAccount` 的类型随请求传到服务端；延迟报告用 0.3.53 稳态重测四种组合，并修正探针的相位锁死和回放窗口两处偏差。
 
 ### 文档
 
