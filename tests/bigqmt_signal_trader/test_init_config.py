@@ -118,7 +118,9 @@ class RenderedConfigTest(unittest.TestCase):
         (592.9ms vs 15.8ms) and redis 9x (30.7ms vs 3.4ms) -- see #244 and
         docs/LATENCY_REPORT.md.
         """
-        wants_background = {"redis": True, "zmq": False,
+        # #343: every transport drains. redis's "True is faster" was the
+        # adjust thread's LPOP stealing the request; #321 removed that.
+        wants_background = {"redis": False, "zmq": False,
                             "pipe": False, "mysql": False}
         for transport, expected in sorted(wants_background.items()):
             loaded = _load(init_config.render_server_config(
@@ -131,7 +133,7 @@ class RenderedConfigTest(unittest.TestCase):
     def test_the_order_switch_does_not_change_the_threading_mode(self):
         for answers in (_answers(), _answers(allow_order_methods=True)):
             loaded = _load(init_config.render_server_config(answers), "s.py")
-            self.assertIs(loaded["BIGQMT_REDIS_CONFIG"]["rpc_background_threads"], True)
+            self.assertIs(loaded["BIGQMT_REDIS_CONFIG"]["rpc_background_threads"], False)
 
     def test_zmq_client_gets_a_concrete_connect_address(self):
         loaded = _load(init_config.render_client_config(

@@ -223,9 +223,13 @@ class BackgroundThreadResolutionTest(unittest.TestCase):
         self.assertFalse(_transport_can_drain("shm"))
         self.assertFalse(_transport_can_drain("nonesuch"))
 
-    def test_unset_keeps_the_historical_default(self):
+    def test_unset_means_the_adjust_drain(self):
+        # #343: pipe can drain, so an absent key drains (94ms vs 189ms with
+        # the receiver thread on the 0.3.28 table). The historical default
+        # -- receiver thread on -- is only kept for transports that cannot.
         from bigqmt_signal_trader_strategy import _resolve_background_threads
-        self.assertTrue(_resolve_background_threads("pipe", None))
+        self.assertFalse(_resolve_background_threads("pipe", None))
+        self.assertTrue(_resolve_background_threads("pipe", True))
 
 
 class FactoryTest(unittest.TestCase):

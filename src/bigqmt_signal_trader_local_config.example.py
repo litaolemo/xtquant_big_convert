@@ -47,17 +47,17 @@ BIGQMT_REDIS_CONFIG = {
     # off the main strategy thread. That is enforced when the listener list is
     # expanded, so no value below can move them (#244).
     #
-    # rpc_background_threads is therefore a pure latency choice, and it differs
-    # per transport (100 read methods, live terminal -- docs/LATENCY_REPORT.md):
-    #     redis  True 3.4ms   / False 30.7ms   <- this file ships redis
-    #     zmq    True 592.9ms / False 15.8ms
-    #     pipe   True 189.0ms / False 94.4ms
-    # Only redis wants True: its brpop wake is immediate, while zmq/pipe
-    # background threads pay a cross-thread GIL handoff (~1 adjust tick) per
-    # round trip. Switching transport? Switch this too.
+    # rpc_background_threads is therefore a pure latency choice: False (the
+    # adjust-thread drain) for every transport. The drain costs at most one
+    # adjust tick; a background thread costs one tick per GIL acquisition and
+    # a round trip has several (#343, live terminal 2026-09-22, ms):
+    #     redis  True ping 407 / positions 197    False ping 102 / positions 103
+    #     zmq    True ping 103 / positions 490    False ping  87 / positions  88
+    # True is only for a transport that cannot drain (none of the shipped
+    # ones need it).
     "rpc_process_in_listener": True,
     "rpc_listener_methods": ("*",),
-    "rpc_background_threads": True,
+    "rpc_background_threads": False,
     "schedule_adjust": True,
     "schedule_adjust_interval": "100nMilliSecond",
     # How long one adjust tick may keep the strategy thread running queued

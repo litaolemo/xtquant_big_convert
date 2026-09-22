@@ -62,7 +62,7 @@ python -m bigqmt_signal_trader.init_config
 
 几个不问、直接定死的：
 
-- **`rpc_background_threads` 按传输选**（redis `True`、zmq/pipe `False`）——选反了差 4~37 倍
+- **`rpc_background_threads` 一律 `False`**（adjust 线程 drain）——后台线程模式每次跨线程交接付一个 tick，redis 也不例外（#343）
 - **`rpc_allow_order_methods` 默认 `False`**——打开前会明确提示：任何能连上这条通道的程序都可以下单
 - 选了**无 redis 单文件**会自动把传输改成 zmq，不会留下一份声称用 redis 的配置
 
@@ -573,33 +573,32 @@ xt_trader.reload_status()            # -> {'ok': True, 'modules_purged': 28,
 
 ### 可插拔传输层
 
-实测（2026-09-08 盘中，同一台实盘终端，`schedule_adjust_interval:
-"100nMilliSecond"`）。方法覆盖 **100 个只读接口**，每个跑 5 次取中位，再对全部
-方法取分位——不是挑一两个快的报数：
+**决定延迟的是线程模式，不是传输。** 2026-09-22 在同一台实盘终端（0.3.50，
+`schedule_adjust_interval: "100nMilliSecond"`）把四种组合各重启一次、同一组只读探针各
+跑 20 轮，min / median / max（ms）：
 
-| 传输 + 模式 | 延迟 p50 | p90 | 跨机 | 适用场景 |
-|------|---------|-----|------|---------|
-| **redis + 后台线程**（默认）| **3.4ms** | 25.2ms | ✅ | 生产默认，最快 |
-| **zmq + drain** | 15.8ms | 94.7ms | ✅ | 无 redis 时的首选 |
-| redis + drain | 30.7ms | 93.4ms | ✅ | 不推荐，比默认慢 9 倍 |
-| **pipe + drain** | 94.4ms | 95.6ms | ❌ | 白名单拒 socket 时唯一可用 |
-| pipe + 后台线程 | 189.0ms | 296.8ms | ❌ | 不推荐 |
-| zmq + 后台线程 | 592.9ms | 697.5ms | ✅ | 旧默认，**不要用** |
-| **mysql** | ~105ms | — | ✅ | 兼容兜底 |
-| **shm** | — | — | ❌ | 接口预留（未实现）|
+| 方法 | redis + 后台线程 | zmq + 后台线程 | zmq + drain | redis + drain |
+|---|---|---|---|---|
+| ping | 199 / 407 / 605 | 98 / 103 / 303 | 10 / 87 / 108 | 23 / 102 / 106 |
+| get_full_tick（1 只） | 199 / 338 / 473 | 8 / 196 / 306 | 8 / 90 / 107 | 26 / 102 / 107 |
+| get_instrument_detail | 132 / 208 / 373 | 99 / 195 / 211 | 7 / 88 / 104 | 33 / 102 / 107 |
+| query_stock_positions | 102 / 197 / 320 | 396 / 490 / 600 | 8 / 88 / 103 | 85 / 103 / 109 |
+| query_stock_orders | 33 / 175 / 200 | 399 / 493 / 613 | 4 / 88 / 105 | 86 / 102 / 109 |
 
-**同一个传输配错模式，差 4~37 倍**——这比选哪个传输更要紧：
+- **drain**（`rpc_background_threads: False`）：adjust 线程自己收 / 处理 / 发，一个请求最多等
+  一个 tick，`handle` 0–1ms、`return` 1–5ms，所以 max 卡在 ~105ms
+- **后台线程**（`True`）：收包线程每拿一次 GIL 就付约一个 tick。往返次数决定延迟——
+  redis 回包 8 次往返 ≈ 400ms；zmq 的 ping 1–2 次 ≈ 100–200ms；zmq 上走 adjust 的交易查询
+  收→丢队列→adjust 处理→回 router 线程发，4–5 次 ≈ 500ms
 
-```
-zmq    592.9ms -> 15.8ms   （drain 快 37 倍）
-pipe   189.0ms -> 94.4ms   （drain 快 2 倍）
-redis    3.4ms -> 30.7ms   （drain 反而慢 9 倍）
-```
+所以 **`rpc_background_threads` 一律 `False`**，redis 也是。0.3.28 那张「redis + 后台线程
+3.4ms 最快」的表是真的测出来的，但那 3.4ms 是 adjust 线程 LPOP 抢到请求的那部分，不是
+后台线程自己的成绩；#321 关掉了那次抢（它会把重读拖上策略线程）之后，redis + 后台线程
+就成了四种里最慢的（#343 的报告就是这个）。`bigqmt-init` 从 0.3.51 起对所有传输都写
+`False`；旧配置里写着 `True` 的，改成 `False` 重启一次。
 
-`rpc_background_threads` 控制这个开关。**redis 是唯一后台线程更快的**：它的
-`brpop` 阻塞唤醒是即时的，而 zmq / pipe 的后台线程都要付跨线程 GIL 交接的
-代价（每次交接约一个 adjust tick）。默认值已经按传输分别选对，没有特别理由
-不要改。
+传输本身的取舍：redis 跨机、回报有 stream 短时回放、下载任务和全市场快照缓存都在；
+zmq 同机免 Redis；pipe 白名单拒 socket 时唯一可用（跨机 ❌）；mysql 兼容兜底；shm 预留。
 
 六种渠道返回的**数据完全一致**：100 个方法逐项比对结构指纹（字段名 + 嵌套
 形状），零差异；另取 14 个方法做 sha256 全精度逐字节比对（zmq vs redis），
@@ -1279,7 +1278,7 @@ BIGQMT_REDIS_CONFIG = {
     #   注意 zmq 实测比 redis 慢（ping 95ms vs 10ms，交易查询 95ms vs 4ms），
     #   它的用途是「这台机器没有 redis」，不是低延迟。
     # "transport": "zmq",
-    # 切 mysql（兼容兜底）：需装 pymysql+DBUtils，同样自动开 background_threads。
+    # 切 mysql（兼容兜底）：需装 pymysql+DBUtils。
     # "transport": "mysql",
     # "mysql": {"driver":"pymysql","host":"...","port":3306,"user":"root",
     #           "password":"...","database":"bigqmt_rpc","charset":"utf8mb4"},
@@ -1287,17 +1286,16 @@ BIGQMT_REDIS_CONFIG = {
     "rpc_allow_order_methods": False,    # 下单默认关闭
     "rpc_process_in_listener": True,     # 只读请求在收包线程直接处理（低延迟）
     "rpc_listener_methods": ("*",),      # * = 所有只读方法
-    "rpc_background_threads": True,      # redis 用后台收包线程（最快）
+    "rpc_background_threads": False,     # adjust 线程 drain；True 每次跨线程交接付一个 tick（#343）
     "schedule_adjust": True,
     "schedule_adjust_interval": "100nMilliSecond",
 }
 ```
 
-> **`rpc_background_threads` 按传输选，没有一个值对所有传输都最好**（实测见上面的传输对比表）：
-> redis 用 `True`（3.4ms，`brpop` 唤醒是即时的）；zmq / pipe / mysql 用 `False`
-> 走 adjust drain（zmq 15.8ms），因为它们的后台线程每次都要付跨线程 GIL 交接，
-> 约一个 adjust tick。zmq 配 `True` 是 592.9ms，慢 37 倍。不写这个键则沿用历史
-> 默认（开后台线程）—— 对 redis 正好是对的，对 zmq / pipe 不是。向导按传输替你定好了。
+> **`rpc_background_threads` 一律 `False`**（实测见上面「可插拔传输层」那张四列表）：
+> drain 模式一个请求最多等一个 adjust tick；后台线程每拿一次 GIL 付一个 tick，redis 回包
+> 8 次往返就是 400ms（#343）。不写这个键，0.3.51 起各传输默认也是 drain；旧配置里写着
+> `True` 的改掉重启。`True` 只留给没有 drain 实现的传输。
 >
 > 安全性不依赖这个开关：碰交易上下文的方法（`LISTENER_DEFERRED_METHODS`）在展开
 > listener 名单时被无条件剔除，任何配置都无法把它们排到后台线程上（#244）。

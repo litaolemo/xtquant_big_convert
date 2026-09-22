@@ -400,8 +400,10 @@ QMT 终端自身的 C++ 主循环占着 GIL**,`setswitchinterval`/精简 adjust 
 ### 传输与后台线程
 
 - **redis**(默认,跨机):`rpc_process_in_listener=True`。
-- **zmq**(同机低延迟):只加 `transport="zmq"` 一行;非 redis 传输 `_build_rpc_service` 会自动开
-  `background_threads`,端口按账号派生 `tcp://127.0.0.1:1556x`。
+- **zmq**(同机免 Redis):只加 `transport="zmq"` 一行,端口按账号派生 `tcp://127.0.0.1:1556x`。
+- **`rpc_background_threads` 一律 `False`**(adjust drain)。后台收包线程每拿一次 GIL 付一个
+  adjust tick,redis 回包 8 次往返就是 ~400ms(#343);drain 下所有传输都是 ≤1 tick。不写这个
+  键时能 drain 的传输默认就是 drain,只有没有 drain 实现的(shm)保留收包线程。
 - QMT 编辑器可直接加载 `BIGQMT_ZMQ_DRYRUN.py`；该入口强制使用 ZMQ，并复用原有 Bridge 加载逻辑。
 - 内置 Redis 客户端读取含股票代码的原始 JSON 会触发 `Sensitive Data Detected`;客户端 helper 默认
   对请求做安全编码。

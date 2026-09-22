@@ -127,7 +127,7 @@ QMT 的 python 目录（回车则写到当前目录）: D:\国金证券QMT交易
 
 几个不问、直接定死的：
 
-- `rpc_background_threads` 按传输选（redis `True`、zmq `False`），选反了差 4~37 倍
+- `rpc_background_threads` 一律 `False`（adjust drain）——后台线程每次跨线程交接付一个 tick，redis 也不例外（#343）
 - 选了 `single_file_no_redis` 会把传输改成 zmq，不会留下一份声称用 redis 的配置
 
 > 生成的文件带账号和凭据，**不要提交到版本库**。QMT 登录密码不落盘——`qmt_launcher` 从环境变量 `BIGQMT_LOGIN_PASSWORD` 读。

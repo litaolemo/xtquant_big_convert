@@ -575,8 +575,12 @@ def _resolve_background_threads(transport_name, configured):
 
     ``configured`` is None when the local config never set
     ``rpc_background_threads`` (the runtime only forwards the key when it was
-    given explicitly) -- that case keeps the historical default: background
-    receiver threads on for every transport.
+    given explicitly). That used to mean the historical default -- receiver
+    threads on -- for every non-redis transport. Since #343 it means the
+    adjust drain wherever the transport can drain: measured on the live
+    terminal, drain is <= 1 tick on every transport while a background thread
+    pays a tick per GIL acquisition (zmq+thread 490ms for a deferred query,
+    zmq+drain 88ms). Only a transport with no drain keeps its thread.
 
     An explicit False opts into the adjust-driven drain instead: the transport
     is polled with a non-blocking recv from drain_request_queue on each adjust
@@ -598,11 +602,9 @@ def _resolve_background_threads(transport_name, configured):
     normalized = str(transport_name or "redis").lower()
     if _is_redis_transport(normalized):
         return bool(configured)
-    if configured is None:
+    if not _transport_can_drain(normalized):
         return True
-    if _transport_can_drain(normalized):
-        return bool(configured)
-    return True
+    return bool(configured)
 
 
 def _transport_can_drain(transport_name):
@@ -791,7 +793,7 @@ def _build_rpc_service(context_info, app, config):
         configured_bg = _config_bool(configured_bg, False)
     background_threads = _resolve_background_threads(transport_name, configured_bg)
     if background_threads and not configured_bg:
-        print("[bigqmt_rpc] transport=%s -> background_threads auto-enabled" % transport_name)
+        print("[bigqmt_rpc] transport=%s cannot drain -> background_threads forced on" % transport_name)
     # Build the transport. Redis is the default and reuses the existing clients/
     # templates (zero behavior change). zmq/mysql/shm go through the factory and
     # bypass the Redis clients entirely.

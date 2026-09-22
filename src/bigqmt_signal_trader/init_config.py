@@ -97,22 +97,26 @@ def _zmq_server_bind_host(client_host):
 
 
 def _background_threads_for(transport):
-    """Which rpc_background_threads value this transport wants.
+    """Which rpc_background_threads value this transport wants: False, all of them.
 
     Not a safety choice -- trade-context methods are excluded from listener
-    processing no matter what this says (#244) -- purely latency. Measured on
-    the live terminal over 100 read methods (docs/LATENCY_REPORT.md):
+    processing no matter what this says (#244) -- purely latency. The adjust
+    drain costs at most one tick; a background thread costs one tick per
+    GIL acquisition, and a round trip has several. Measured on the live
+    terminal 2026-09-22 (0.3.50, 100ms tick, min/median/max ms, #343):
 
-        redis  True 3.4ms   / False 30.7ms
-        zmq    True 592.9ms / False 15.8ms
-        pipe   True 189.0ms / False 94.4ms
+        method                  redis+bg      zmq+bg        zmq+drain    redis+drain
+        ping                    199/407/605   98/103/303    10/87/108    23/102/106
+        get_full_tick           199/338/473   8/196/306     8/90/107     26/102/107
+        query_stock_positions   102/197/320   396/490/600   8/88/103     85/103/109
+        query_stock_orders      33/175/200    399/493/613   4/88/105     86/102/109
 
-    redis is the only one that wants True: its brpop wake is immediate, while
-    zmq/pipe background threads pay a cross-thread GIL handoff (~1 adjust
-    tick) on every round trip. One blanket value here is what shipped zmq
-    configs 37x slower than they needed to be.
+    redis used to be the exception ("brpop wakes immediately", 3.4ms in the
+    0.3.28 table) -- but that 3.4ms was the adjust thread's LPOP stealing
+    the request, which #321 removed because it dragged heavy reads onto the
+    strategy thread. Without it redis+background is the slowest of the four.
     """
-    return str(transport or "redis").lower() in ("redis", "", "default")
+    return False
 
 
 def render_server_config(answers):
@@ -154,8 +158,8 @@ def render_server_config(answers):
         "    # get_trade_detail_data returns EMPTY off the main strategy thread, so",
         "    # order/query methods always run on QMT's adjust callback -- enforced",
         "    # in code, not by the flag below (#244). rpc_background_threads is a",
-        "    # latency choice and it differs per transport: redis wants True,",
-        "    # zmq/pipe want False (adjust drain).",
+        "    # latency choice: False (adjust drain) for every transport -- a",
+        "    # background thread pays ~1 adjust tick per GIL acquisition (#343).",
         '    "rpc_process_in_listener": True,',
         '    "rpc_listener_methods": ("*",),',
         '    "rpc_background_threads": %r,' % _background_threads_for(answers["transport"]),

@@ -18,12 +18,14 @@ class BackgroundThreadResolutionTest(unittest.TestCase):
         self.assertFalse(_resolve_background_threads("default", False))
         self.assertFalse(_resolve_background_threads(None, False))
 
-    def test_zmq_transport_defaults_background_threads_on(self):
+    def test_zmq_transport_defaults_to_the_adjust_drain(self):
         # None = the local config never named rpc_background_threads (the
-        # runtime only forwards the key when explicit): keep the historical
-        # receiver-thread default.
-        self.assertTrue(_resolve_background_threads("zmq", None))
-        self.assertTrue(_resolve_background_threads("ZMQ", None))
+        # runtime only forwards the key when explicit). #343: that means the
+        # drain now -- a router thread pays a tick per GIL acquisition
+        # (deferred query 490ms vs 88ms measured live). An explicit True is
+        # still honoured.
+        self.assertFalse(_resolve_background_threads("zmq", None))
+        self.assertFalse(_resolve_background_threads("ZMQ", None))
         self.assertTrue(_resolve_background_threads("zmq", True))
 
     def test_zmq_explicit_false_opts_into_adjust_drain(self):
@@ -37,7 +39,7 @@ class BackgroundThreadResolutionTest(unittest.TestCase):
 
     def test_mysql_explicit_false_opts_into_adjust_drain(self):
         # mysql also implements drain_request_queue, so the override stands.
-        self.assertTrue(_resolve_background_threads("mysql", None))
+        self.assertFalse(_resolve_background_threads("mysql", None))
         self.assertFalse(_resolve_background_threads("mysql", False))
         self.assertTrue(_resolve_background_threads("mysql", True))
 

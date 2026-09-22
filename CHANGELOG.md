@@ -23,6 +23,19 @@
   只记了阶段总耗时，没记是哪个请求把 adjust 线程冻住的。阈值 `slow_request_seconds` 默认 1.0，
   在 handler 返回后才记，不给快请求加 GIL 等待。服务端改动，需部署后才生效。
 
+- **`rpc_background_threads` 默认改为 `False`（adjust drain），所有传输一律**（#343 @jiema、#342
+  @sotinyatgithub）。0.3.45 → 0.3.49 后 redis 上 RPC 从 0.1s 变 0.5–0.7s：#321 关掉了 adjust
+  线程每拍 LPOP 抢队列（它会把重读拖上策略线程），之后所有请求都走后台收包线程，而后台线程
+  每拿一次 GIL 就付一个 adjust tick，redis 回包 8 次往返就是 ~400ms。0.3.28 那张「redis +
+  后台线程 3.4ms 最快」的表测的其实是 adjust 抢到的那部分。2026-09-22 在实盘终端把四种组合各
+  重启一次、同一组探针各 20 轮（median，ms）：redis+后台 ping 407 / 持仓 197，zmq+后台
+  103 / 490，zmq+drain 87 / 88，redis+drain 102 / 103——**决定延迟的是线程模式不是传输**。
+  改动：`bigqmt-init` 对所有传输写 `False`；配置里不写这个键时，能 drain 的传输（redis /
+  zmq / pipe / mysql）默认 drain，只有没有 drain 实现的（shm）保留收包线程；显式 `True`
+  仍尊重。README「可插拔传输层」、`docs/LATENCY_REPORT.md` 换成这张四列表。**已有部署**：
+  `bigqmt_signal_trader_local_config.py` 里写着 `"rpc_background_threads": True` 的改成
+  `False` 后重启策略，这一处在顶层文件里热重载不生效。
+
 ## [0.3.50] - 2026-09-21
 
 ### 修复
