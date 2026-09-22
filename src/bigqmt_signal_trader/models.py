@@ -332,11 +332,16 @@ class OrderRequest:
         strategy_name,
         remark="",
         order_type=None,
+        account_type=None,
     ):
         # MiniQMT-style order_type (xtconstant). Only set for operations a
         # BUY/SELL action cannot express -- credit financing, repayment and the
         # special-margin family. None means an ordinary stock order.
         self.order_type = order_type
+        # The account type the request named (港股通: "HUGANGTONG" on a stock
+        # account id). The settlement lookup reads the order back under it;
+        # None means the account's default.
+        self.account_type = account_type
         self.signal_id = signal_id
         self.account_id = account_id
         self.action = action

@@ -384,6 +384,27 @@ def load_client_config(module_name=None):
     return {}
 
 
+def _account_type_param(account):
+    """The type name a StockAccount declares, "" for a bare id string.
+
+    Sent as the ``account_type`` param of every trade RPC (港股通 on a stock
+    account: StockAccount(id, "HUGANGTONG") reads the HUGANGTONG book). The
+    server honours it only when the account is configured for that type,
+    otherwise the deployment's own type answers, as always (#92).
+    """
+    if account is None or isinstance(account, (str, dict)):
+        return ""
+    return _account_type_name(getattr(account, "account_type", None))
+
+
+def _with_account_type(params, account):
+    """``params`` plus the account's declared type, when it declares one."""
+    name = _account_type_param(account)
+    if name:
+        params["account_type"] = name
+    return params
+
+
 def _account_id(account, fallback=""):
     if account is None:
         return str(fallback or "")
@@ -4130,6 +4151,7 @@ class BigQmtXtTrader:
         # client's StockAccount(..., "CREDIT") never travels -- so prefer what
         # ping reports, fall back to what the caller declared.
         self._server_account_type = ""
+        self._server_account_types = []
         self._declared_account_type = ""
         # Set once the exec-event listener is really subscribed; start() waits
         # on it instead of sleeping blind. Never cleared on reconnect rounds --
@@ -4377,10 +4399,13 @@ class BigQmtXtTrader:
         """Remember what the deployment says it trades as."""
         try:
             reported = str((pong or {}).get("account_type") or "").strip().upper()
+            listed = [str(t or "").strip().upper()
+                      for t in ((pong or {}).get("account_types") or [])]
         except Exception:
             return
         if reported:
             self._server_account_type = reported
+            self._server_account_types = [t for t in listed if t]
             self._warn_on_account_type_mismatch()
 
     def _warn_on_account_type_mismatch(self):
@@ -4393,6 +4418,10 @@ class BigQmtXtTrader:
         server = self._server_account_type
         declared = self._declared_account_type
         if not server or not declared or server == declared:
+            return
+        # A deployment configured for several types (港股通 on a stock
+        # account) answers each request as the type its StockAccount named.
+        if declared in (getattr(self, "_server_account_types", None) or []):
             return
         log.warning(
             "account_type mismatch: this client asked for %s but the QMT "
@@ -4644,7 +4673,8 @@ class BigQmtXtTrader:
     def query_stock_asset(self, account):
         account_id = _account_id(account, self.client.account_id)
         try:
-            data = self.client.call("query_stock_asset", {"account_id": account_id}, account_id=account_id) or {}
+            data = self.client.call("query_stock_asset", _with_account_type({"account_id": account_id}, account),
+                                    account_id=account_id) or {}
         except Exception:
             # #243: default is to let the failure through. Only an explicit
             # account_cache_fallback, with a dated and fresh snapshot, answers
@@ -4754,7 +4784,8 @@ class BigQmtXtTrader:
     def query_stock_positions(self, account):
         account_id = _account_id(account, self.client.account_id)
         try:
-            data = self.client.call("query_stock_positions", {"account_id": account_id}, account_id=account_id) or {}
+            data = self.client.call("query_stock_positions", _with_account_type({"account_id": account_id}, account),
+                                    account_id=account_id) or {}
         except Exception:
             if self._account_cache_usable(account_id, "query_stock_positions") is None:
                 raise
@@ -4772,7 +4803,7 @@ class BigQmtXtTrader:
         account_id = _account_id(account, self.client.account_id)
         data = self.client.call(
             "query_position_statistics",
-            {"account_id": account_id},
+            _with_account_type({"account_id": account_id}, account),
             account_id=account_id,
         ) or {}
         return [self._position_statistics_object(account_id, item) for item in _as_list(data)]
@@ -4881,7 +4912,7 @@ class BigQmtXtTrader:
         try:
             data = self.client.call(
                 "query_stock_position",
-                {"account_id": account_id, "stock_code": stock_code},
+                _with_account_type({"account_id": account_id, "stock_code": stock_code}, account),
                 account_id=account_id,
             )
         except Exception:
@@ -4908,11 +4939,11 @@ class BigQmtXtTrader:
         account_id = _account_id(account, self.client.account_id)
         data = self.client.call(
             "query_stock_orders",
-            {
+            _with_account_type({
                 "account_id": account_id,
                 "cancelable_only": bool(cancelable_only),
                 "strategy_name": strategy_name,
-            },
+            }, account),
             account_id=account_id,
         ) or []
         return [self._order_from_dict(account_id, item) for item in _as_list(data)]
@@ -4931,7 +4962,7 @@ class BigQmtXtTrader:
         account_id = _account_id(account, self.client.account_id)
         data = self.client.call(
             "query_stock_trades",
-            {"account_id": account_id, "strategy_name": strategy_name},
+            _with_account_type({"account_id": account_id, "strategy_name": strategy_name}, account),
             account_id=account_id,
         ) or []
         return [self._trade_from_dict(account_id, item) for item in _as_list(data)]
@@ -4948,7 +4979,7 @@ class BigQmtXtTrader:
             -> {'ORDER': {'rows': 15, 'attributes': [...], 'error': ''}, ...}
         """
         account_id = _account_id(account, self.client.account_id)
-        params = {"account_id": account_id}
+        params = _with_account_type({"account_id": account_id}, account)
         if detail_types:
             params["detail_types"] = list(detail_types)
         return self.client.call("describe_trade_detail_fields", params,
@@ -4987,11 +5018,11 @@ class BigQmtXtTrader:
         account_id = _account_id(account, self.client.account_id)
         data = self.client.call(
             "query_execution_snapshot",
-            {
+            _with_account_type({
                 "account_id": account_id,
                 "order_strategy_name": order_strategy_name,
                 "trade_strategy_name": trade_strategy_name,
-            },
+            }, account),
             account_id=account_id,
         ) or {}
         result = dict(data) if isinstance(data, dict) else {}
@@ -5090,7 +5121,7 @@ class BigQmtXtTrader:
         user_order_id = str(order_remark or "").strip()
         if not user_order_id:
             user_order_id = "bqrpc:%s:%s" % (int(time.time() * 1000), uuid.uuid4().hex[:10])
-        payload = {
+        payload = _with_account_type({
             "account_id": account_id,
             "stock_code": stock_code,
             "order_type": order_type,
@@ -5099,7 +5130,7 @@ class BigQmtXtTrader:
             "price": price,
             "strategy_name": strategy_name,
             "order_remark": user_order_id,
-        }
+        }, account)
         if not wait_settlement:
             payload["wait_settlement"] = False
         tracked = getattr(self.client, "call_tracked", None)
@@ -5372,8 +5403,10 @@ class BigQmtXtTrader:
         for job in jobs:
             seq, args, kwargs = job
             account_id = _account_id(args[0], self.client.account_id)
-            groups.setdefault(account_id, []).append(job)
-        for account_id, group in groups.items():
+            # By id AND type: one stock account's STOCK and HUGANGTONG
+            # cancels are different books on the server.
+            groups.setdefault((account_id, _account_type_param(args[0])), []).append(job)
+        for (account_id, _type), group in groups.items():
             if len(group) < self.ASYNC_CANCEL_BATCH_MIN:
                 for job in group:
                     self._submit_async_cancel_single(job)
@@ -5390,11 +5423,11 @@ class BigQmtXtTrader:
         try:
             data = self.client.call(
                 "cancel_order_stock_sysid",
-                {
+                _with_account_type({
                     "account_id": account_id,
                     "market": market,
                     "order_sysid": self._resolve_order_sys_id(order_id),
-                },
+                }, account),
                 account_id=account_id,
             ) or {}
             ok = bool(data.get("success", data))
@@ -5422,6 +5455,7 @@ class BigQmtXtTrader:
         and retrying would double-cancel -- report unknown-outcome per item
         instead."""
         payload = []
+        account = group[0][1][0] if group and group[0][1] else None
         for seq, args, kwargs in group:
             order_id = args[1] if len(args) > 1 else kwargs.get("order_id", "")
             market = args[2] if len(args) > 2 else kwargs.get("market", "")
@@ -5433,7 +5467,7 @@ class BigQmtXtTrader:
         try:
             results = self.client.call(
                 "cancel_order_stock_batch",
-                {"account_id": account_id, "items": payload},
+                _with_account_type({"account_id": account_id, "items": payload}, account),
                 account_id=account_id,
             ) or []
         except RpcServerRepliedError as exc:
@@ -5510,7 +5544,7 @@ class BigQmtXtTrader:
             entry = dict(item or {})
             entry.setdefault("account_id", account_id)
             payload.append(entry)
-        params = {"account_id": account_id, "items": payload}
+        params = _with_account_type({"account_id": account_id, "items": payload}, account)
         if timeout_seconds is None:
             timeout_seconds = max(
                 float(getattr(self.client, "timeout_seconds",
@@ -5673,8 +5707,11 @@ class BigQmtXtTrader:
         for job in jobs:
             fields = self._async_job_fields(job[1], job[2])
             account_id = _account_id(fields.get("account"), self.client.account_id)
-            groups.setdefault(account_id, []).append((job, fields))
-        for account_id, group in groups.items():
+            # By id AND type (港股通 orders on a stock account id are a
+            # different book on the server).
+            key = (account_id, _account_type_param(fields.get("account")))
+            groups.setdefault(key, []).append((job, fields))
+        for (account_id, _type), group in groups.items():
             if len(group) < self.ASYNC_BATCH_MIN:
                 for (seq, args, kwargs), _fields in group:
                     self._submit_async_single(seq, args, kwargs)
@@ -5719,7 +5756,10 @@ class BigQmtXtTrader:
             item.setdefault("signal_id", "rpc-%s" % uuid.uuid4().hex)
             payload.append(item)
         try:
-            results = self.order_stock_batch(account_id, payload,
+            # The first job's StockAccount, not the bare id: order_stock_batch
+            # sends its declared type along (港股通).
+            batch_account = (group[0][1] or {}).get("account") or account_id
+            results = self.order_stock_batch(batch_account, payload,
                                              idempotent=False) or []
         except RpcServerRepliedError as exc:
             log.warning("async batch of %d refused by the server (%s); "
@@ -6061,7 +6101,7 @@ class BigQmtXtTrader:
             entry = dict(item or {})
             entry.setdefault("account_id", account_id)
             payload.append(entry)
-        params = {"account_id": account_id, "orders": payload}
+        params = _with_account_type({"account_id": account_id, "orders": payload}, account)
         if not idempotent:
             params["idempotent"] = False
         if batch_id:
@@ -6104,7 +6144,7 @@ class BigQmtXtTrader:
         passorder without placing an order -- use it to check your mapping.
         """
         account_id = _account_id(account, self.client.account_id)
-        params = {
+        params = _with_account_type({
             "account_id": account_id,
             "op_type": op_type,
             "order_code": order_code,
@@ -6113,7 +6153,7 @@ class BigQmtXtTrader:
             "volume": volume,
             "strategy_name": strategy_name,
             "user_order_id": user_order_id,
-        }
+        }, account)
         if order_type is not None:
             params["order_type"] = order_type
         if quick_trade is not None:
@@ -6133,12 +6173,12 @@ class BigQmtXtTrader:
         account_id = _account_id(account, self.client.account_id)
         data = self.client.call(
             "cancel_order_stock_sysid",
-            {
+            _with_account_type({
                 "account_id": account_id,
                 "market": market,
                 # Send the broker's own 合同编号, not the int we derived from it.
                 "order_sysid": self._resolve_order_sys_id(order_sysid),
-            },
+            }, account),
             account_id=account_id,
         ) or {}
         return 0 if bool(data.get("success", data)) else -1
@@ -6161,7 +6201,8 @@ class BigQmtXtTrader:
     def _query_account_list(self, account, method):
         account_id = _account_id(account, self.client.account_id)
         try:
-            rows = self.client.call(method, {"account_id": account_id}, account_id=account_id) or []
+            rows = self.client.call(method, _with_account_type({"account_id": account_id}, account),
+                                    account_id=account_id) or []
         except Exception:
             return []
         # MiniQMT answers these by attribute (see CompatRow). The server
@@ -6251,7 +6292,7 @@ class BigQmtXtTrader:
                 error / callback_bound
         """
         account_id = _account_id(account, self.client.account_id)
-        params = {"account_id": account_id}
+        params = _with_account_type({"account_id": account_id}, account)
         if wait_seconds is not None:
             params["wait_seconds"] = float(wait_seconds)
         if max_age_seconds is not None:
@@ -6290,8 +6331,9 @@ class BigQmtXtTrader:
         try:
             return self.client.call(
                 "query_smt_secu_rate",
-                {"account_id": account_id, "stock_code": stock_code, "max_term": max_term,
-                 "fare_way": fare_way, "credit_type": credit_type, "trade_type": trade_type},
+                _with_account_type({"account_id": account_id, "stock_code": stock_code, "max_term": max_term,
+                                    "fare_way": fare_way, "credit_type": credit_type,
+                                    "trade_type": trade_type}, account),
                 account_id=account_id,
             ) or []
         except Exception:
@@ -6334,7 +6376,7 @@ class BigQmtXtTrader:
         try:
             data = self.client.call(
                 "get_new_purchase_limit",
-                {"account_id": account_id},
+                _with_account_type({"account_id": account_id}, account),
                 account_id=account_id,
             ) or {}
             if isinstance(data, dict):

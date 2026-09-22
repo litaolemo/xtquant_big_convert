@@ -105,7 +105,7 @@ QMT 的 python 目录（回车则写到当前目录）: D:\国金证券QMT交易
 | 问题 | 说明 |
 |---|---|
 | 资金账号 | 服务端和客户端会写同一个，对不上是「查询全空」的头号原因 |
-| 账号类型（STOCK） | STOCK / CREDIT / FUTURE / STOCK_OPTION / HUGANGTONG / SHENGANGTONG。信用账户选 CREDIT，选错查出来是整行 0 |
+| 账号类型（STOCK） | STOCK / CREDIT / FUTURE / STOCK_OPTION / HUGANGTONG / SHENGANGTONG。信用账户选 CREDIT，选错查出来是整行 0。股票户兼做港股通：生成后把 `BIGQMT_ACCOUNT_TYPE` 手工改成列表 `["STOCK", "HUGANGTONG", "SHENGANGTONG"]` |
 | 传输方式（redis） | redis 或 zmq。两边由同一组答案生成，不会一边 redis 一边 zmq |
 | Redis 地址 / 端口 / db / 用户名 / 密码 | 选 redis 才问。密码输入不回显，会写进配置文件 |
 | 允许远程下单/撤单？（否） | 打开前它会警告：任何能连上这条通道的程序都可以下单。首次部署先留 `否`，验证通过再打开 |

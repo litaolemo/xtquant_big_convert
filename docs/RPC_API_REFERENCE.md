@@ -29,7 +29,7 @@
 
 ### `ping`
 - **参数**：无
-- **返回**：`{"pong": True, "account_id": "...", "server_time": "YYYY-MM-DD HH:MM:SS"}`
+- **返回**：`{"pong": True, "account_id": "...", "account_type": "STOCK", "account_types": ["STOCK", ...], "server_time": "YYYY-MM-DD HH:MM:SS"}`——`account_types` 是这个账号可按哪些类型查（`BIGQMT_ACCOUNT_TYPE` 写成列表时不止一个，港股通）
 - **用途**：探活、确认 RPC 服务在线与归属账号。
 - **实测延迟**：Redis ~13ms（p50）。
 
@@ -366,6 +366,11 @@ FormulaServer 直连不认这个参数，带上它会强制回落到 RPC 桥（�
 ## 4. 账户 / 持仓 / 委托
 
 下列方法的 `account_id` 参数均可选（不传则用服务端配置的账号）。也接受 `account`（对象/dict）。
+
+所有交易类方法（本节、第 5 节下单撤单、第 6 节账户扩展查询）还接受可选的 `account_type`
+（`"STOCK"` / `"CREDIT"` / `"FUTURE"` / `"HUGANGTONG"` / `"SHENGANGTONG"` / ...，或 xtconstant 的数字）：
+客户端 `StockAccount(id, "HUGANGTONG")` 的类型就是这样传来的。服务端只在该账号配置允许时按它查
+（`BIGQMT_ACCOUNT_TYPE` 或 `BIGQMT_ACCOUNT_TYPE_MAP` 的值写成列表），否则按配置的默认类型答并记一次日志。
 
 ### `get_asset`
 - **别名**：`query_stock_asset`

@@ -220,6 +220,14 @@ ACCOUNT_TYPE_SOURCE = "default"
 ACCOUNT_TYPE = "STOCK"
 for _source_name, _source_value in _account_type_sources:
     if _source_value:
+        # A LIST names every type the account may be addressed as (港股通:
+        # ["STOCK", "HUGANGTONG", "SHENGANGTONG"]); the first is what this
+        # deployment trades as by default, the rest are honoured per request
+        # (account_type_map.request_account_type).
+        if isinstance(_source_value, (list, tuple)):
+            _source_value = next((v for v in _source_value if str(v or "").strip()), "")
+            if not _source_value:
+                continue
         ACCOUNT_TYPE = str(_source_value).strip().upper()
         ACCOUNT_TYPE_SOURCE = _source_name
         break
@@ -247,10 +255,20 @@ def _report_deployment():
 
 def _report_account_type():
     """Say which account type won and where it came from."""
-    print("[bigqmt_shell] account_type=%s (from %s)" % (ACCOUNT_TYPE, ACCOUNT_TYPE_SOURCE))
+    extra = ""
+    if isinstance(BIGQMT_ACCOUNT_TYPE, (list, tuple)) and len(BIGQMT_ACCOUNT_TYPE) > 1:
+        extra = " also answers as %s per request" % "/".join(
+            str(v).strip().upper() for v in BIGQMT_ACCOUNT_TYPE[1:] if str(v or "").strip())
+    print("[bigqmt_shell] account_type=%s (from %s)%s" % (ACCOUNT_TYPE, ACCOUNT_TYPE_SOURCE, extra))
+
+    def _first(value):
+        if isinstance(value, (list, tuple)):
+            value = next((v for v in value if str(v or "").strip()), "")
+        return str(value or "").strip().upper()
+
     conflicting = [
         name for name, value in _account_type_sources
-        if value and str(value).strip().upper() != ACCOUNT_TYPE
+        if _first(value) and _first(value) != ACCOUNT_TYPE
     ]
     if conflicting:
         print("[bigqmt_shell] ignored conflicting account_type from: %s"

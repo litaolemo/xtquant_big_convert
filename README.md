@@ -963,6 +963,34 @@ BIGQMT_REDIS_CONFIG = {
 - **全推行情推送到每个账号**（#315 起）。推送通道按账号命名（`bigqmt:quote_push:<账号>:<topic>`），此前只发主账号的频道，按副账号配置的客户端「订阅成功但无回调」。现在表里每个账号各发一份，客户端不用改。
 - **已实盘验证**：上面这份配置的形状就是一套实际跑着的 STOCK + FUTURE 部署，dual-channel 收发、副账号的 `account_id` 注入、副账号交易请求被主线程 drain 三条路都在实盘走通了。#171 合并时 CHANGELOG 写的"本仓库从未实跑过"已经不再成立。换券商或换账号类型组合时，仍建议先用小单验一遍副账号的下单、撤单、持仓。
 
+#### 同一个账号、几种类型：港股通（`BIGQMT_ACCOUNT_TYPE` 写成列表）
+
+港股通不是另一个账号：股票户用**同一个资金账号**做沪港通 / 深港通，但终端把那些持仓、委托、
+成交记在 `get_trade_detail_data(账号, 'HUGANGTONG' | 'SHENGANGTONG', ...)` 下，按 `'STOCK'`
+查不到。`BIGQMT_ACCOUNT_TYPE_MAP` 一个账号只能对一个类型，写不出这件事——所以类型可以是**列表**，
+第一个是默认（0.3.54 起）：
+
+```python
+BIGQMT_ACCOUNT_ID = "你的股票账号"
+BIGQMT_ACCOUNT_TYPE = ["STOCK", "HUGANGTONG", "SHENGANGTONG"]   # 方式一的表里也可以：{"账号": ["STOCK", "HUGANGTONG"]}
+```
+
+客户端照 MiniQMT 的写法，用类型不同的 `StockAccount` 分别查：
+
+```python
+acc    = StockAccount("你的股票账号")                  # A 股
+acc_hk = StockAccount("你的股票账号", "SHENGANGTONG")  # 深港通（沪港通用 "HUGANGTONG"）
+xt_trader.query_stock_positions(acc)      # STOCK 持仓
+xt_trader.query_stock_positions(acc_hk)   # 深港通持仓
+xt_trader.order_stock(acc_hk, "00700.HK", xtconstant.STOCK_BUY, 100, xtconstant.FIX_PRICE, 300.0)
+```
+
+`StockAccount` 的类型随每个交易类请求以 `account_type` 参数传到服务端；在列表里就按它查、按它结算
+（港股通委托的合同编号回填要去 HUGANGTONG 的委托列表里找），不在列表里仍按默认答并记一次日志——部署
+的配置仍然决定这个账号是什么户（#92 那条不变）。`ping` 多报 `account_types`，客户端的「类型不一致」
+告警只在声明的类型不在这张表里时才响。下单本身不用改：`passorder` 的 23/24 对 `.HK` 代码就是港股通
+买卖。撤单也带类型。**没有港股通权限或不用列表的部署，行为零变化。**
+
 #### 方式二：多策略实例（账号在不同 QMT 客户端时的唯一选择）
 
 **适用条件：每个账号登录在各自的 QMT 客户端里**（不同券商、不同机器，或同一台机器上两个安装目录）。每个客户端是一个独立进程，各自有自己的 `python` 目录，所以什么都不用"指向"——每个目录里放一份**同名**的配置文件和一份入口，各写各的账号：
@@ -1062,7 +1090,7 @@ xt_trader.cancel_order_stock(acc, order_id)   # 撤单送回的是原始字符�
 | `get_full_tick(["SH"])` | 全市场 | **默认只取股票**（1.08s）；要全部传 `types=["all"]`（7.4s，含地方债等 26744 只） |
 | `get_instrument_detail()` 查不到 | `None` | `{}`（两者都是 falsy，`if not detail` 通用） |
 | `download_history_data()` | 无返回 | 返回 `{"finished": n, "total": n}`（多给的信息，可忽略） |
-| 账户类型 | `StockAccount(id, "CREDIT")` 即可 | 还需服务端 `BIGQMT_ACCOUNT_TYPE = "CREDIT"`，**客户端的类型不会传到服务端** |
+| 账户类型 | `StockAccount(id, "CREDIT")` 即可 | 服务端 `BIGQMT_ACCOUNT_TYPE` 决定；客户端的类型会随请求传来，但只在服务端配置（可以是列表，港股通）允许时才生效 |
 | 委托类型常量 | `xtconstant.order_type` | 内部会翻译成 `passorder` 的 opType（两套编号，专项两融 40–45 → 70–75） |
 
 ### 本项目的扩展（MiniQMT 没有）

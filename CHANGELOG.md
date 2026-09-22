@@ -3,6 +3,19 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [未发布]
+
+### 新增
+
+- **港股通：同一个账号几种类型**。股票户用同一个资金账号做沪港通 / 深港通，终端把持仓、委托、成交
+  记在 `get_trade_detail_data(账号, 'HUGANGTONG' | 'SHENGANGTONG', ...)` 下；`BIGQMT_ACCOUNT_TYPE_MAP`
+  一个账号只能对一个类型，写不出来。现在 `BIGQMT_ACCOUNT_TYPE`（和表里的值）可以是**列表**，第一个
+  是默认：`["STOCK", "HUGANGTONG", "SHENGANGTONG"]`。客户端 `StockAccount(id, "HUGANGTONG")` 的类型
+  随每个交易类请求以 `account_type` 参数传到服务端，在列表里就按它查、按它结算（委托号回填去该类型的
+  委托列表找，撤单也带类型），不在列表里仍按默认答并记一次日志——部署的配置仍决定账号是什么户（#92）。
+  `ping` 多报 `account_types`，客户端的类型不一致告警只在声明的类型不在表里时才响。不用列表的部署行为
+  零变化。下单本身不用改：`passorder` 的 23/24 对 `.HK` 代码就是港股通买卖。
+
 ## [0.3.53] - 2026-09-22
 
 #351 重读走工作线程、回包由 adjust 下一拍发出，drain 模式下少占策略拍；Redis 主机不通时 adjust LPOP 超时后退避，不再把策略拍拖成 1.5 s；结算扫描进 `slow request` 日志；延迟报告改正——0.3.28 的「redis + 后台线程 3.4ms」是重启后回放窗口测的。

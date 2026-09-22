@@ -15,6 +15,13 @@ BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
 # 一行全 0 的资产，表现为「信用账户资产全是 0」而日志里毫无线索（issue #92）。
 # 也可以写在下面 BIGQMT_REDIS_CONFIG 的 "account_type" 里，两处都认；解析结果
 # 会在启动时打印，冲突也会指出来。
+#
+# 同一个账号有几种类型（港股通）就写成列表，第一个是默认：
+#     BIGQMT_ACCOUNT_TYPE = ["STOCK", "HUGANGTONG", "SHENGANGTONG"]
+# 客户端 StockAccount(id, "HUGANGTONG") 的类型会随每个交易类请求传来，在列表里
+# 就按它查（港股通的持仓/委托/成交在终端里记在 HUGANGTONG / SHENGANGTONG 下，
+# 不在 STOCK 下）；不在列表里仍按默认答，并记一次日志。下单不用改：passorder
+# 的 23/24 对 .HK 代码就是港股通买卖。
 BIGQMT_ACCOUNT_TYPE = "STOCK"
 
 BIGQMT_REDIS_CONFIG = {

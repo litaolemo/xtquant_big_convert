@@ -634,10 +634,12 @@ class CancelSettlement(object):
     """
 
     __slots__ = ("order_ref", "account_id", "result", "deadline", "attempts",
-                 "request", "response")
+                 "request", "response", "account_type")
 
-    def __init__(self, order_ref, account_id, result, deadline):
+    def __init__(self, order_ref, account_id, result, deadline, account_type=None):
         self.order_ref = order_ref
+        # The type the cancel request named (港股通), read back under it.
+        self.account_type = account_type
         self.account_id = account_id
         self.result = result
         self.deadline = deadline
@@ -783,11 +785,17 @@ class BigQmtRpcHandlers:
             handler = self._handle_query_stock_positions
         else:
             handler = getattr(self, "_handle_%s" % method, None)
-        if handler is None and method in MARKET_DATA_METHODS:
-            return self._handle_market_data_method(method, params)
-        elif handler is None:
-            raise ValueError("rpc method is not implemented: %s" % requested_method)
-        return handler(params)
+        # The account type the caller's StockAccount named, scoped to this
+        # request on this thread: a 港股通 query on a stock account id reads
+        # HUGANGTONG rows instead of STOCK ones (account_type_map).
+        from .account_type_map import request_account_type
+
+        with request_account_type(params.get("account_type")):
+            if handler is None and method in MARKET_DATA_METHODS:
+                return self._handle_market_data_method(method, params)
+            elif handler is None:
+                raise ValueError("rpc method is not implemented: %s" % requested_method)
+            return handler(params)
 
     def _handle_ping(self, params):
         return {
@@ -798,8 +806,23 @@ class BigQmtRpcHandlers:
             "version": _deployed_version(),
             "account_type": self._reported_account_type(
                 params.get("account_id") or self.account_id),
+            # Every type this account may be addressed as (港股通 on a stock
+            # account: ["STOCK", "HUGANGTONG", "SHENGANGTONG"]); the client's
+            # mismatch warning checks its StockAccount type against this list.
+            "account_types": self._reported_account_types(
+                params.get("account_id") or self.account_id),
             "server_time": _dt.datetime.now(),
         }
+
+    def _reported_account_types(self, account_id=None):
+        try:
+            from .account_type_map import account_types_for
+
+            gateway = self.order_gateway
+            default = getattr(gateway, "account_type", "") if gateway is not None else ""
+            return list(account_types_for(account_id or self.account_id, default or "STOCK"))
+        except Exception:
+            return []
 
     def _reported_account_type(self, account_id=None):
         """What this deployment will actually trade as.
@@ -2548,6 +2571,7 @@ class BigQmtRpcHandlers:
                 params.get("strategy_name")),
             remark=order_tag,
             order_type=self._forwarded_order_type(params),
+            account_type=self._configured_account_type(self._request_account_id(params)),
         )
         if request.action not in ("BUY", "SELL"):
             raise ValueError("action must be BUY or SELL")
@@ -2733,11 +2757,22 @@ class BigQmtRpcHandlers:
         MUST run on the main strategy thread -- get_trade_detail_data returns
         empty anywhere else.
 
-        ``orders_cache`` (account_id -> rows) lets one settle pass share a
-        single ORDER snapshot across every pending settlement (#303). A
-        final lookup always reads fresh: its verdict is "not in the system",
-        and that must not rest on a list fetched for someone else.
+        ``orders_cache`` ((account_id, account_type) -> rows) lets one settle
+        pass share a single ORDER snapshot across every pending settlement
+        (#303). A final lookup always reads fresh: its verdict is "not in the
+        system", and that must not rest on a list fetched for someone else.
+
+        Runs under the type the order was placed as: a 港股通 order on a stock
+        account is in the HUGANGTONG list, not the STOCK one.
         """
+        from .account_type_map import request_account_type
+
+        with request_account_type(getattr(settlement.order_request, "account_type", None)):
+            return self._apply_order_lookup_as_requested(
+                settlement, final=final, inline=inline, orders_cache=orders_cache)
+
+    def _apply_order_lookup_as_requested(self, settlement, final=False, inline=False,
+                                         orders_cache=None):
         request = settlement.order_request
         settlement.attempts += 1
         # Fast path: QMT's order_callback already pushed the answer
@@ -2781,12 +2816,13 @@ class BigQmtRpcHandlers:
                 return True
         try:
             orders = None
+            cache_key = (request.account_id, getattr(request, "account_type", None) or "")
             if orders_cache is not None and not final:
-                orders = orders_cache.get(request.account_id)
+                orders = orders_cache.get(cache_key)
             if orders is None:
                 orders = self.order_gateway.query_orders(request.account_id, "") or []
                 if orders_cache is not None:
-                    orders_cache[request.account_id] = orders
+                    orders_cache[cache_key] = orders
             by_remark = _rows_for_this_submit(
                 orders, request.remark, want_code, want_action, settlement.submitted_at)
             by_remark = [
@@ -3137,6 +3173,7 @@ class BigQmtRpcHandlers:
             account_id,
             result,
             _monotonic() + self.order_settle_timeout_seconds,
+            account_type=self._configured_account_type(account_id),
         )
         if getattr(result, "success", None) is not False:
             try:
@@ -3247,6 +3284,12 @@ class BigQmtRpcHandlers:
 
     def _apply_cancel_lookup(self, settlement, final=False):
         """Resolve an ambiguous native cancel return from the order snapshot."""
+        from .account_type_map import request_account_type
+
+        with request_account_type(getattr(settlement, "account_type", None)):
+            return self._apply_cancel_lookup_as_requested(settlement, final=final)
+
+    def _apply_cancel_lookup_as_requested(self, settlement, final=False):
         settlement.attempts += 1
         order_sys_id = str(settlement.order_ref.order_sys_id or "")
         # Fast path: the order's own status change was pushed to us by QMT's
