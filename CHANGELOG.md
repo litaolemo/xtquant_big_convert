@@ -3,7 +3,9 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
-## [未发布]
+## [0.3.53] - 2026-09-22
+
+#351 重读走工作线程、回包由 adjust 下一拍发出，drain 模式下少占策略拍；Redis 主机不通时 adjust LPOP 超时后退避，不再把策略拍拖成 1.5 s；结算扫描进 `slow request` 日志；延迟报告改正——0.3.28 的「redis + 后台线程 3.4ms」是重启后回放窗口测的。
 
 ### 新增
 
