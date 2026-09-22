@@ -383,10 +383,11 @@ QMT 终端自身的 C++ 主循环占着 GIL**,`setswitchinterval`/精简 adjust 
 |---|---|---|---|---|
 | `500nMilliSecond` | ~2.4/s | ~490 / 510ms | 极低 | 默认省电 |
 | `200nMilliSecond` | 折中 | ~200ms 量级 | 中 | **推荐平衡点** |
-| `100nMilliSecond` | ~2150/s(QMT 当"尽快跑"热循环) | ~92 / 108ms | 烧≈1 核 | 尾最低但费 CPU |
+| `100nMilliSecond` | 10/s（稳态；启动后回放窗口里几千/s 是历史 K 线回放，不是这个定时器） | ~92 / 108ms | 低 | 现默认 |
 
-**deferred 交易查询恒定 ~1s**(实测 p50 1012~1013ms,与 interval 无关)—— 瓶颈是
-`get_trade_detail_data` 自身的柜台查询开销,调 interval 无效。要低延迟拿持仓,走**客户端 redis
+**deferred 交易查询的下限是一拍，上限看 `get_trade_detail_data` 自己**：2026-09-04 实测
+p50 1012~1013ms（与 interval 无关），2026-09-22 同一终端 drain 下 103ms —— 差的是柜台查询
+自身的开销（当天委托/成交行数），调 interval 无效。要低延迟拿持仓,走**客户端 redis
 缓存**(position_sync 已在写)而非每次实时查。
 
 ### zmq 真机实测(同机 localhost)

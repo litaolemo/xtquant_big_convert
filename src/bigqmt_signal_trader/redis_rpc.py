@@ -3725,7 +3725,27 @@ class RedisPubSubRpcService:
 
         Unsettled entries go back on the queue, so each order costs one lookup
         per adjust tick until it resolves or its deadline passes.
+
+        Timed like a request (#342's slow-request log): a pass that misses the
+        callback fast path scans the terminal's ORDER list, once per pass, and
+        drain_pending runs up to three passes per tick. With #345 every
+        order_stock_async is watched for order_settle_timeout_seconds too, so
+        on a day with hundreds of orders this is the one adjust-thread cost
+        that grew, and the log is where it shows.
         """
+        pending = self._pending_settlements.qsize()
+        shadow = self._shadow_settlements.qsize()
+        if not pending and not shadow:
+            return 0
+        _t0 = time.perf_counter()
+        try:
+            return self._settle_pending_orders(max_items)
+        finally:
+            self._note_slow_request(
+                "settle_pending_orders[pending=%d shadow=%d]" % (pending, shadow),
+                time.perf_counter() - _t0)
+
+    def _settle_pending_orders(self, max_items=100):
         settled = 0
         # Snapshot the size first. Unsettled entries go back on the same queue,
         # so draining until empty would keep re-picking them and spin one adjust

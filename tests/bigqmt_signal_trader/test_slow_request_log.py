@@ -108,6 +108,62 @@ class SlowRequestLogTest(unittest.TestCase):
                                  "params": {"codes": ["600000.SH"]}})
         self.assertEqual(self._slow_lines(), [])
 
+    # -- settlement passes (#345 follow-up) --------------------------------
+    # A settle pass that misses the callback fast path scans the terminal's
+    # ORDER list, and drain_pending runs up to three passes per tick. Since
+    # #345 every order_stock_async is watched too, so on a busy account this
+    # is the adjust-thread cost that grew. It gets the same line as a slow
+    # request, with the queue sizes it was working through.
+
+    def _park(self, service, shadow=False):
+        from bigqmt_signal_trader.redis_rpc import OrderSettlement
+
+        class _Req(object):
+            account_id = "acct"
+            stock_code = "600000.SH"
+            action = "BUY"
+            remark = "tag-1"
+            strategy_name = "s"
+            order_type = 23
+            price = 10.0
+            volume = 100
+
+        settlement = OrderSettlement(_Req(), {"order_id": -1}, deadline=1e12, shadow=shadow)
+        settlement.request = {"request_id": "o1", "account_id": "acct"}
+        settlement.response = {"request_id": "o1", "account_id": "acct", "ok": False}
+        (service._shadow_settlements if shadow else service._pending_settlements).put(settlement)
+        return settlement
+
+    def test_slow_settle_pass_is_named_with_its_queue_sizes(self):
+        service = _service(FakeMarketData())
+        clock = self.clock
+
+        def slow_lookup(settlement, final=False, orders_cache=None):
+            clock.append(3.0)  # one ORDER scan "took" three seconds
+            return True
+
+        service.handlers._apply_order_lookup = slow_lookup
+        self._park(service)
+        self._park(service, shadow=True)
+        self.assertEqual(service.settle_pending_orders(), 2)
+        lines = self._slow_lines()
+        self.assertEqual(len(lines), 1, self.records)
+        self.assertIn("method=settle_pending_orders[pending=1 shadow=1]", lines[0])
+        self.assertIn("6.0s", lines[0])
+
+    def test_empty_settle_pass_costs_nothing_and_is_silent(self):
+        service = _service(FakeMarketData())
+        service.handlers._apply_order_lookup = lambda *a, **k: self.fail("no lookup on an empty pass")
+        self.assertEqual(service.settle_pending_orders(), 0)
+        self.assertEqual(self._slow_lines(), [])
+
+    def test_fast_settle_pass_is_silent(self):
+        service = _service(FakeMarketData())
+        service.handlers._apply_order_lookup = lambda settlement, final=False, orders_cache=None: True
+        self._park(service)
+        self.assertEqual(service.settle_pending_orders(), 1)
+        self.assertEqual(self._slow_lines(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

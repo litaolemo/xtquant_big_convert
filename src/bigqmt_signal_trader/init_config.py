@@ -112,9 +112,10 @@ def _background_threads_for(transport):
         query_stock_orders      33/175/200    399/493/613   4/88/105     86/102/109
 
     redis used to be the exception ("brpop wakes immediately", 3.4ms in the
-    0.3.28 table) -- but that 3.4ms was the adjust thread's LPOP stealing
-    the request, which #321 removed because it dragged heavy reads onto the
-    strategy thread. Without it redis+background is the slowest of the four.
+    0.3.28 table) -- but that table was measured right after restarting the
+    strategy, inside QMT's history replay, when adjust runs ~5000 times a
+    second and every hop is sub-millisecond. At the steady 10Hz that follows
+    the replay, redis+background is the slowest of the four (#351).
     """
     return False
 

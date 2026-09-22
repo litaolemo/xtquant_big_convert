@@ -3,6 +3,37 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [未发布]
+
+### 修复
+
+- **Redis 主机不通时，adjust 线程每拍在 LPOP 上卡满一个连接超时**。drain 模式下
+  adjust 每拍 LPOP 一次请求队列；主机宕机（不是拒绝，是没有应答）时这次 LPOP 要等满
+  `socket_connect_timeout`（1.5 s），下一拍再等一次。2026-09-17 12:53–16:25（192.168.8.13
+  不通）终端日志 `adjust cadence: ticks=7 avg=1.509s` 连续 1212 个窗口——策略自己的 `tick_app`
+  跟着从 100ms 一拍变 1.5 s 一拍，三个半小时。现在 LPOP 超时后 drain **暂停 5 s**，连续超时
+  翻倍到 30 s 封顶，第一次 LPOP 有应答就复位并记一行 `drain LPOP recovered`；暂停期间
+  `drain_request_queue` 立即返回 0，adjust 保持节奏。连接被拒绝（瞬时）仍照旧抛出。
+- **结算扫描进 `slow request` 日志**。`settle_pending_orders` 一次没命中回调快路径就扫一遍终端
+  委托列表，`drain_pending` 每拍最多三次；#345 之后每笔 `order_stock_async` 也盯 3 s，忙账户上
+  这是 adjust 线程唯一长出来的成本。超过 `slow_request_seconds` 记
+  `slow request method=settle_pending_orders[pending=N shadow=M] took X.Xs`；两个队列都空时
+  不计时、不扫描。
+
+### 文档
+
+- **延迟报告改正**（#351）。0.3.28 那张「redis + 后台线程 3.4ms / 交易查询 4ms / 195 次每秒」
+  是在**重启后的回放窗口**里测的：策略启动 QMT 先回放历史 K 线，adjust 跟着每根 K 线跑
+  （日志 `adjust cadence: ticks=51429 avg=0.000s over 10s`，每秒 5000 拍），那几十秒里任何
+  RPC 都是毫秒级；回放完 `run_time` 才是 10Hz，drain 一拍 ~100ms、后台线程每条命令一拍。
+  0.3.51 报告里「3.4ms 是 adjust 线程 LPOP 抢到的那部分、#321 关掉之后就没了」的解释是错的
+  ——9/14 起（#321 之前）后台线程回的包 `publish=` 就已经是 200–900ms。#321 真正改的是
+  0.3.46 前后台线程模式下 adjust 每拍那次 LPOP：它把后台线程等 GIL 时的请求拿到 adjust 上
+  一拍答完，体感是 ~100ms 与 500–900ms 混着来；关掉后全是 500–900ms（#351 的「变慢」），
+  drain 则全部一拍——配置里显式 `rpc_background_threads: True` 的改成 `False` 重启即可。
+  `LATENCY_REPORT.md` 方法论加「回放窗口」一条，README 撤下「10ms / 4ms / 195 次每秒」那张表
+  换成稳态四组合表，`BIG_QMT_REDIS_RPC.md` 的「100nMilliSecond 热循环 2150/s」同样是回放。
+
 ## [0.3.52] - 2026-09-22
 
 #345 终端下单前拦下的单异步也有 `on_order_error`、pipe/mysql 无推送时异步单等结算；#330 直接还款无行不报错、信用委托 `order_type` 按 `m_nOpType`；#339 `download_history_data2` 的 `data_wait_seconds` 默认 60 → 10。

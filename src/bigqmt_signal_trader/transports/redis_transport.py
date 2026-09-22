@@ -97,6 +97,13 @@ class RedisTransport(RpcTransport):
     """Redis-backed transport. Owns rpush/blpop/brpop/publish/setex."""
 
     name = "redis"
+    # After the adjust-thread LPOP times out, the drain stays off for this
+    # long, doubling on every consecutive timeout up to the cap, and resets on
+    # the first LPOP that answers. A dead Redis host costs one
+    # socket_connect_timeout (1.5s) per probe; without a pause that was one
+    # per tick (live, 2026-09-17: 3.5 hours of 1.5s ticks).
+    DRAIN_TIMEOUT_BACKOFF_SECONDS = 5.0
+    DRAIN_TIMEOUT_BACKOFF_MAX_SECONDS = 30.0
 
     def __init__(
         self,
@@ -129,6 +136,11 @@ class RedisTransport(RpcTransport):
         self._pubsub = None
         self._thread = None
         self._queue_thread = None
+        # Adjust-thread LPOP backoff after a timeout (2026-09-17 outage). Monotonic clock:
+        # this is compared against time.monotonic() on every tick.
+        self._drain_backoff_until = 0.0
+        self._drain_backoff_seconds = 0.0
+        self._drain_timeouts = 0
         # Hooks so the service can observe/intercept received payloads (debug
         # logging, inline-vs-deferred dispatch). When None, the request is
         # delivered straight to the on_request callback.
@@ -440,15 +452,33 @@ class RedisTransport(RpcTransport):
                 )
                 self._skip_adjust_queue_drain_logged = True
             return 0
+        # getattr: an instance built without __init__ (test fakes, a partial
+        # reload) has no backoff state and simply never pauses.
+        if time.monotonic() < getattr(self, "_drain_backoff_until", 0.0):
+            return 0
         processed = 0
         for _ in range(int(max_items)):
             try:
                 item = self.listen_redis.lpop(self.request_queue)
             except Exception as exc:
                 if _is_redis_timeout(exc):
-                    print("%s ERROR drain timeout on LPOP queue=%s; skip this tick" % (self.print_prefix, self.request_queue))
+                    # This LPOP just held the adjust thread for the whole
+                    # socket timeout. Pause the drain rather than pay it
+                    # again on the next tick: a Redis host that was down for
+                    # 3.5 hours (2026-09-17, 192.168.8.13) turned the
+                    # strategy's 100ms cadence into 1.5s for the duration --
+                    # "adjust cadence: ticks=7 avg=1.509s" for 1212 windows
+                    # -- and the strategy's own tick_app with it.
+                    self._note_drain_timeout()
                     break
                 raise
+            if getattr(self, "_drain_timeouts", 0):
+                print(
+                    "%s drain LPOP recovered after %d timeout(s); queue=%s"
+                    % (self.print_prefix, self._drain_timeouts, self.request_queue)
+                )
+                self._drain_timeouts = 0
+                self._drain_backoff_seconds = 0.0
             if not item:
                 break
             if self.on_raw_payload is not None:
@@ -457,6 +487,31 @@ class RedisTransport(RpcTransport):
                 self.deliver(_loads(item))
             processed += 1
         return processed
+
+    def _note_drain_timeout(self):
+        """Record an adjust-thread LPOP timeout and schedule the pause.
+
+        5s, then 10, 20, 30, 30... while the timeouts keep coming; the first
+        LPOP that answers resets it. During the pause drain_request_queue
+        returns 0 at once, so the adjust tick keeps its cadence and the
+        strategy's own work runs on time; requests wait in the Redis list
+        (or fail on the client side, which is what a dead Redis means) and
+        are picked up by the first probe that gets through.
+        """
+        self._drain_timeouts = getattr(self, "_drain_timeouts", 0) + 1
+        previous = getattr(self, "_drain_backoff_seconds", 0.0)
+        if previous <= 0:
+            self._drain_backoff_seconds = float(self.DRAIN_TIMEOUT_BACKOFF_SECONDS)
+        else:
+            self._drain_backoff_seconds = min(
+                previous * 2.0, float(self.DRAIN_TIMEOUT_BACKOFF_MAX_SECONDS))
+        self._drain_backoff_until = time.monotonic() + self._drain_backoff_seconds
+        print(
+            "%s ERROR drain timeout on LPOP queue=%s (timeout #%d); drain paused %.0fs "
+            "so the adjust tick runs on without it"
+            % (self.print_prefix, self.request_queue, self._drain_timeouts,
+               self._drain_backoff_seconds)
+        )
 
     def stop(self):
         super(RedisTransport, self).stop()
