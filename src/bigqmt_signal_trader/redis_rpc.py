@@ -383,6 +383,54 @@ MARKET_DATA_METHODS = {
 READ_METHODS |= MARKET_DATA_METHODS
 READ_METHODS |= QUOTE_SUBSCRIPTION_METHODS
 
+# Reads that are heavy whatever their arguments (#351): a financial read is
+# 0.8s hot and minutes cold (#104), formula evaluation and factor generation
+# run to completion. In the adjust drain (rpc_background_threads False) every
+# one of these runs ON the strategy thread, and a 1.8s get_market_data_ex is
+# the strategy's own tick_app stopped for 1.8s -- the reason #321 took the
+# LPOP off the adjust thread. Heavy reads instead go to one worker thread:
+# their reply pays the cross-thread GIL handoff (~1 tick per acquisition).
+#
+# What the worker buys depends on how much of the call QMT runs with the GIL
+# released. Measured live (2026-09-22, 100ms tick, each read hammered back to
+# back on the worker, 'adjust cadence' avg / max over 10s windows):
+#
+#     get_full_tick ["SH","SZ"]   read ~200ms   cadence 0.100 / 0.25-0.33s
+#     get_market_data_ex 3 x 4mo 1m  ~500ms     cadence 0.100 / 0.27-0.29s
+#     get_financial_data 10 x 3 tables ~2.1s    cadence 0.100 / ~0.5s
+#     download_history_data2 5 codes ~1.2s      cadence 0.56-0.63 / 1.3-1.5s
+#
+# The first three release the GIL for most of the read: the tick keeps its
+# average and its worst case shrinks from the whole read to a fraction. A
+# download holds the GIL for its whole duration -- the worker changes
+# nothing for the tick and adds a tick or two to the reply -- so download_*
+# stays inline. Trade-context methods (LISTENER_DEFERRED_METHODS) are never
+# in this set: get_trade_detail_data answers empty off the main thread.
+HEAVY_READ_METHODS = frozenset([
+    "get_financial_data",
+    "get_raw_financial_data",
+    "get_factor_data",
+    "gen_factor_index",
+    "call_formula",
+    "get_formula_result",
+    "get_his_option_list_batch",
+    "get_option_detail_data_batch",
+    "get_his_index_data",
+    "get_longhubang",
+])
+
+# Reads that are heavy by SIZE: one code is milliseconds, a market token or a
+# long list is seconds (get_full_tick: 0.29ms per instrument, 1.1s for "SH",
+# 7.4s for all of it; get_market_data_ex: tick period 3.9s per code, a date
+# window of 1m bars 0.3-1.4s). _heavy_by_size decides per request.
+HEAVY_READ_CODE_METHODS = frozenset([
+    "get_ticks",            # get_full_tick
+    "get_market_data",
+    "get_market_data_ex",
+    "get_local_data",
+])
+HEAVY_READ_CODES_THRESHOLD = 20
+
 
 def _maybe_scalar(value):
     item = getattr(value, "item", None)
@@ -1265,6 +1313,28 @@ class BigQmtRpcHandlers:
                 except Exception as exc:
                     sample[name] = "unknown: %s" % exc.__class__.__name__
             report["sample"] = sample
+        # #351: in the adjust drain, heavy reads go to the worker thread.
+        heavy_thread = getattr(service, "_heavy_thread", None)
+        report["background_threads"] = bool(getattr(service, "background_threads", True))
+        report["heavy_offload"] = bool(getattr(service, "heavy_offload", False))
+        report["heavy_worker_alive"] = bool(heavy_thread is not None and heavy_thread.is_alive())
+        is_heavy = getattr(service, "is_heavy_read", None)
+        if callable(is_heavy):
+            heavy_sample = {}
+            for name, params in (
+                    ("get_full_tick", {"codes": ["600000.SH"]}),
+                    ("get_full_tick[SH]", {"codes": ["SH"]}),
+                    ("get_market_data_ex[count=5]", {"stock_list": ["600000.SH"], "count": 5}),
+                    ("get_market_data_ex[tick]", {"stock_list": ["600000.SH"], "period": "tick"}),
+                    ("get_financial_data", {"stock_list": ["600000.SH"]}),
+                    ("download_history_data2", {"stock_list": ["600000.SH"]}),
+                    ("get_positions", {})):
+                try:
+                    heavy_sample[name] = ("heavy_worker" if is_heavy(name.split("[")[0], params)
+                                          else "inline")
+                except Exception as exc:
+                    heavy_sample[name] = "unknown: %s" % exc.__class__.__name__
+            report["heavy_sample"] = heavy_sample
         return report
 
     def _probe_credit_account_object(self):
@@ -3422,8 +3492,24 @@ class RedisPubSubRpcService:
         expire_margin_seconds=1.0,
         settle_interval_seconds=0.25,
         slow_request_seconds=1.0,
+        heavy_offload=True,
+        heavy_codes_threshold=HEAVY_READ_CODES_THRESHOLD,
     ):
         self.listen_redis = redis_client
+        # Heavy reads leave the adjust thread for one worker (#351). Only in
+        # the adjust drain: with background threads the receive thread already
+        # runs them off the strategy thread. See HEAVY_READ_METHODS.
+        self.heavy_offload = bool(heavy_offload)
+        self.heavy_codes_threshold = max(1, int(heavy_codes_threshold))
+        self._heavy_queue = queue.Queue()
+        # Replies the worker built. They are SENT from the adjust thread on
+        # its next tick, never from the worker: a zmq ROUTER socket and a
+        # named pipe handle are not shared between threads (the adjust thread
+        # is in recv on the same socket), and on redis a send from the worker
+        # would pay the same GIL tick the adjust send does.
+        self._heavy_replies = queue.Queue()
+        self._heavy_thread = None
+        self._heavy_count = 0
         # A handler that holds its thread longer than this logs the method
         # and the thread (#342). On the adjust thread that is the strategy
         # frozen; the drain phase logs only its total, so a 33-minute
@@ -3542,7 +3628,10 @@ class RedisPubSubRpcService:
         self._thread = getattr(self._transport, "_thread", None)
         self._queue_thread = getattr(self._transport, "_queue_thread", None)
         if not self.background_threads:
-            print("%s started queue=%s background_threads=False" % (self.print_prefix, self.request_queue))
+            self._start_heavy_worker()
+            print("%s started queue=%s background_threads=False heavy_offload=%s"
+                  % (self.print_prefix, self.request_queue,
+                     self._heavy_thread is not None))
             return
         print("%s started channel=%s queue=%s" % (self.print_prefix, self.request_channel, self.request_queue))
 
@@ -3552,10 +3641,115 @@ class RedisPubSubRpcService:
             self._transport.stop()
         except Exception:
             pass
+        heavy = self._heavy_thread
+        self._heavy_thread = None
+        if heavy is not None and heavy.is_alive():
+            heavy.join(1.0)
         # The transport owns the threads now; keep the attributes for back-compat.
         self._thread = None
         self._queue_thread = None
         self._pubsub = None
+
+    # -- heavy reads off the adjust thread (#351) -------------------------
+    def _start_heavy_worker(self):
+        if not self.heavy_offload or self._heavy_thread is not None:
+            return
+        thread = threading.Thread(
+            target=self._heavy_loop, name="bigqmt-rpc-heavy", daemon=True)
+        thread.start()
+        self._heavy_thread = thread
+
+    def _heavy_loop(self):
+        while self._running.is_set():
+            try:
+                request = self._heavy_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                self.process_request(request)
+            except Exception:
+                print("%s heavy worker failed:\n%s" % (self.print_prefix, traceback.format_exc()))
+
+    def _on_heavy_worker(self):
+        thread = self._heavy_thread
+        return thread is not None and threading.current_thread() is thread
+
+    def _should_offload(self, payload):
+        """Heavy read, and there is a worker to take it."""
+        thread = self._heavy_thread
+        if thread is None or not thread.is_alive():
+            return False
+        method = str((payload or {}).get("method") or "")
+        return self.is_heavy_read(method, (payload or {}).get("params"))
+
+    def is_heavy_read(self, method, params=None):
+        canonical = self._canonical(method)
+        if canonical in LISTENER_DEFERRED_METHODS or canonical in ORDER_METHODS:
+            return False
+        if canonical in HEAVY_READ_METHODS:
+            return True
+        if canonical in HEAVY_READ_CODE_METHODS:
+            return self._heavy_by_size(canonical, params)
+        return False
+
+    def _heavy_by_size(self, canonical, params):
+        params = params if isinstance(params, dict) else {}
+        codes = params.get("stock_list")
+        if codes is None:
+            codes = params.get("codes")
+        if codes is None:
+            codes = params.get("stock_code", params.get("code"))
+        if isinstance(codes, str):
+            codes = [codes]
+        try:
+            codes = list(codes or [])
+        except TypeError:
+            codes = []
+        if len(codes) > self.heavy_codes_threshold:
+            return True
+        # A market token ("SH", "SZ", "SHO"...) is thousands of instruments.
+        for code in codes:
+            if isinstance(code, str) and code and "." not in code:
+                return True
+        if canonical == "get_ticks":
+            # types= only makes sense with a token; a caller who passes it
+            # wants the market.
+            return bool(params.get("types"))
+        period = str(params.get("period") or "").lower()
+        if period in ("tick", "l2quote", "l2order", "l2transaction"):
+            return True
+        # A date window (count -1 with a start) instead of the last N bars.
+        try:
+            count = int(params.get("count", -1))
+        except (TypeError, ValueError):
+            count = -1
+        if count < 0 and (params.get("start_time") or params.get("end_time")):
+            return True
+        return False
+
+    def heavy_queue_depth(self):
+        return self._heavy_queue.qsize()
+
+    def flush_heavy_replies(self, max_items=100):
+        """Send the worker's finished replies. Adjust thread."""
+        sent = 0
+        for _ in range(int(max_items)):
+            try:
+                request, response = self._heavy_replies.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                self._publish_response(request, response)
+            except Exception:
+                try:
+                    from .logging_setup import get_logger
+                    get_logger("rpc").error(
+                        "publish heavy reply failed method=%s:\n%s",
+                        (request or {}).get("method"), traceback.format_exc())
+                except Exception:
+                    pass
+            sent += 1
+        return sent
 
     def _listen_loop(self):
         while self._running.is_set():
@@ -3626,6 +3820,13 @@ class RedisPubSubRpcService:
         # Server clock, at receipt. The age the request reaches when the
         # adjust thread finally picks it up is measured from here.
         payload.setdefault("_received_at", time.time())
+        if self._should_offload(payload):
+            self._heavy_count += 1
+            if self._heavy_count <= self.debug_log_limit:
+                print("%s heavy read -> worker method=%s queued=%s"
+                      % (self.print_prefix, payload.get("method"), self._heavy_queue.qsize()))
+            self._heavy_queue.put(payload)
+            return
         if self._should_process_in_listener(payload):
             self.process_request(payload)
             return
@@ -3854,6 +4055,9 @@ class RedisPubSubRpcService:
         Every ``settle_interval_seconds`` of work the batch pauses to settle
         and reply, so early orders answer while later ones still run.
         """
+        # Replies the heavy worker finished since last tick go out first:
+        # they are already late by the read itself.
+        self.flush_heavy_replies()
         # Settle carry-overs from earlier ticks before taking on new work.
         self.settle_pending_orders()
         processed = 0
@@ -4191,6 +4395,12 @@ class RedisPubSubRpcService:
         return template.format(account_id=account_id, request_id=request_id)
 
     def _publish_response(self, request, response):
+        if self._on_heavy_worker():
+            # Built on the worker, sent by the adjust thread (see
+            # _heavy_replies). Every publish the worker reaches -- the normal
+            # reply, a RequestExpired refusal -- parks here.
+            self._heavy_replies.put((request, response))
+            return
         # Delegate to the transport (RedisTransport fans out to key/list/channel;
         # ZMQ/MySQL transports use their native reply path).
         self._transport.send_response(request, response)

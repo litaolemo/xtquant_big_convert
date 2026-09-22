@@ -602,6 +602,21 @@ K 线，adjust 跟着每根 K 线跑（日志 `adjust cadence: ticks=51429 ... o
 **旧配置里显式写着 `True` 的不会自动切，改成 `False` 重启一次。**
 自己测延迟先看日志 cadence 回到 `ticks=100` 再测。
 
+**重读少占策略拍（0.3.53，#351）。** drain 把所有请求放到 adjust 线程上跑，一次 1.8s 的
+`get_market_data_ex` 就是你策略自己的 `tick_app` 停 1.8s——这正是 #321 当初把 LPOP 从 adjust
+上拿掉的原因。现在重的读请求交给一条工作线程，回包由 adjust 在下一拍发出：按方法
+（`get_financial_data`、`call_formula` 等）或按大小（市场令牌的 `get_full_tick`、超过 20 个代码、
+`period="tick"`、按日期窗口取 K 线）判定。重读往返多付 1~2 拍；单只 `get_full_tick`、最近 N 根
+K 线这类轻读和所有交易查询照旧一拍。
+实测（2026-09-22，100ms 拍，每种读在工作线程上连打，看终端 `adjust cadence` 的 avg / max）：
+全市场 `get_full_tick(["SH","SZ"])` 读本身 ~200ms，拍 0.100 / 0.25–0.33s；三只 4 个月 1m 窗口
+~500ms，拍 0.100 / 0.27–0.29s；`get_financial_data` 10 只 3 表 ~2.1s，拍 0.100 / ~0.5s——QMT 的
+C 接口大部分时间放 GIL，拍的均值不变、最坏从整段读缩到一段。`download_history_data2` 5 只 ~1.2s
+整段持 GIL，拍 0.56–0.63 / 1.3–1.5s，工作线程帮不上、回包还多付一两拍，所以 `download_*` 不列入，
+照旧 adjust 线程。
+`rpc_heavy_offload: False` 关掉，`rpc_heavy_codes_threshold` 调阈值；`probe_capabilities` 的
+`thread_routing.heavy_sample` 报每类走哪边。
+
 传输本身的取舍：redis 跨机、回报有 stream 短时回放、下载任务和全市场快照缓存都在；
 zmq 同机免 Redis；pipe 白名单拒 socket 时唯一可用（跨机 ❌）；mysql 兼容兜底；shm 预留。
 **pipe / mysql 没有推送通道**：`on_stock_order` / `on_stock_trade` / `on_order_error` 一条都到不了

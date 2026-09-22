@@ -64,6 +64,18 @@ BIGQMT_REDIS_CONFIG = {
     # RPC requests (#303). Unset = one adjust interval, never under 0.5s;
     # what does not fit waits for the next tick. 0 disables the bound.
     # "drain_budget_seconds": 0.5,
+    # Heavy reads leave the adjust thread for one worker thread in drain mode
+    # (#351): financial data, formulas, and by size a market-token
+    # get_full_tick, > rpc_heavy_codes_threshold codes, tick period or a date
+    # window in get_market_data_ex. QMT releases the GIL for most of those
+    # reads, so the tick keeps its 100ms average and its worst case shrinks
+    # from the whole read to a fraction (measured: 200ms full-market
+    # get_full_tick -> tick max 0.25-0.33s; 2.1s get_financial_data -> ~0.5s).
+    # Their reply pays 1-2 ticks instead of one. download_* holds the GIL for
+    # the whole call and stays inline; light reads and every trade query stay
+    # on the adjust thread as before.
+    # "rpc_heavy_offload": True,
+    # "rpc_heavy_codes_threshold": 20,
     # The default mode calls get_full_tick through RPC. Enable this cache only
     # if full-market payloads are too large for your latency/CPU budget.
     # When a client calls get_full_tick, it renews demand for 10 seconds.

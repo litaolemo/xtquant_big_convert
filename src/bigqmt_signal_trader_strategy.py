@@ -827,6 +827,10 @@ def _build_rpc_service(context_info, app, config):
         background_threads=background_threads,
         debug_log_limit=int(rpc_config.get("debug_log_limit", 5)),
         transport=transport,
+        # Heavy reads off the adjust thread in drain mode (#351); the runtime
+        # forwards rpc_heavy_offload / rpc_heavy_codes_threshold.
+        heavy_offload=_config_bool(rpc_config.get("heavy_offload"), True),
+        heavy_codes_threshold=int(rpc_config.get("heavy_codes_threshold", 20) or 20),
     )
     # Multi-account: when BIGQMT_ACCOUNT_TYPE_MAP has multiple entries,
     # build one RPC service per account sharing the same handlers.

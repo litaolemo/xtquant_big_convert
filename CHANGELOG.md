@@ -5,6 +5,28 @@
 
 ## [未发布]
 
+### 新增
+
+- **重读走工作线程，少占策略拍**（#351）。drain 模式（0.3.51 起默认）把所有请求放到 adjust
+  线程上跑，一次 1.8 s 的 `get_market_data_ex` 就是策略自己的 `tick_app` 停 1.8 s——这正是
+  #321 当初把 LPOP 从 adjust 上拿掉的原因，也是它顺带丢掉一拍回包的代价。现在按方法
+  （`get_financial_data` / `get_raw_financial_data`、`call_formula` / `gen_factor_index` 等 10 个）
+  或按大小（市场令牌的 `get_full_tick`、`types=`、超过 `rpc_heavy_codes_threshold`=20 个代码、
+  `period="tick"`、`count=-1` 带日期窗口）判定为重的读请求交给一条 `bigqmt-rpc-heavy` 线程，
+  回包由 adjust 线程在下一拍发出（zmq ROUTER / 管道句柄不能跨线程，redis 从工作线程发也要付
+  同一拍）。重读往返多付 1~2 拍；单只 `get_full_tick`、最近 N 根 K 线这类轻读和所有交易查询
+  （`LISTENER_DEFERRED_METHODS`）照旧一拍、照旧在 adjust 线程。过期拒绝（#303）在工作线程上
+  照常判、照常回。
+  实测（2026-09-22，100ms 拍，每种读在工作线程上连打，看终端 `adjust cadence` 的 avg / max）：
+  全市场 `get_full_tick(["SH","SZ"])` 读本身 ~200ms，拍 0.100 / 0.25–0.33s；三只 4 个月 1m 窗口
+  ~500ms，拍 0.100 / 0.27–0.29s；`get_financial_data` 10 只 3 表 ~2.1s，拍 0.100 / ~0.5s——QMT 的
+  C 接口大部分时间放 GIL，拍的均值不变、最坏从整段读缩到一段。`download_history_data2` 5 只 ~1.2s
+  整段持 GIL，拍 0.56–0.63 / 1.3–1.5s，工作线程帮不上、回包还多付一两拍，所以 `download_*` 不列入，
+  照旧 adjust 线程。
+  `rpc_heavy_offload: False` 回到 0.3.52 行为；后台线程模式下没有这条线程。`probe_capabilities`
+  的 `thread_routing` 多报 `background_threads` / `heavy_offload` / `heavy_worker_alive` /
+  `heavy_sample`。
+
 ### 修复
 
 - **Redis 主机不通时，adjust 线程每拍在 LPOP 上卡满一个连接超时**。drain 模式下
