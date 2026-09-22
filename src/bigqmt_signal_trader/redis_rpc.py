@@ -3336,8 +3336,14 @@ class RedisPubSubRpcService:
         transport=None,
         expire_margin_seconds=1.0,
         settle_interval_seconds=0.25,
+        slow_request_seconds=1.0,
     ):
         self.listen_redis = redis_client
+        # A handler that holds its thread longer than this logs the method
+        # and the thread (#342). On the adjust thread that is the strategy
+        # frozen; the drain phase logs only its total, so a 33-minute
+        # ``[adjust_phase] drain`` never said which request it was inside.
+        self.slow_request_seconds = float(slow_request_seconds)
         # A request past the client's own deadline is not dispatched (#303).
         # The client states its wait in the envelope; the server measures the
         # age from the moment it received the request, so no clock is shared.
@@ -3928,12 +3934,15 @@ class RedisPubSubRpcService:
         try:
             if self.account_id and account_id and account_id != self.account_id:
                 raise PermissionError("account_id mismatch")
-            _t0 = time.perf_counter() if method == "ping" else 0.0
-            if method == "get_request_outcome":
-                result = self._request_outcome(request.get("params") or {}, account_id)
-            else:
-                result = self.handlers.handle(method, request.get("params") or {})
-            _t1 = time.perf_counter() if method == "ping" else 0.0
+            _t0 = time.perf_counter()
+            try:
+                if method == "get_request_outcome":
+                    result = self._request_outcome(request.get("params") or {}, account_id)
+                else:
+                    result = self.handlers.handle(method, request.get("params") or {})
+            finally:
+                _t1 = time.perf_counter()
+                self._note_slow_request(method, _t1 - _t0)
             response["data"] = to_jsonable(result)
             response["ok"] = True
             # Surface server-side diagnostics when the handler recorded one.
@@ -3992,6 +4001,32 @@ class RedisPubSubRpcService:
         if self._processed_count <= self.debug_log_limit:
             print("%s responded method=%s ok=%s" % (self.print_prefix, method, response["ok"]))
         return response
+
+    def _note_slow_request(self, method, seconds):
+        """Name a handler that held its thread for ``slow_request_seconds``.
+
+        Logged after the handler returns (or raises), so it cannot add GIL
+        wait to a request that was fast. Never raises: this runs on the
+        adjust thread too, where an exception stops the strategy.
+        """
+        try:
+            threshold = float(self.slow_request_seconds)
+        except Exception:
+            threshold = 1.0
+        if threshold <= 0 or seconds < threshold:
+            return
+        try:
+            thread_name = threading.current_thread().name
+        except Exception:
+            thread_name = "?"
+        try:
+            from .logging_setup import get_logger
+            get_logger("rpc").warning(
+                "slow request method=%s took %.1fs thread=%s (#342: this is "
+                "what an [adjust_phase] drain of the same size was inside)",
+                method, seconds, thread_name)
+        except Exception:
+            pass
 
     def _format_response_target(self, template, account_id, request_id):
         if not template:

@@ -3,6 +3,26 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [未发布]
+
+### 修复
+
+- **Redis 回包合成一次往返、只写一个客户端**（#343，@jiema）。`send_response` 原来对回包
+  依次做 SETEX + RPUSH + EXPIRE + PUBLISH，而且在响应客户端和监听客户端上**各做一遍**——
+  8 次往返。`rpc_background_threads=True` 时回包在后台监听线程上发，每次 Redis 命令放掉 GIL
+  再从 QMT 主线程手里抢回来约一个 adjust tick（#104），8 次就是半秒多。本机终端 0.3.50 实测：
+  `ping breakdown handle=0.0ms ... publish=500-700ms`，所有走监听线程的读请求端到端 0.5-0.8s，
+  而走 adjust 线程的 deferred 查询同一时刻 7ms。现在一条 pipeline 一次往返，第二个客户端只在
+  第一个抛错时兜底（两个客户端连的是同一个 Redis，之前的第二份写入是重复，不是冗余——回包
+  列表里还会多留一份到 TTL）。用终端自带的 redis-py 3.5.3 对着实盘 Redis 验证过 key / list /
+  channel 三处都到、列表恰好一项。**这只是把 8 次交接压成 1 次，不是回到 0.3.45 的 adjust
+  LPOP 抢队列（#321 关掉的那条路才是 3ms 那档），#343 的根因讨论在 issue 里。**
+  服务端改动，需部署 + 重启策略后实盘复测。
+- **单个请求把线程占住超过 1 秒时记一行 `slow request method=... took ...s thread=...`**（#342）。
+  `[adjust_phase] drain 2016488ms`（33 分钟）以及本机 2026-09-16 的 `drain 3540677ms`（59 分钟）
+  只记了阶段总耗时，没记是哪个请求把 adjust 线程冻住的。阈值 `slow_request_seconds` 默认 1.0，
+  在 handler 返回后才记，不给快请求加 GIL 等待。服务端改动，需部署后才生效。
+
 ## [0.3.50] - 2026-09-21
 
 ### 修复

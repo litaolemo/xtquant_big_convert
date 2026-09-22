@@ -289,12 +289,86 @@ class RedisTransport(RpcTransport):
             self.response_channel_template, account_id, request_id
         )
         response_list = request.get("reply_list")
+        if self._send_response_pipelined(
+                response_key, response_list, response_channel, ttl_seconds, payload):
+            return
         if response_key:
             self._write_response_key(response_key, ttl_seconds, payload)
         if response_list:
             self._push_response_list(response_list, ttl_seconds, payload)
         if response_channel:
             self._publish_response_channel(response_channel, payload)
+
+    def _send_response_pipelined(self, response_key, response_list, response_channel,
+                                 ttl_seconds, payload):
+        """The whole reply in ONE round trip, on ONE client (#343).
+
+        Every Redis command issued from the background listener thread lets
+        go of the GIL for the socket and then has to win it back from QMT's
+        main thread, and that costs about one adjust tick each (#104). The
+        per-command path below is SETEX + RPUSH + EXPIRE + PUBLISH -- and it
+        ran on the response client AND the listen client, so eight round
+        trips and eight re-acquisitions per reply. On the live terminal
+        (0.3.50, redis, rpc_background_threads=True, 100nMilliSecond) that
+        read as ``ping breakdown handle=0.0ms ... publish=500-700ms``: the
+        handler was free, the reply was the round trip.
+
+        The second client was never a second recipient -- it is the same
+        Redis -- so it is a fallback here, tried only when the first one
+        raises. Returns False when no client offers a pipeline (the older
+        test fakes), and the per-command path takes over unchanged.
+        """
+        clients = self._response_clients()
+        first_error = None
+        attempted = False
+        for client in clients:
+            pipeline_factory = getattr(client, "pipeline", None)
+            if not callable(pipeline_factory):
+                continue
+            try:
+                pipe = pipeline_factory(transaction=False)
+            except TypeError:
+                pipe = pipeline_factory()
+            if not callable(getattr(pipe, "execute", None)):
+                continue
+            attempted = True
+            try:
+                publish_index = None
+                queued = 0
+                if response_key:
+                    if ttl_seconds > 0:
+                        pipe.setex(response_key, ttl_seconds, payload)
+                    else:
+                        pipe.set(response_key, payload)
+                    queued += 1
+                if response_list:
+                    pipe.rpush(response_list, payload)
+                    queued += 1
+                    if ttl_seconds > 0:
+                        pipe.expire(response_list, ttl_seconds)
+                        queued += 1
+                if response_channel:
+                    pipe.publish(response_channel, payload)
+                    publish_index = queued
+                    queued += 1
+                results = pipe.execute() if queued else []
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+                continue
+            if response_channel:
+                receivers = 0
+                try:
+                    receivers = int(results[publish_index] or 0)
+                except Exception:
+                    pass
+                self._published_count += 1
+                if self._published_count <= self.debug_log_limit:
+                    print("%s published response receivers=%s" % (self.print_prefix, receivers))
+            return True
+        if not attempted:
+            return False
+        raise first_error
 
     def _write_response_key(self, response_key, ttl_seconds, payload):
         first_error = None
