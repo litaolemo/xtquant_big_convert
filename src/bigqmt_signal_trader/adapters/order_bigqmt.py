@@ -783,6 +783,8 @@ class BigQmtOrderGateway:
                                                  "secu_account"), "") or ""),
                     offset_flag=_attr(row, ("m_nOffsetFlag", "offset_flag")),
                     direction=_attr(row, ("m_nDirection", "direction")),
+                    # the terminal's own opType, for the client's order_type (#330)
+                    op_type=_attr(row, ("m_nOpType", "op_type")),
                 )
             )
         return result
@@ -856,6 +858,8 @@ class BigQmtOrderGateway:
                         row, ("m_dComssion", "m_dCommission", "commission")),
                     offset_flag=_attr(row, ("m_nOffsetFlag", "offset_flag")),
                     direction=_attr(row, ("m_nDirection", "direction")),
+                    # the terminal's own opType, for the client's order_type (#330)
+                    op_type=_attr(row, ("m_nOpType", "op_type")),
                 )
             )
         return result

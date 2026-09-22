@@ -3,6 +3,29 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [未发布]
+
+### 修复
+
+- **终端在下单前拦下的单（资金不足弹窗）异步下单收不到任何回调**（#345 @shyond，单文件 + 管道）。
+  这种拒绝发生在 `passorder` 之前，终端不建委托记录、不发回调；同步 `order_stock` 靠结算到期
+  查不到报 `server_error`，`order_stock_async`（`wait_settlement=False`）答完就没人管了。现在异步
+  单在回复之后仍挂一份**影子结算**，到期委托列表里没有就推 `order_error`（`source="settlement"`，
+  `error_msg` 是那条 not-found 说明），`on_order_error` 能收到；批量下单每一项各挂一份，回复不被
+  拖住。`not found in system` 的文案在运行模式之后补上「终端在建记录前拒绝：资金/仓位、价格、
+  权限，屏幕上有弹窗」。
+- **pipe / mysql 没有推送通道，回报一条都到不了**（同 #345）。之前 README 没写；这两种传输下客户端
+  `order_stock_async` 改为等服务端结算再回（worker 线程等，调用方不阻塞），`server_error` 走
+  `on_order_error`。README 传输段写明。
+- **部分归还融资成功却报 `order not found in system`**（#330 复测）。直接还款在委托列表里没有带
+  备注的行，结算到期查不到。现在 32/45 到期查不到不算失败：无编号、无 `server_error`，
+  `order_stock` 返回 -1 不抛，`message` 提示用 `query_credit_detail` 核对。
+- **`query_stock_orders` / `query_stock_trades` 把融资买入（27）报成 23**（#330）。`order_type`
+  此前从 BUY/SELL 反推。现在快照带终端的 `m_nOpType`，客户端按信用族反查 MiniQMT 常量：27-32 同号，
+  33/34 担保品买卖 → `CREDIT_BUY`/`CREDIT_SELL`（23/24），70-75 专项 → 40-45，80-83 转债透传；
+  没有 `op_type` 的旧服务端照旧。
+
+
 ## [0.3.51] - 2026-09-22
 
 #343 / #342 的延迟：`rpc_background_threads` 默认改为 `False`（adjust drain，所有传输一律，实盘四种组合对照见 README「可插拔传输层」）；Redis 回包合成一次往返；超 1 秒的请求记 `slow request` 日志。**已有部署把配置里的 `True` 改成 `False` 后重启策略。**

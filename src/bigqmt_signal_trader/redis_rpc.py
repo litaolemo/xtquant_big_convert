@@ -548,9 +548,9 @@ class OrderSettlement(object):
     """
 
     __slots__ = ("order_request", "result", "deadline", "attempts", "server_error",
-                 "request", "response", "submitted_at")
+                 "request", "response", "submitted_at", "shadow")
 
-    def __init__(self, order_request, result, deadline, submitted_at=None):
+    def __init__(self, order_request, result, deadline, submitted_at=None, shadow=False):
         self.order_request = order_request
         self.result = result
         self.deadline = deadline
@@ -558,6 +558,14 @@ class OrderSettlement(object):
         self.server_error = ""
         self.request = None
         self.response = None
+        # A shadow settlement (#345) belongs to an order whose reply already
+        # went out (order_stock_async, wait_settlement=False). It is not
+        # answered; it only watches for the order to show up, and when the
+        # deadline passes without it, pushes an order_error so the caller's
+        # on_order_error fires for a refusal the terminal made before creating
+        # any order record (insufficient funds: a dialog on the QMT screen,
+        # no callback, nothing on the wire).
+        self.shadow = bool(shadow)
         # Wall-clock instant taken BEFORE passorder ran (#299). Anything the
         # lookup finds that was recorded before this instant -- a watch-table
         # entry, an order row -- belongs to an earlier order that happened to
@@ -2532,6 +2540,17 @@ class BigQmtRpcHandlers:
         # post-submit "did it land?" check is skipped, and a silent rejection
         # surfaces as the absence of that push rather than as server_error.
         if not _bool_value(params.get("wait_settlement"), True):
+            # Reply now, but keep watching (#345): a refusal before any order
+            # record exists is otherwise invisible to an async caller. Kept
+            # apart from the single reply slot, so a batch (#181) can shadow
+            # every item and the reply is never held.
+            if not self.settle_orders_inline:
+                shadows = getattr(self, "_pending_shadow_settlements", None)
+                if shadows is None:
+                    shadows = self._pending_shadow_settlements = []
+                shadows.append(OrderSettlement(
+                    request, result, _monotonic() + self.order_settle_timeout_seconds,
+                    submitted_at=submitted_at, shadow=True))
             return result
 
         if self.settle_orders_inline:
@@ -2554,6 +2573,52 @@ class BigQmtRpcHandlers:
             submitted_at=submitted_at,
         )
         return result
+
+    def _exec_event_sink(self):
+        """Where an exec event this handler emits goes: redis, else the quote
+        push channel, else None."""
+        redis_client = self._identity_redis()
+        if redis_client is not None:
+            return redis_client
+        manager = getattr(self, "quote_subscription_manager", None)
+        publisher = getattr(manager, "_on_push_publisher", None)
+        if callable(publisher):
+            class _PushSink(object):
+                def publish(self_, topic, data):
+                    return publisher(topic, data)
+            return _PushSink()
+        return None
+
+    def publish_order_error(self, request, error_msg):
+        """Push on_order_error for an order refused before any record (#345)."""
+        sink = self._exec_event_sink()
+        if sink is None:
+            return False
+        from .exec_events import publish_exec_event
+
+        event = {
+            "event_type": "order_error",
+            "account_id": str(request.account_id or ""),
+            "stock_code": str(request.stock_code or ""),
+            "order_sys_id": "",
+            "error_id": -1,
+            "status": 57,
+            "order_remark": str(request.remark or ""),
+            "user_order_id": str(request.remark or ""),
+            "strategy_name": str(request.strategy_name or ""),
+            "error_msg": str(error_msg or ""),
+            "source": "settlement",
+            "created_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "created_at_ts": time.time(),
+        }
+        publish_exec_event(sink, event["account_id"], event)
+        return True
+
+    def take_shadow_settlements(self):
+        """Pop the shadow settlements the last request registered (#345)."""
+        shadows = getattr(self, "_pending_shadow_settlements", None) or []
+        self._pending_shadow_settlements = []
+        return shadows
 
     def take_pending_settlement(self):
         """Pop the settlement the last submit_order registered, if any."""
@@ -2694,6 +2759,23 @@ class BigQmtRpcHandlers:
                 # Not there yet. QMT assigns the id asynchronously, so an early
                 # miss is normal -- only a miss at the deadline is a real one.
                 return False
+            if _is_cash_repay_order_type(getattr(request, "order_type", None)):
+                # 直接还款 (#330): the repayment went through and no row with
+                # this remark ever showed in the ORDER list (a partial repay
+                # measured live: 100 of 1000 repaid, then "not found in
+                # system" raised at the caller). A cash repayment is not a
+                # securities order; the terminal keeps no order record the
+                # bridge can settle against. No id, no error: order_stock
+                # answers -1 without raising, and the caller verifies via
+                # query_credit_detail.
+                try:
+                    settlement.result.message = (
+                        "直接还款 submitted; the terminal keeps no order row for a "
+                        "cash repayment, so no order_sys_id -- verify with "
+                        "query_credit_detail")
+                except Exception:
+                    pass
+                return True
             # Deadline reached with no remark match -> not in the system. Do NOT
             # fall back to matching stock_code+action: order_tag is a unique id
             # we generated, so a miss is always a real miss, while an unrelated
@@ -2715,7 +2797,10 @@ class BigQmtRpcHandlers:
                 "internally and never reaches the broker -- switch it to 实盘 "
                 "(a simulated account stays simulated). The editor window and "
                 "backtest/signal modes place no real order either. If the mode "
-                "is already 实盘, then check price range and permissions."
+                "is already 实盘, the terminal refused the order BEFORE creating "
+                "a record -- insufficient funds/position, price range, "
+                "permissions: it shows a dialog on the QMT screen and fires no "
+                "callback, so this reply is the only signal (#345)."
                 % (request.stock_code, request.action, request.price,
                    request.volume, settlement.attempts)
             )
@@ -3386,6 +3471,10 @@ class RedisPubSubRpcService:
         # Unbounded on purpose: every entry represents a live broker operation,
         # so dropping one would strand it with no reply.
         self._pending_settlements = queue.Queue()
+        # Async orders already answered, still watched for a pre-record
+        # refusal (#345). Separate from the reply queue so
+        # pending_settlement_count keeps meaning "replies waiting".
+        self._shadow_settlements = queue.Queue()
         self._running = threading.Event()
         self._thread = None
         self._queue_thread = None
@@ -3684,10 +3773,54 @@ class RedisPubSubRpcService:
             except Exception:
                 pass
             settled += 1
+        settled += self._settle_shadow_orders(orders_cache, max_items)
         return settled
+
+    def _settle_shadow_orders(self, orders_cache, max_items=100):
+        """Watch already-answered async orders; push order_error on a refusal (#345)."""
+        settled = 0
+        batch = min(int(max_items), self._shadow_settlements.qsize())
+        for _ in range(batch):
+            try:
+                settlement = self._shadow_settlements.get_nowait()
+            except queue.Empty:
+                break
+            expired = _monotonic() >= settlement.deadline
+            try:
+                done = self.handlers._apply_order_lookup(
+                    settlement, final=expired, orders_cache=orders_cache)
+            except Exception:
+                done = True
+            if not done:
+                self._shadow_settlements.put(settlement)
+                continue
+            if getattr(settlement, "server_error", ""):
+                self._push_shadow_order_error(settlement)
+            settled += 1
+        return settled
+
+    def shadow_settlement_count(self):
+        return self._shadow_settlements.qsize()
 
     def pending_settlement_count(self):
         return self._pending_settlements.qsize()
+
+    def _push_shadow_order_error(self, settlement):
+        """order_error for an async order the terminal never recorded (#345).
+
+        Same channels the 废单 callback path uses: the redis exec-event
+        channels when there is a redis client, else the quote push channel's
+        exec:* topic. A deployment with neither (pipe / mysql) cannot carry
+        it -- the client falls back to a synchronous settlement there.
+        """
+        request = settlement.order_request
+        publish = getattr(self.handlers, "publish_order_error", None)
+        if not callable(publish):
+            return
+        try:
+            publish(request, str(settlement.server_error or ""))
+        except Exception as exc:
+            print("%s shadow order_error push failed: %s" % (self.print_prefix, exc))
 
     def drain_pending(self, max_items=20, budget_seconds=None):
         """Run queued requests on the adjust thread, then settle.
@@ -3953,6 +4086,10 @@ class RedisPubSubRpcService:
             # a falsey native cancel may still be awaiting a reliable terminal
             # status (#148). Park either reply instead of sleeping on this
             # thread; a later adjust tick settles and publishes it (#44).
+            take_shadows = getattr(self.handlers, "take_shadow_settlements", None)
+            for shadow in (take_shadows() if callable(take_shadows) else []):
+                shadow.request = request
+                self._shadow_settlements.put(shadow)
             take = getattr(self.handlers, "take_pending_settlement", None)
             settlement = take() if callable(take) else None
             if settlement is not None:

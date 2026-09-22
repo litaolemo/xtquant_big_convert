@@ -272,7 +272,7 @@ seq = xt_trader.order_stock_async(acc, "600654.SH", 23, 100, 11, 2.95, "rpc_test
 | `on_order_stock_async_response(seq, resp)` | 异步下单提交成功 | ✅（实盘）|
 | `on_stock_order(order)` | 委托状态变化（已报 50 / 已成 56 / 废单 57）| ✅（实盘）|
 | `on_stock_trade(trade)` | 成交回报 | ✅ |
-| `on_order_error(err)` | 废单/拒单（服务端检测 status=57 推送）| ✅（实盘）|
+| `on_order_error(err)` | 废单/拒单（服务端检测 status=57 推送）；**终端在下单前就拦下的单**（资金/仓位不足、价格越界、无权限——终端弹窗、不建委托记录、没有任何回调）由服务端结算到期查不到时补推，`error_msg` 以 `passorder submitted but order not found in system` 开头，`source="settlement"`（#345 起）| ✅（实盘）/ 补推未实测 |
 | `on_cancel_error(err)` | 撤单失败 | ✅ |
 | `on_cancel_order_stock_async_response` | 异步撤单回报 | ✅ |
 
@@ -599,6 +599,9 @@ xt_trader.reload_status()            # -> {'ok': True, 'modules_purged': 28,
 
 传输本身的取舍：redis 跨机、回报有 stream 短时回放、下载任务和全市场快照缓存都在；
 zmq 同机免 Redis；pipe 白名单拒 socket 时唯一可用（跨机 ❌）；mysql 兼容兜底；shm 预留。
+**pipe / mysql 没有推送通道**：`on_stock_order` / `on_stock_trade` / `on_order_error` 一条都到不了
+（只有 redis pub/sub 和 zmq PUB 能推）。那里的 `order_stock_async` 会改成等服务端结算再回
+（调用方照样不阻塞），拒单靠 `server_error` 变成 `on_order_error`；成交要自己 `query_stock_trades`。
 
 六种渠道返回的**数据完全一致**：100 个方法逐项比对结构指纹（字段名 + 嵌套
 形状），零差异；另取 14 个方法做 sha256 全精度逐字节比对（zmq vs redis），
@@ -1667,6 +1670,7 @@ python test_all_apis.py
 | `server_error: passorder submitted but order not found in system` | 委托没进系统。最常见是 QMT 模型交易的**运行模式是「模拟」**（默认值）—— `passorder` 内部撮合，永远到不了券商 | 运行模式改**实盘** |
 | `order_gateway is not configured` | 策略 `init` 挂了 | 看启动日志找真正的异常 |
 | `直接还款 (order_type 32): the repayment amount goes in order_volume as integer yuan, price is ignored` | 归还融资把金额放在了 `price`（#330）。`passorder` 的直接还款金额走 **volume 槽**，`price` 不看 | `order_stock(acc, code, CREDIT_DIRECT_CASH_REPAY, 还款金额, FIX_PRICE, 0, ...)`，金额整数元 |
+| `server_error: passorder submitted but order not found in system`（运行模式已是实盘） | **终端在下单前拦下了**——资金/仓位不足、价格越界、无权限。终端弹窗、不建委托记录、不发任何回调，这条回复是唯一信号（#345） | 看 QMT 屏幕上的弹窗；异步下单收 `on_order_error`（`source="settlement"`） |
 | `RequestExpired: ... NOT dispatched` / `TimeoutError: ... The bridge did NOT place this order` | **并发下单撞上串行 `passorder`**（每笔 ~200ms，在 QMT 策略线程上一笔一笔跑）：轮到这单时已过你的超时，桥**拒绝而没下**（#303） | 可安全重试；降并发或加大 `timeout_seconds`。超时后客户端会自动问 `get_request_outcome`，报错里写明下了没下 |
 
 **最常见的是第一条。** 一句话确认：
