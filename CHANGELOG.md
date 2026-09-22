@@ -3,7 +3,9 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
-## [未发布]
+## [0.3.52] - 2026-09-22
+
+#345 终端下单前拦下的单异步也有 `on_order_error`、pipe/mysql 无推送时异步单等结算；#330 直接还款无行不报错、信用委托 `order_type` 按 `m_nOpType`；#339 `download_history_data2` 的 `data_wait_seconds` 默认 60 → 10。
 
 ### 修复
 
