@@ -7,6 +7,14 @@
 
 ### 修复
 
+- **`download_history_data2` 一批里有一只没数据就整批等 60 秒**（#339，@sotinyatgithub 的"每合约 12 秒"）。
+  `data_wait_seconds` 默认 60 → 10。实测（0.3.50，redis + drain）：服务端下载 0.6–1.4 s 同步返回后
+  20,726 根 1m 0.3 s 就能读到，第一次拉回为空的代码基本就是终端没有（停牌/新股/退市），等不来。
+  10 秒是几轮轮询的量。轮询里那次 `get_market_data_ex` 的 RPC 超时不再跟着这个值缩（取
+  `max(data_wait_seconds, 60)`），300 只 × 2 万根的一次回包不会被 10 秒截断。单合约 86 天 1m
+  整套 1.2–1.4 s，10 只一批 0.96 s/只——他报的 5–12 s 是 0.3.49 + `rpc_background_threads=True`
+  的账，同 #343。
+
 - **终端在下单前拦下的单（资金不足弹窗）异步下单收不到任何回调**（#345 @shyond，单文件 + 管道）。
   这种拒绝发生在 `passorder` 之前，终端不建委托记录、不发回调；同步 `order_stock` 靠结算到期
   查不到报 `server_error`，`order_stock_async`（`wait_settlement=False`）答完就没人管了。现在异步

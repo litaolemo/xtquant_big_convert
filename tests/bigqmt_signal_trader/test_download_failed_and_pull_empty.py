@@ -90,3 +90,36 @@ class FailedDownloadWithEmptyPullTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PollBudgetDefaultTest(unittest.TestCase):
+    """#339: one code with no data held its whole batch for the old 60s
+    default. The server download returns after the data landed, so a few
+    polls is the budget; the RPC timeout of a pull is not shrunk with it."""
+
+    def test_the_default_wait_is_ten_seconds(self):
+        import inspect
+        from bigqmt_signal_trader.xtquant_compat import BigQmtXtData
+        sig = inspect.signature(BigQmtXtData.download_history_data2)
+        self.assertEqual(10.0, sig.parameters["data_wait_seconds"].default)
+
+    def test_a_short_wait_does_not_shorten_the_pull_rpc_timeout(self):
+        from bigqmt_signal_trader.xtquant_compat import BigQmtXtData
+        seen = {}
+        xt = BigQmtXtData.__new__(BigQmtXtData)
+
+        class Client(object):
+            account_id = "acct"
+
+            def call(self_, method, params=None, account_id=None, timeout_seconds=None, use_formula=True, request_id=None):
+                return True
+
+        xt.client = Client()
+        xt._local_cache = lambda: object()
+        xt.get_market_data_ex = lambda **kw: seen.setdefault("timeout", kw.get("timeout_seconds")) and {}
+        xt._pull_and_cache = lambda *a, **k: {}
+        try:
+            xt.download_history_data2(["600000.SH"], "1d", data_wait_seconds=0)
+        except Exception:
+            pass
+        self.assertGreaterEqual(seen.get("timeout") or 0, 60.0)

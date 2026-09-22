@@ -3254,7 +3254,7 @@ class BigQmtXtData:
                           start_time=start_time, end_time=end_time)
         return _divid_factors_frame(data)
 
-    def download_history_data2(self, stock_list, period, start_time="", end_time="", callback=None, incrementally=None, dividend_type="none", chunk_size=None, download_timeout_seconds=180.0, data_wait_seconds=60.0):
+    def download_history_data2(self, stock_list, period, start_time="", end_time="", callback=None, incrementally=None, dividend_type="none", chunk_size=None, download_timeout_seconds=180.0, data_wait_seconds=10.0):
         """Pull bars from Big QMT over RPC and cache them locally, in batches.
 
         Mirrors xtdata.download_history_data2: after this, get_local_data(..., the
@@ -3275,6 +3275,15 @@ class BigQmtXtData:
 
         ``download_timeout_seconds`` covers the server-side download only; it is
         generous because a cold code with a wide window can take minutes.
+
+        ``data_wait_seconds`` is how long a batch keeps re-polling for codes the
+        first pull came back empty for. The server download returns after the
+        data landed (measured: 20,726 1m bars readable 0.3s after a 0.6-1.4s
+        download), so an empty first pull almost always means the terminal
+        has nothing for that code (suspended, new, delisted) and will not get
+        it by waiting. The old default of 60s made one such code hold its
+        whole batch for a minute (#339: "12s per contract" on 300 contracts).
+        10s is a few polls, enough for a terminal that lands data late.
 
         The server-side download is best-effort while the client pull can still
         save it (cache enabled), but with the local cache disabled it is the
@@ -3366,7 +3375,9 @@ class BigQmtXtData:
                     count=-1,
                     dividend_type=dividend_type,
                     fill_data=False,  # fill 会用全 0 占位行冒充数据，轮询判定必须关掉
-                    timeout_seconds=float(data_wait_seconds),
+                    # The RPC timeout for one pull is not the poll budget: a
+                    # batch of 300 codes x 20k bars is a multi-second reply.
+                    timeout_seconds=max(float(data_wait_seconds), 60.0),
                     # 等的就是刚提交的那笔下载。heal 看到「还没落地」会把它原样
                     # 再提交一遍、睡 2 秒、再读——每轮如此，等待目标被反复推后，
                     # 单票冷启动必然打满 60 秒（#275）。轮询里的读不参与 heal。
