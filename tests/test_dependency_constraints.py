@@ -26,7 +26,7 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PYPROJECT = os.path.join(ROOT, "pyproject.toml")
-README = os.path.join(ROOT, "README.md")
+README = os.path.join(ROOT, "docs", "USER_GUIDE.md")
 
 
 def _read(path):
@@ -59,14 +59,17 @@ class RedisUpperBoundTest(unittest.TestCase):
 
 
 class ReadmeDocumentsTheConstraintsTest(unittest.TestCase):
+    """详细文档 2026-09-23 起从 README 迁入 docs/USER_GUIDE.md（README 只留
+    简介与免责声明），钉的内容跟着文档走。"""
+
     def test_readme_states_the_client_python_ceiling(self):
         self.assertIn("3.13", _read(README),
-                      "README 没有写客户端 Python 的建议上限")
+                      "USER_GUIDE 没有写客户端 Python 的建议上限")
 
     def test_readme_warns_about_upgrading_redis_inside_qmt(self):
         """QMT 是 Python 3.6，redis-py 4.4 起要 3.7+，硬升会重演 #71。"""
         text = _read(README)
-        self.assertIn("#71", text, "README 没提 QMT 端升 redis 的坑（#71）")
+        self.assertIn("#71", text, "USER_GUIDE 没提 QMT 端升 redis 的坑（#71）")
 
 
 if __name__ == "__main__":

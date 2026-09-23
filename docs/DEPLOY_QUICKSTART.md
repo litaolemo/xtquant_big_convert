@@ -1,6 +1,6 @@
 # 部署快速开始（单账号）
 
-> 面向第一次部署和升级已有部署的最短路径。传输层对比、多账号、无 redis 版本的能力边界见 [README](../README.md)；排错见 README「日志与排错」。
+> 面向第一次部署和升级已有部署的最短路径。传输层对比、多账号、无 redis 版本的能力边界见 [使用指南](USER_GUIDE.md)；排错见「日志与排错」。
 
 整条链路只有三件东西：**QMT 侧的服务端**（一个策略文件加一个包，跑在 QMT 进程里）、**外部的客户端**（pip 装的包）、**中间的 Redis**（或同机 ZMQ）。部署就是把服务端放进 QMT、让两边的连接参数一致。
 
@@ -12,7 +12,7 @@
 |---|---|---|
 | `bigqmt_signal_trader` 包（客户端用的那份） | 客户端机器的 site-packages | 第 1 步 `pip install` |
 | `bigqmt_signal_trader_client_config.py` | 客户端：**和你运行的脚本同一目录** | 第 2 步 `bigqmt-init` 第二个目录问题（回车 = 当前目录） |
-| `bigqmt_signal_trader/`（整个包目录） | QMT 的 `python` 目录，如 `D:\国金证券QMT交易端\python\` | 第 3 步**你手动拷** |
+| `bigqmt_signal_trader/`（整个包目录） | QMT 的 `python` 目录，如 `D:\QMT交易端\python\` | 第 3 步**你手动拷** |
 | `bigqmt_signal_trader_strategy.py` | 同上 | 同上 |
 | `bigqmt_signal_trader_redis_rpc_runtime.py` | 同上 | 同上 |
 | `BIGQMT_REDIS_DRYRUN.py`（入口；纯 zmq 换 `BIGQMT_ZMQ_DRYRUN.py`） | 同上 | 同上 |
@@ -22,7 +22,7 @@
 
 ## 前提
 
-- 大 QMT 客户端已安装并已登录（国金/华泰等各券商版本均可）
+- 大 QMT 客户端已安装并已登录（各券商版本均可）
 - 一个 Redis；同机可选 ZMQ 免 Redis
 - 客户端机器上有 Python 3.8 以上。**QMT 自带的是 Python 3.6.8**，服务端代码就跑在它里面，这一点在升级时会用到
 
@@ -92,11 +92,11 @@ Redis 密码（无则回车，输入不回显）:
   2) 单文件（base64 内嵌，redis 或 zmq 均可）
   3) 单文件（明文代码，强制 zmq；沙箱拒绝 import redis 时用）
 请选择 [1-3]: 1
-QMT 的 python 目录（回车则写到当前目录）: D:\国金证券QMT交易端\python   ← 别回车
+QMT 的 python 目录（回车则写到当前目录）: D:\QMT交易端\python   ← 别回车
 客户端配置写到哪个目录（回车则当前目录）: D:\my_client
 
 === 已写入 ===
-  D:\国金证券QMT交易端\python\bigqmt_signal_trader_local_config.py
+  D:\QMT交易端\python\bigqmt_signal_trader_local_config.py
   D:\my_client\bigqmt_signal_trader_client_config.py
 ```
 
@@ -110,7 +110,7 @@ QMT 的 python 目录（回车则写到当前目录）: D:\国金证券QMT交易
 | Redis 地址 / 端口 / db / 用户名 / 密码 | 选 redis 才问。密码输入不回显，会写进配置文件 |
 | 允许远程下单/撤单？（否） | 打开前它会警告：任何能连上这条通道的程序都可以下单。首次部署先留 `否`，验证通过再打开 |
 | 部署方式（package） | 见上表 |
-| **QMT 的 python 目录（回车则写到当前目录）** | **这里最容易出错。** 填 QMT 安装目录下的 `python`，如 `D:\国金证券QMT交易端\python`。直接回车会写到你当前所在的目录，服务端找不到配置 |
+| **QMT 的 python 目录（回车则写到当前目录）** | **这里最容易出错。** 填 QMT 安装目录下的 `python`，如 `D:\QMT交易端\python`。直接回车会写到你当前所在的目录，服务端找不到配置 |
 | 客户端配置写到哪个目录（回车则当前目录） | **你外部程序（要运行的脚本）所在目录。** 客户端靠 `import bigqmt_signal_trader_client_config` 找它，得在 `sys.path` 上——和脚本同目录最省事；放别处要加 `PYTHONPATH` 或设 `BIGQMT_CLIENT_CONFIG_MODULE`。放进 QMT 的 python 目录只有从那里运行才碰巧能用（退回读服务端配置） |
 
 跑完它写出这些文件：
@@ -294,4 +294,4 @@ xt_trader.reload_status()            # -> {'ok': True, 'modules_purged': 28,
 
 **但改这三个文件仍然要重启策略**：`bigqmt_signal_trader_strategy.py`、`bigqmt_signal_trader_redis_rpc_runtime.py`、`BIGQMT_REDIS_DRYRUN.py`——QMT 自己 exec 它们，模块没法 reload 自己所在的模块。单文件部署整个都是这种情况。
 
-更细的排错（日志位置、日志保留策略、启动诊断字段）见 README「日志与排错」。
+更细的排错（日志位置、日志保留策略、启动诊断字段）见 [使用指南](USER_GUIDE.md)「日志与排错」。

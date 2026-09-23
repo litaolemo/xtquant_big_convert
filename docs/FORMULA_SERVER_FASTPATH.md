@@ -138,7 +138,7 @@ BIGQMT_FORMULA_SERVER_CONFIG = {
     "enabled": True,            # 或环境变量 BIGQMT_FORMULA_ENABLED=0 关闭
     # "host": "127.0.0.1",     # 绑的是 0.0.0.0，跨机可达（需放行防火墙）
     # "port": 58600,           # 不写则从 qmt_root 的 ini 读，再退回 58600
-    # "qmt_root": r"D:\国金证券QMT交易端",
+    # "qmt_root": r"D:\QMT交易端",
     # "timeout_seconds": 3.0,
     # "methods": ["get_instrument"],      # 只路由白名单
     # "failure_cooldown_seconds": 30.0,

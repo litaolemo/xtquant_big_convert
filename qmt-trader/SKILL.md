@@ -34,7 +34,7 @@ pip install "xtquant-big-convert[redis]"   # redis 传输（默认，推荐）
 
 ### 第 2 步：把服务端文件同步到 QMT 的 python 目录
 
-需要拷 4 项到大 QMT 的 `python` 目录（如 `D:\国金证券QMT交易端\python\`）：
+需要拷 4 项到大 QMT 的 `python` 目录（如 `D:\QMT交易端\python\`）：
 
 ```
 bigqmt_signal_trader/                  （整个包，pip 装的在 site-packages 里）
@@ -69,8 +69,8 @@ BIGQMT_REDIS_CONFIG = {
 }
 ```
 
-> **这个开关按传输选，选反了差几十倍**（实测见 README 的传输对比表）：
-> redis 用 `True`（3.4ms），zmq / pipe 用 `False` 走 adjust drain（zmq 15.8ms）。
+> **这个开关按传输选，选反了差几十倍**（实测见 docs/USER_GUIDE.md 的传输对比表）：
+> redis 用 `True`（3.4ms），zmq 用 `False` 走 adjust drain（zmq 15.8ms）。
 > zmq 配 `True` 是 592.9ms —— 慢 37 倍。原因是 zmq / pipe 的后台线程每次都要付
 > 跨线程 GIL 交接（约一个 adjust tick），redis 的 `brpop` 唤醒没有这一步。
 >
@@ -103,7 +103,7 @@ $env:BIGQMT_REDIS_HOST="Redis地址"; $env:BIGQMT_REDIS_PORT="6379"
 $env:BIGQMT_REDIS_DB="5"; $env:BIGQMT_REDIS_PASSWORD="Redis密码"
 ```
 
-然后验证（redis ~3ms / zmq+drain ~16ms 为正常，实测口径见 README 传输对比表）：
+然后验证（redis ~3ms / zmq+drain ~16ms 为正常，实测口径见 docs/USER_GUIDE.md 传输对比表）：
 
 ```bash
 python scripts/qmt.py ping

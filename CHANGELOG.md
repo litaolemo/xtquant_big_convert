@@ -1127,8 +1127,6 @@ pip install -U xtquant-big-convert==0.3.31
 
 ### 新增
 
-- **Windows 命名管道传输**（`transport="pipe"`，零第三方依赖，本机同主机）：给 import 白名单拒 `socket` 且不许 `pip install` 的券商终端一条活路——`ctypes.WinDLL("kernel32")` 就够，不碰套接字。同名管道的同步句柄不容并发读写（实测写会永久阻塞或报 err=232），所以每条连接**只有它的工作线程能写**：任意线程的应答只进 outbox 并 CancelIoEx 唤醒，由工作线程自己写出；客户端超时靠看门狗取消阻塞读（而非读后查超时）；停机先 CancelIoEx 再关句柄；写失败（可证未发出）自动重连重发一次，读失败（生死未知）照旧抛给调用方。实盘验证（2026-09-08，国金终端）：ping/get_asset/get_positions/query_orders/reload_deployment/reload_status 全部正常应答，deferred 三件套 110-405ms（adjust tick 节奏）。裸管道往返 ~0.012ms；选它是为了**依赖**，不是为了速度。
-
 - **全推订阅的状态查询与一键强拆**（`quote_subscription_status` / `quote_unsubscribe_all`，客户端同名方法）：忘了 seq 也有救。状态报每个组合的标的、客户端数、距上次心跳秒数——**一直保活的组合说明有心跳在喂（有客户端进程还活着），逐渐变冷的就是收割器正在收的路上**（实盘实测：客户端死后 ~30 秒收割器自动拆订阅）。强拆不需要 seq，关掉全部组合；keepalive 对未知 sub_id 是 no-op，清掉的组合不会复活。
 
 ### 修复

@@ -11,7 +11,6 @@
 | **`redis`（默认）** | **~10ms** | ✅ | redis-py | 生产默认，也是实测最快的 |
 | `zmq` | ~95ms（drain）| ✅（tcp） | pyzmq | 没有 redis 时的同机方案 |
 | `mysql` | ~50ms+ | ✅ | DBUtils + 驱动 | 兼容兜底（Redis/ZMQ 都不可用时）|
-| `shm` | — | ❌ | — | 留接口未实现（需 Python 3.8+）|
 
 切换传输**只改一个配置字段 `transport`**，业务代码（handlers / `to_jsonable` / `process_request`）零改动。
 
@@ -56,7 +55,7 @@
 
 ```python
 BIGQMT_REDIS_CONFIG = {
-    "transport": "zmq",          # 默认 "redis"。可选: redis/zmq/mysql/shm
+    "transport": "zmq",          # 默认 "redis"。可选: redis/zmq/mysql
     "zmq": {
         "bind_address": "tcp://127.0.0.1:5560",  # Windows 同机使用 TCP 回环
     },
@@ -160,11 +159,6 @@ BIGQMT_REDIS_CONFIG = {
 
 注意：sqlite 连接线程绑定，sqlite 测试需 `check_same_thread=False` + `maxshared=0`。
 
-### SHM（`transport: shm`，未实现）
-
-留接口，`send_request` 会抛 `TransportError`。Python 3.8+ 的
-`multiprocessing.shared_memory` 或自定义 mmap 环形缓冲区可后续实现。
-
 ## 实测延迟对比（同机）
 
 基准脚本：`python bench_transports.py -n 100`
@@ -194,7 +188,6 @@ src/bigqmt_signal_trader/transports/
 ├── redis_transport.py     # Redis 实现（默认，零行为变更）
 ├── zmq_transport.py       # ZMQ ROUTER/DEALER 实现
 ├── mysql_transport.py     # MySQL + DBUtils 连接池
-├── shm_transport.py       # 共享内存 stub
 └── factory.py             # build_transport(name, config) 工厂
 ```
 

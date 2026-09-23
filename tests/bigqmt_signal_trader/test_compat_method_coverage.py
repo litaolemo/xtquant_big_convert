@@ -10,7 +10,7 @@
     要么明确写进 CALL_METHOD_ONLY —— 二选一，不能悄悄漏掉。
 
 `CALL_METHOD_ONLY` 是大 QMT 独有的 ContextInfo 扩展，MiniQMT 本来就没有这些
-方法，按设计走 `xtdata.call_method()` 兜底（README「通用 RPC 兜底」一节）。
+方法，按设计走 `xtdata.call_method()` 兜底（docs/USER_GUIDE.md「通用 RPC 兜底」一节）。
 往白名单加新方法时，这个测试会强制你做一次选择。
 
 注意不要用 `hasattr(xtquant.xtdata, name)` 当判据：本仓库 `src/xtquant/` 有个

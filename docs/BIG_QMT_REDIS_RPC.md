@@ -373,7 +373,7 @@ print(response)
 
 `gil_probe` 探针显示进程周期性被卡 ~490ms,但 `adjust_phase` 每段都 <50ms —— 即**尾延迟来自
 QMT 终端自身的 C++ 主循环占着 GIL**,`setswitchinterval`/精简 adjust 都 preempt 不了。唯一根治
-是把 serving 挪出该进程(sidecar 独立 GIL,见 `shm_transport.py` 预留)。
+是把 serving 挪出该进程(sidecar 独立 GIL)。
 
 ### schedule_adjust_interval 调这个数压尾延迟
 
@@ -404,13 +404,13 @@ p50 1012~1013ms（与 interval 无关），2026-09-22 同一终端 drain 下 103
 - **zmq**(同机免 Redis):只加 `transport="zmq"` 一行,端口按账号派生 `tcp://127.0.0.1:1556x`。
 - **`rpc_background_threads` 一律 `False`**(adjust drain)。后台收包线程每拿一次 GIL 付一个
   adjust tick,redis 回包 8 次往返就是 ~400ms(#343);drain 下所有传输都是 ≤1 tick。不写这个
-  键时能 drain 的传输默认就是 drain,只有没有 drain 实现的(shm)保留收包线程。
+  键时能 drain 的传输默认就是 drain,只有没有 drain 实现的保留收包线程。
 - **重读走工作线程**(`rpc_heavy_offload`,默认 `True`,#351)。drain 下所有请求都在 adjust 线程上
   跑,一次 1.8s 的 `get_market_data_ex` 就是策略自己的 `tick_app` 停 1.8s——这正是 #321 把 LPOP
   从 adjust 上拿掉的原因。现在按方法(`get_financial_data` / `get_raw_financial_data`、
   `call_formula` / `gen_factor_index` 等)或按大小(市场令牌的 `get_full_tick`、超过
   `rpc_heavy_codes_threshold`=20 个代码、`period="tick"`、按日期窗口取 K 线)判定为重的读请求交给
-  一条工作线程,回包由 adjust 线程在下一拍发出(zmq 的 ROUTER socket / 管道句柄不能跨线程用)。
+  一条工作线程,回包由 adjust 线程在下一拍发出(zmq 的 ROUTER socket 不能跨线程用)。
   重读的往返多付 1~2 拍;轻读和所有交易查询照旧一拍、照旧在 adjust 线程。
   实测（2026-09-22，100ms 拍，每种读在工作线程上连打，看终端 `adjust cadence` 的 avg / max）：
   全市场 `get_full_tick(["SH","SZ"])` 读本身 ~200ms，拍 0.100 / 0.25–0.33s；三只 4 个月 1m 窗口

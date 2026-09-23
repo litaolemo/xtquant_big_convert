@@ -1,0 +1,1884 @@
+# xtquant_big_convert 使用指南
+
+> 本文是功能与运维细节的主文档（2026-09-23 起从 README 迁入；README 只保留简介与免责声明）。
+
+大 QMT 运行环境里的 RPC 桥接包：把大 QMT 内置 Python（行情查询、交易、持仓）封装成**可远程调用的服务**，并兼容一组 MiniQMT 方法名，让外部程序无需 XtQuantServer 权限就能驱动大 QMT。
+
+支持 **Redis / ZMQ / MySQL** 三种可插拔传输，切换只需改一个配置字段。
+
+已发布 PyPI，客户端一行安装：`pip install xtquant-big-convert`（详见下文「环境要求与依赖安装」）。
+
+另附 [qmt-trader skill](../qmt-trader/)：让 Claude Code / ZCode / Cursor 等 AI 助手通过统一 CLI（47 个子命令）直接查行情、算期权 Greeks、查持仓、下单撤单，详见下文「AI 助手 Skill：qmt-trader」。
+
+---
+
+### 配置向导：`bigqmt-init`### 配置向导：`bigqmt-init`
+
+部署流程见 [docs/DEPLOY_QUICKSTART.md](DEPLOY_QUICKSTART.md)，向导是它的**第 2 步**：替代手抄两份 `.example.py`。在能写到 QMT 的 python 目录的机器上跑：
+
+```bash
+bigqmt-init
+```
+
+`bigqmt-init` 找不到、或者用的是源码检出，等价写法：
+
+```bash
+python -m bigqmt_signal_trader.init_config
+```
+
+只能在终端里交互着答，不能用管道喂——密码那一问走 `getpass` 读终端。
+
+问资金账号、账号类型、传输方式（redis / zmq）、地址端口、Redis 用户名密码、是否允许远程下单、部署方式、两个目录，然后把服务端和客户端两份配置由**同一组答案**写出来，连接参数不会对不上：
+
+| 文件 | 写到哪 | 谁用 |
+|---|---|---|
+| `bigqmt_signal_trader_local_config.py` | QMT 的 python 目录 | 服务端 |
+| `bigqmt_signal_trader_client_config.py` | 你指定的目录 | 客户端 |
+| `BIGQMT_*_ALL_IN_ONE.py` | QMT 的 python 目录 | 只有选了单文件部署才生成，配置已烘焙进去 |
+
+**它不做的事，也是最容易误解的地方：** 默认的 `package` 部署方式下它**只写配置，不拷包**。跑完打印的「把 src/ 下的包同步到 QMT 的 python 目录」是对源码检出说的；pip 装的没有 `src/`，按快速开始第 3 步找到包的位置再拷 4 项。单文件模式则已经生成到位。
+
+**最容易答错的一问：**「QMT 的 python 目录（回车则写到当前目录）」。这里填 QMT 安装目录下的 `python`，直接回车会写到你当前所在的目录，服务端启动时找不到配置。
+
+几个不问、直接定死的：
+
+- **`rpc_background_threads` 一律 `False`**（adjust 线程 drain）——后台线程模式每次跨线程交接付一个 tick，redis 也不例外（#343）
+- **`rpc_allow_order_methods` 默认 `False`**——打开前会明确提示：任何能连上这条通道的程序都可以下单
+- 选了**无 redis 单文件**会自动把传输改成 zmq，不会留下一份声称用 redis 的配置
+
+已存在的文件会先问再覆盖（`--force` 跳过询问）。
+
+> **密码分两类。** Redis 密码是服务凭据，写进配置文件，输入时不回显。**QMT 登录密码不落盘**——`qmt_launcher` 从环境变量 `BIGQMT_LOGIN_PASSWORD` 读，这样它不会出现在 `argv` 或磁盘文件里。
+>
+> 生成的文件带账号和凭据，**不要提交到版本库**。
+
+## 功能一览
+
+### RPC 接口（远程可调用）
+
+通过 RPC 可调用的大 QMT 能力（**白名单 137 个只读方法 + 3 个下单方法（`submit_order` / `submit_orders_batch` / `cancel_order`）+ MiniQMT 风格别名**，覆盖官方文档全部交易/查询函数）：
+
+| 类别 | 方法 |
+|------|------|
+| **系统** | `ping` |
+| **行情快照** | `get_ticks` / `get_full_tick`（五档盘口）|
+| **合约/品种** | `get_instrument` / `get_instrument_type` / `get_stock_name` / `get_last_close` / `get_last_volume`（流通股本）/ `get_open_date` / `get_contract_expire_date` / `get_float_caps`（流通股本）/ `get_total_share` / `get_weight_in_index` / `get_svol`、`get_bvol`（盘中窗口内外盘，非当日累计）/ `get_contract_multiplier`（仅在答 int32 哨兵 `2147483647` 时报错）/ `get_risk_free_rate` / `is_stock_type` / `get_cb_info`；**实测答不了、客户端显式报错**：`get_stock_type`（恒 0）/ `get_turn_over_rate`（恒 None）|
+| **K线/历史** | `get_market_data` / `get_market_data_ex` / `get_local_data` / `get_close_price` / `get_index_weight` |
+| **L2 行情** | `get_l2_quote` / `get_l2_order` / `get_l2_transaction` / `subscribe_l2thousand`（需 L2 权限）|
+| **板块** | `get_stock_list_in_sector` / `get_sector_list`* / `get_sector_info` / `create_sector` / `add_sector` / `remove_sector` |
+| **交易日历/时段** | `get_trading_dates` / `get_holidays`* / `get_markets`* / `get_market_last_trade_date`* / `get_date_location` / `get_trading_calendar` / `get_trade_times` |
+| **数据下载** | `download_history_data` / `download_history_data2` / `download_holiday_data` / `download_etf_info` / `download_cb_data` / `download_history_contracts` / `download_index_weight` / `download_sector_data` |
+| **财务/因子** | `get_financial_data` / `download_financial_data` / `download_financial_data2` / `get_raw_financial_data` / `get_factor_data` |
+| **ETF/期权/期货** | `get_etf_info` / `get_ipo_info` / `get_option_list` / `get_his_option_list` / `get_his_option_list_batch` / `get_option_detail_data` / `get_option_undl_data` / `get_option_undl` / `get_ETF_list` / `get_main_contract` / `get_his_contract_list` |
+| **期权定价** | `bsm_price` / `bsm_iv` / `get_option_iv` |
+| **龙虎榜/股东** | `get_longhubang` / `get_top10_share_holder` / `get_holder_num` / `get_turnover_rate`（区间换手率）/ `get_industry` / `get_his_st_data` / `get_his_index_data` |
+| **资金流** | `get_north_finance_change`（北向）/ `get_hkt_statistics`（港股通）/ `get_hkt_details` / `get_hkt_exchange_rate` |
+| **因子/模型** | `call_formula` / `subscribe_formula` / `unsubscribe_formula` / `get_formula_result` / `gen_factor_index` |
+| **时间转换** | `datetime_to_timetag` / `timetag_to_datetime` / `timetagToDateTime`（纯本地计算）|
+| **账户查询** | `get_asset`（资金）/ `get_positions`（持仓）/ `query_stock_position`（单股持仓）/ `query_orders`（委托）/ `query_trades`（成交）/ `get_history_trade_detail_data`（历史成交）/ `get_value_by_order_id` / `get_last_order_id` |
+| **新股/打新** | `get_ipo_data`（返回以申购代码为键的 dict）/ `get_new_purchase_limit`；客户端另有 `query_ipo_data` / `ipo_subscribe` / `ipo_subscribe_all`，见下文 |
+| **融资融券** | `get_assure_contract`（担保品）/ `get_enable_short_contract`（融券标的）/ `get_unclosed_compacts`（未平仓）/ `get_closed_compacts`（已平仓）/ `get_debt_contract`（负债）—— 需两融权限，普通账户降级为空 |
+| **期权持仓** | `get_option_subject_position`（标的持仓）/ `get_comb_option`（组合期权）|
+| **持仓同步** | `sync_positions`（写回 Redis 供客户端缓存）|
+| **下单/撤单** | `submit_order` / `cancel_order`（默认关闭，需显式开启）|
+
+> **表里是 RPC 的方法名，客户端怎么调：**
+>
+> - **行情 / 参考数据**（上表除「账户查询」及往下几行外）在兼容层 `BigQmtXtData` 上有**同名**封装，按表里的名字直接调即可：`xtdata.get_open_date("600519.SH")`、`xtdata.get_longhubang(...)`、`xtdata.bsm_price(...)`。参数名见 [docs/RPC_API_REFERENCE.md](RPC_API_REFERENCE.md)。（issue #262 之前「合约/品种」整族只有兜底一条路，照着表写 `xtdata.get_open_date(...)` 会撞 `AttributeError`。）
+> - **账户 / 委托 / 下单**走 `xt_trader`，用的是 MiniQMT 的方法名：`get_asset` → `xt_trader.query_stock_asset(account)`、`get_positions` → `query_stock_positions`、`submit_order` → `order_stock`，见下节「客户端兼容层」。
+> - **没有同名封装的**（如 `get_ETF_list` / `get_hkt_exchange_rate` / `ping` / `sync_positions`）走万能入口：`xtdata.call_method("get_ETF_list")`，或直接 `xt_trader.client.call("<method>", {...})` —— 白名单里的任何方法都能这么调。
+>
+> **两个方法在实测的这台终端上有名字没答案**（`get_stock_type` 恒 0、`get_turn_over_rate` 对 5 个代码 × 3 种格式恒 None）。这两个的封装**显式抛 `NotImplementedError` 并说明实测结果和替代算法**，不把那个空值递给你 —— 报错看得见，一个恒定的假答案看不见。要自己试的话 `xtdata.call_method("get_turn_over_rate", stockcode=...)` 仍然打得通（区间版 `get_turnover_rate` 按官方文档需先下载财务数据（股本）与日线数据，本终端没下过）。
+>
+> `get_contract_multiplier` 是**回读式**：答案是 int32 哨兵 `2147483647`（这台终端对股票 / ETF / 期权 / 期货代码一律给这个）才报错，真乘数照常放行 —— 但本终端没有期货行情，**「有期货数据时能正常返回」这一条没有实测过**。
+
+> `*` 标记的方法在大 QMT（完整交易端）环境下用 **fallback** 实现（非原生数据）：`get_sector_list` **不再静默返回兜底清单** —— 拿不到终端真实板块时直接抛错，要那 13 个常用板块名请显式传 `allow_fallback=True`（issue #143：一份和真列表长得一模一样的假清单，调用方分辨不出来，用户自建的板块永远不出现）；`get_holidays` 从交易日历反推，`get_markets` 返回固定市场集合，`get_market_last_trade_date` 从日历派生。详见 [docs/RPC_API_REFERENCE.md](RPC_API_REFERENCE.md) 第 8 节「大 QMT 环境的能力边界」。
+
+> **板块名要用终端认的那个拼法，拼错不报错、只返回空列表。** `get_stock_list_in_sector` 在大 QMT 上是正常工作的，看到空结果先怀疑名字。下面 13 个是 `get_sector_list(allow_fallback=True)` 返回的全部名字，每一个都在大 QMT 2.1.19.0 上实测过（2026-09-11，只读）：
+>
+> | 板块名 | 返回 | 注意 |
+> |---|---|---|
+> | 沪深A股 | 5220 只 | |
+> | 上证A股 | 2318 只 | **不是**「沪市A股」，那个返回 0 |
+> | 深证A股 | 2902 只 | **不是**「深市A股」，那个返回 0 |
+> | 科创板 | 617 只 | |
+> | 创业板 | 1408 只 | |
+> | 沪市基金 | 1152 只 | 基金反过来：「上证基金 / 深证基金」返回 0 |
+> | 深市基金 | 1124 只 | |
+> | 沪深ETF | 1722 只 | |
+> | 沪市债券 | 22351 只 | |
+> | 深市债券 | 19787 只 | |
+> | 上证期权 | 674 只 | |
+> | 深证期权 | 452 只 | |
+> | 中金所 | 0 只 | 股票账户没有期货权限，不是拼写问题 |
+>
+> A 股用「上证 / 深证」、基金用「沪市 / 深市」，两套拼法在同一台终端上并存，没有规律可推，只能逐个实测。2318 + 2902 = 5220 正好等于沪深A股，可以作为自检。
+
+
+### 客户端兼容层
+
+- `bigqmt_signal_trader.xtquant_compat`：把旧代码的 `xt_trader` / `xtdata` 调用转成 RPC，无需改业务代码。
+- 兼容 MiniQMT 方法名：`query_stock_asset` / `query_stock_positions` / `query_stock_orders` / `get_full_tick` / `order_stock` 等。
+- **本地 IV/Greeks fallback**：`xtdata.get_option_analytics(option_code)` 从合约元数据和期权/标的最新 K 线 close 计算隐含波动率及 Delta/Gamma/Vega/Theta/Rho；`xtdata.get_option_chain_analytics("510050.SH", "202609")` 一次价格批读计算整条到期月份。显式传 `option_price` / `underlying_price` 可改用盘口中间价。无套利边界不成立的陈旧价格按合约返回 `analytics_error`，不会用一个伪 IV 污染整条链。原生 `get_option_iv` 保持不变，可用 `include_native_iv=True` 对照。
+- **委托/成交对象补齐 MiniQMT 契约**（0.3.8 起，issue #133）：`query_stock_orders` / `query_stock_trades` 返回的对象新增 `account_type`（xtconstant 数字码，取部署实际配置的类型而非硬编码 2）、`instrument_name`、`secu_account`、`offset_flag`、`direction`，成交多一个 `commission`。
+
+  **`strategy_name` 只对经本桥下的委托有效**：实测 QMT 的 ORDER（120 个属性）和 DEAL（47 个属性）行上**都没有 `m_strStrategyName` —— `get_trade_detail_data` 按策略过滤却从不回报。本桥下的单从自己的委托身份库回填（下单时按作为备注发出的 `user_order_id` 记录）；**手工在终端下的单没有备注，保持为空**。
+
+  `secu_account` 同理恒为空：两种行都不带股东代码。字段保留是为了读到 `""` 而不是 `AttributeError`。
+
+- **`describe_trade_detail_fields(account)` 诊断 RPC**（0.3.8 起）：返回 QMT 自己的 ORDER / DEAL 行上**有哪些属性名**（只返回名字不返回值）。遇到"某字段为空"时，它回答的是"**是终端没给，还是桥没转发**"——这两种从客户端看完全一样。
+
+- **`get_stock_type` 在大 QMT 上不可用，会显式抛错**（0.3.8 起）：服务端走 `ContextInfo.get_stock_type`，而这个 stub 对**任何**代码都返回 `0` —— 实测股票 / ETF / 债券 / 期权、以及各种代码格式全是 0。恒为 0 的"类型"比报错更糟（报错看得见，错的分类看不见），所以改成抛 `NotImplementedError` 并指向真正能用的 `get_instrument_type(code)`，后者实测能区分 `stock` / `fund` / `etf` / `bond` / `index`。完整 QMT 的交易日 ContextInfo fallback 会把 `SH/SZ` 转成代表指数代码。委托快照增量暴露 `price_type` / `traded_price`，旧 QMT 不提供时分别保持 `None` / `0.0`。
+- **完整 xtconstant 枚举**（539 个常量，涵盖原生 MiniQMT 全部 90 个，值逐一比对无改动）：账号类型、委托类型（股票/期货/信用/期权）、报价类型、委托状态、账号状态、`ORDER_TYPE_SET`。
+
+```python
+# 旧代码零改动（自动命中 shim）
+from xtquant.xtconstant import STOCK_BUY, FIX_PRICE, ORDER_SUCCEEDED
+
+# 或直接从 compat 导入
+from bigqmt_signal_trader.xtquant_compat import (
+    SECURITY_ACCOUNT, STOCK_BUY, FIX_PRICE, CREDIT_FIN_BUY,
+    FUTURE_OPEN, ACCOUNT_STATUS_OK, ORDER_SUCCEEDED,
+)
+```
+
+### 想保留原来的 `xtquant` / `xtdata` 写法怎么办
+
+**本来就支持** —— `src/xtquant/` 是一个 shim 包，提供 `xtdata` / `xttrader` / `xtconstant` / `xttype` 四个子模块。
+
+但它和**真的 xtquant 同名**，所以先看清一件事：
+
+```
+真的 xtquant     .../site-packages/xtquant        （官方包）
+本项目的 shim    .../xtquant_big_convert/src/xtquant
+```
+
+**两者靠 `sys.path` 顺序决胜，排在前面的赢。** shim 自己的文档就写着：
+
+> Put this package before the real xtquant package on PYTHONPATH **only when
+> the caller intentionally wants Big QMT RPC compatibility.**
+
+#### 方案 A：零改动，让 shim 顶替
+
+适合**整套切到桥上**。业务代码一个字不改：
+
+```python
+from xtquant import xtdata
+from xtquant.xtconstant import STOCK_BUY, FIX_PRICE, ORDER_SUCCEEDED
+
+xtdata.get_full_tick(["000001.SZ"])        # 走 RPC 到大 QMT
+```
+
+**代价**：整个进程里再也拿不到真的 xtquant。shim 只实现桥支持的方法，真包里的其他东西就没了。
+
+#### 方案 B：显式导入，两个都留着
+
+适合**渐进迁移**。不让 shim 进 `sys.path`，改成显式：
+
+```python
+from bigqmt_signal_trader.xtquant_compat import xtdata as bq_xtdata
+from bigqmt_signal_trader.xtquant_compat import (
+    XtQuantTrader, StockAccount, XtQuantTraderCallback,
+    STOCK_BUY, FIX_PRICE, ORDER_SUCCEEDED,
+)
+
+from xtquant import xtdata          # 真包，完全不受影响
+```
+
+老代码继续用真 xtquant，新代码走桥，按模块逐步迁。
+
+#### ⚠️ 安装方式决定谁赢
+
+**普通 `pip install xtquant-big-convert` 会把 shim 的 `xtquant/` 装进 site-packages**，和真包同名同目录。两个 pip 包争同一个路径，谁后装谁覆盖，`pip uninstall` 其中一个还可能把另一个的文件带走。
+
+| 你要的 | 装法 |
+|---|---|
+| **方案 A**（shim 顶替），且本机**没有**真 xtquant | 普通 `pip install xtquant-big-convert` |
+| **方案 B**（两个都留着） | **editable 安装**：`pip install -e /path/to/xtquant_big_convert` —— 它不往 site-packages 写 `xtquant/`，只加一条路径，随时能靠调整 `sys.path` 顺序切换 |
+| 按环境切换（本机真包、服务器走桥） | 虚拟环境隔离 + `PYTHONPATH` 控制顺序 |
+
+确认当前谁生效：
+
+```python
+import importlib.util
+print(importlib.util.find_spec("xtquant").origin)
+# ...site-packages/xtquant/__init__.py       -> 真包
+# ...xtquant_big_convert/src/xtquant/...     -> shim
+```
+
+### 异步回报回调（MiniQMT 风格，实盘验证）
+
+客户端注册 `XtQuantTraderCallback` 子类，`connect()`/`subscribe()` 后实时接收委托/成交/错误回报（通过 Redis pubsub 推送）：
+
+```python
+from bigqmt_signal_trader.xtquant_compat import (
+    StockAccount, XtQuantTraderCallback, configure, xt_trader,
+)
+
+class MyCallback(XtQuantTraderCallback):
+    def on_stock_order(self, order):
+        print("委托回报:", order.stock_code, order.order_status, order.order_sysid)
+
+    def on_stock_trade(self, trade):
+        print("成交回报:", trade.stock_code, trade.order_id, trade.traded_volume, trade.traded_price)
+
+    def on_order_error(self, order_error):
+        print("委托失败:", order_error.order_id, order_error.error_id, order_error.error_msg)
+
+    def on_cancel_error(self, cancel_error):
+        print("撤单失败:", cancel_error.order_id, cancel_error.error_id, cancel_error.error_msg)
+
+    def on_order_stock_async_response(self, response):
+        print("异步下单回报:", response.account_id, response.order_id, response.seq)
+
+    def on_account_status(self, status):
+        print("账户状态:", status.account_id, status.account_type, status.status)
+
+configure()
+xt_trader.register_callback(MyCallback())
+acc = StockAccount(xt_trader.client.account_id, "STOCK")
+xt_trader.connect()
+xt_trader.subscribe(acc)
+
+# 异步下单（返回 seq，回报走回调）
+seq = xt_trader.order_stock_async(acc, "600654.SH", 23, 100, 11, 2.95, "rpc_test", "备注")
+```
+
+**完整的回调链**（对齐 MiniQMT 原生语义，实盘验证）：
+
+| 回调 | 触发时机 | 已验证 |
+|------|---------|--------|
+| `on_account_status` | `connect()`/`subscribe()` 后 | ✅ |
+| `on_order_stock_async_response(seq, resp)` | 异步下单提交成功 | ✅（实盘）|
+| `on_stock_order(order)` | 委托状态变化（已报 50 / 已成 56 / 废单 57）| ✅（实盘）|
+| `on_stock_trade(trade)` | 成交回报 | ✅ |
+| `on_order_error(err)` | 废单/拒单（服务端检测 status=57 推送）；**终端在下单前就拦下的单**（资金/仓位不足、价格越界、无权限——终端弹窗、不建委托记录、没有任何回调）由服务端结算到期查不到时补推，`error_msg` 以 `passorder submitted but order not found in system` 开头，`source="settlement"`（#345 起）| ✅（实盘）/ 补推未实测 |
+| `on_cancel_error(err)` | 撤单失败 | ✅ |
+| `on_cancel_order_stock_async_response` | 异步撤单回报 | ✅ |
+
+**异步下单的事件顺序**（Issue #51）：`on_order_stock_async_response`（异步下单工作线程）与 `on_stock_order` / `on_stock_trade`（Redis pub/sub 监听线程）走不同通道，服务端在 `order_callback` 里先推事件、后回 RPC，事件先于响应是**常态**而非偶发竞态。客户端按 `order_remark` 设屏障：命中待响应委托的事件先暂存，response（或 error）触发后按到达顺序放行；屏障 10 秒超时兜底——丢事件比顺序错乱更糟。延迟只加在 `order_stock_async` 路径上：手工下单、同步下单、无 remark 的委托一律直通。成交事件可能没有 remark，此时按委托事件学到的 `order_sys_id` 关联。`order_remark` 不强制唯一（网格类策略常复用）：同 remark 的后一笔下单会接管前一笔的屏障并先放行其暂存事件，response 按 seq 精确匹配，前一笔的 response 不会误放后一笔的屏障。已验证：单测（含反向验证）+ 盘后真实 Redis 注入实测（部署环境保序成立）。
+
+**`*_async` 查询方法**（对齐 MiniQMT 签名，callback 可选）：
+
+```python
+# 方式 1：callback 接收结果（MiniQMT 原生语义，返回 None）
+xt_trader.query_stock_asset_async(acc, lambda asset: print(asset.cash, asset.total_asset))
+xt_trader.query_stock_positions_async(acc, lambda positions: print(len(positions)))
+
+# 方式 2：不传 callback，返回 seq（我们的扩展）
+seq = xt_trader.query_stock_orders_async(acc)
+```
+
+**注意**：QMT 必须运行在**实盘模式**（非模拟/模型交易）才能收到完整回报。模拟模式下委托进 QMT 界面但不在真实委托队列，`query_orders` 查不到、`order_stock` 返回 -1（触发 `on_order_error`）。
+
+### 新股申购（打新）
+
+```python
+from bigqmt_signal_trader.xtquant_compat import xt_trader, StockAccount
+acc = StockAccount("你的账号")
+
+# 1) 看今天有什么可申购（只读）
+for code, info in xt_trader.query_ipo_data(acc, stock_type="STOCK").items():
+    print(code, info["name"], info["issuePrice"], info["maxPurchaseNum"])
+# 301689.SZ  某某科技  16.0  12000
+
+# 2) 先看计划，不下单
+for row in xt_trader.ipo_subscribe_all(acc, dry_run=True):
+    print(row)
+# {'stock_code': '301689.SZ', 'action': 'planned', 'volume': 12000, 'price': 16.0, ...}
+
+# 3) 真申购（沪深；北交所默认排除）
+results = xt_trader.ipo_subscribe_all(acc)
+```
+
+每只返回 `action`（`subscribed` / `planned` / `skipped` / `failed`）与 `reason`，一只失败不影响其余。
+
+**这是一个你主动调用的方法，不是桥自己会做的事。** 它会下真实委托，所以必须是当天有人明确要求，而不是升级后自动发生。要每天定时打新，请在你自己的程序里调度它。
+
+因为走的是既有的 `order_stock` 通道，它自动获得：
+
+| | |
+|---|---|
+| `rpc_allow_order_methods` | 和其他委托一样保持 opt-in，默认关 |
+| `orderType 1101` / `prType 11` / `quickTrade 2` | 网关默认值 —— `quickTrade` 必须是 2，见 API 参考 1.4：定时器/回调中下单传 1 可能静默不发出 |
+| 主线程执行、委托记账、exec 事件 | 与普通下单完全一致 |
+
+**默认只打沪深。** 沪深打新是市值申购、不冻结资金；北交所需要冻结资金，因此默认排除。需要时显式打开：
+
+```python
+xt_trader.ipo_subscribe_all(acc, markets=("SH", "SZ", "BJ"))
+```
+
+**申购代码无法识别时会跳过，不会猜。** 申购代码有自己的编号（沪 `730/732/780/787/789`，深 `00/30`，北 `920/889/8/4`），认不出来的代码一律跳过——在一个会下单的路径上，猜错的代价不对称。
+
+`query_new_purchase_limit(acc)` 返回各板块申购额度（dict）。
+
+> 实盘验证到 `dry_run` 为止：`query_ipo_data` 与申购计划均已在大 QMT 上验证正确（2026-08-28，301689.SZ @ 16.0 × 12000）。**真实申购会下真实委托，未在本仓库验证过。**
+
+### 全推行情订阅（subscribe_whole_quote 真推送）
+
+`subscribe_whole_quote` 是**服务端真推送**——对齐 MiniQMT 全推行情订阅。服务端引用计数管理大 QMT 行情回调，通过独立 PUB/SUB 通道向客户端**增量推送**行情（不是一次性快照）：
+
+**架构（三通道）**：
+1. **控制面 RPC**——`subscribe_whole_quote` / `unsubscribe_whole_quote` / `quote_keepalive` 方法（复用现有 transport）
+2. **数据面推送**——`QuotePushChannel` 单向 PUB/SUB（redis pub/sub 或 zmq PUB/SUB，按部署 transport 选择；msgpack 编码 + json 兜底）
+3. **Big-QMT 行情源**——`QuoteSubscriptionManager` 按组合键归一化共享（大写/去空格/排序），多客户端共享一个底层订阅
+
+**关键设计**：
+- **组合键去重**：不同客户端订阅相同标的组合，只占一个 big-QMT 订阅
+- **引用计数**：按 `(client_id, sub_id)` 计数，全部退订或 30s keepalive 超时才销毁
+- **客户端心跳**：周期 `quote_keepalive`；检测推送静默（默认 10 轮心跳）自动重放订阅，**服务端重启后自动恢复**
+- **初始快照**：客户端用 `get_full_tick` 预拉快照（big-QMT 回调是增量的）
+- **期权兼容**：显式 `.SHO/.SZO` 合约在部分完整大 QMT 版本中不会从 `subscribe_whole_quote` 推送，因此服务端对这些代码逐合约使用 `ContextInfo.subscribe_quote(..., result_type="list")`；股票、ETF 和市场代码仍走原有全推路径。混合组合对客户端保持一个订阅号。
+
+**用法**：
+
+```python
+from bigqmt_signal_trader.xtquant_compat import configure, xtdata
+
+configure()
+
+# 订阅全推行情（callback 收到增量推送）
+def on_quote(data):
+    for code, tick in data.items():
+        print(code, tick.get("lastPrice"))
+
+seq = xtdata.subscribe_whole_quote(["600000.SH", "000001.SZ"], callback=on_quote)
+
+# 退订
+xtdata.unsubscribe_quote(seq)
+```
+
+**验证**：实盘交易日验证 1/20/50/100 只标的，3s 推送节奏稳定，零丢失零乱序；多客户端共享/退订隔离/同客户端多 sub_id 全过；服务端重启恢复（42s 中断后验证两次）。另在完整大 QMT 2.1.19.0 盘中验证显式 `.SHO` 快照、500ms 实时推送及 ETF+期权混合组合。详见 [docs/SUBSCRIBE_WHOLE_QUOTE_PUSH.md](SUBSCRIBE_WHOLE_QUOTE_PUSH.md) 和 [docs/SUBSCRIBE_WHOLE_QUOTE_LIVE_VERIFICATION.md](SUBSCRIBE_WHOLE_QUOTE_LIVE_VERIFICATION.md)。
+
+### 多个客户端同时用一座桥
+
+可以，redis 模式天然支持多消费者，三条通道各自的机制：
+
+| 通道 | 多客户端怎么工作 | 注意 |
+|---|---|---|
+| **RPC 查询**（行情快照、持仓、委托、下单） | 每个请求带自己的 `request_id`，回复写到 `bigqmt:rpc:resp:<账号>:<request_id>`，互不串。N 个进程同时 `query_stock_positions` / `get_full_tick` 都行 | **吞吐是共享的**：服务端串行处理（交易类查询排在 adjust 线程上一次一个），谁都不排队的前提是总量不大。多个消费者各自每秒拉一次全市场 `get_full_tick(["SH"])`（~1s 一次）会互相拖慢；这种让一个进程拉、其余订阅它，或开 `full_tick_cache` |
+| **全推行情**（`subscribe_whole_quote`） | 服务端按 `(client_id, sub_id)` 引用计数，同一组合只在 QMT 订一次；推送走 redis pub/sub，**订同一 topic 的所有客户端都收到**；最后一个退订才真退 | 0.3.49 前同机多进程有坑：`client_id` 默认是每用户一份持久化文件，两个进程共用它、`sub_id` 又都从 1 数起，服务端看成一个订阅者，B 退订会把 A 的也拆掉。现在 `sub_id` 带进程号，不再撞；**跨机器**共用同一份配置时仍请各设 `BIGQMT_QUOTE_CLIENT_ID` |
+| **委托/成交回报**（`on_stock_order` 等） | redis stream + pub/sub 按账号广播，每个客户端各起自己的监听线程，都收到全量事件 | 事件是按账号而不是按客户端的：A 下的单 B 也会收到回报，按 `order_remark` / `strategy_name` 自己过滤 |
+
+### 全市场快照的品种过滤（`types`）
+
+**市场令牌返回的是交易所挂牌的全部标的，股票只占一小部分。** 实测上交所 `"SH"` 共 **26744** 个标的，其中股票 **2315 只（8.7%）**，其余是债券（36%）、回购等。QMT 的耗时严格线性、约 **0.29ms/只**，所以全量要 7.4s，只取股票 0.9s。
+
+从 0.2.15 起 **默认只取股票**：
+
+```python
+xtdata.get_full_tick(["SH"])                      # 2315 只   1.08s   ← 新默认
+xtdata.get_full_tick(["SH"], types=["all"])       # 26744 只  7.39s   ← 旧行为
+xtdata.get_full_tick(["SH", "SZ"])                # 5216 只   1.66s
+xtdata.get_full_tick(["SH"], types=["stock","etf"])
+xtdata.get_full_tick(["600000.SH"])               # 显式代码不受影响
+```
+
+> **这是破坏性变更。** 如果你的代码依赖 `get_full_tick(["SH"])` 返回债券 / 回购 / ETF，请显式传 `types=["all"]`。收窄发生时会打印一次提示，便于发现：
+>
+> ```
+> [bigqmt_market] SH narrowed to 2315 stock; pass types=['all'] for every
+> instrument the exchange lists
+> ```
+
+| `types` | 板块 | 约数 |
+|---|---|---|
+| `stock`（默认） | 上证A股 / 深证A股 / 京市A股 | 2315 / 2901 / 339 |
+| `etf` | 沪深ETF | 1696 |
+| `fund` | 沪深基金 | 2249 |
+| `index` | 沪深指数 | 609 |
+| `convertible`（别名 `cbond` / `cb`） | 沪深转债 | 320 |
+| `all` | 不收窄，返回交易所全部标的 | 26744（SH） |
+
+**关键在于请求时就收窄，而不是拿回来再过滤**——事后过滤仍要付 QMT 对每个多余标的的 0.29ms。板块清单由 FormulaServer 直连提供（实测 13ms）并按运行缓存，相对省下的时间可以忽略。
+
+**收窄失败时退回全量，不返回空**：板块查不到、类型不认识、该市场没有对应板块（如 `HK`），都保留市场令牌照旧请求。丢行情比慢更糟。
+
+**显式传超大代码列表会超时**：26744 个代码显式传入会打爆单次 RPC 超时，而市场令牌可以。要全量请用令牌 + `types=["all"]`。
+
+### `get_market_data_ex` 的 `field_list` 与速度
+
+不传 `field_list` 表示"要全部字段"，返回 11 列，**只能走 RPC**：
+
+```
+field_list=[]                      0.97s   11 列（含 preClose / suspendFlag 等）
+field_list=[open,high,low,close,volume,amount]
+                                   0.03s    6 列   ← FormulaServer 直连，约 30 倍
+```
+
+**这不是可以自动优化掉的差距。** FormulaServer 只供那 6 列，其余 4 列返回 `NaN`，而 RPC 有真实值（实测 `preClose` 9.07 / 7.82 / 11.59，直连全部为 `nan`）。把默认路由到直连会静默把真实价格换成 `NaN`，所以默认保持走 RPC。
+
+**只要 OHLCV 就显式写出来**，那 30 倍就到手了。首次不传 `field_list` 时会在 `bigqmt.log` 记一条说明。
+
+### 启动预热与卡顿监控
+
+**重启策略后，第一次调用 `get_financial_data` 可能要几分钟。** 实测过一次 **346 秒**——当时 QMT 自身完全健康（全推行情每几秒一批、线程池正常），主策略线程也空闲（adjust 每 10 秒 100 拍，每拍 < 2ms）。当天之后的所有调用都在 1 秒内，**包括从没查过的票和没查过的表**，所以这是一次性代价，不是按代码的缓存未命中。
+
+**两个前提条件**（2026-09-10 实测确认，不达成就返回 None 而不是报错）：
+
+1. **数据必须在终端本地**：`get_financial_data` 读的是大 QMT 终端的本地财务库，从没下载过的票/表返回空。大 QMT 没有 `ContextInfo.download_financial_data`，xtdata SDK 又连不上它的数据服务，所以**桥上的 `download_financial_data` 在大 QMT 用不了**——下载只能在 QMT 界面里做（数据管理/财务数据），或在 miniQMT 数据服务上做。
+2. **日期区间要给**：`start_time`/`end_time` 留空时 ContextInfo 直接返回 None（实测 0.17s 空手而归）。给真实区间才返回数据行。MiniQMT 传过来的老代码如果习惯空调用，在大 QMT 上要补上日期。
+
+问题在于它的传染性：**RPC 处理是串行的**，一个调用卡住，后面排队的全部超时。客户端看到的是一片超时，和「桥死了」完全一样。
+
+#### 启动时自动预热（默认开启）
+
+启动后会在**后台线程**上先跑一次这个调用，把这份等待提前付掉：
+
+```
+[bigqmt_warmup] get_financial_data: first call after a restart can take
+minutes; running it now so a caller does not have to wait
+[bigqmt_warmup] get_financial_data warm after 346.0s -- that wait is now paid
+```
+
+热了之后就是这样：
+
+```
+[bigqmt_warmup] get_financial_data warm in 0.31s
+```
+
+**预热不会让这个代价变便宜**，它只是把代价挪到一个确定的时刻、一个没人等待的线程上，并且留下一行说明——而不是让它以「第一个调用方莫名卡死」的形式出现。
+
+> **为什么不放在 init 里？** 启动诊断（`_diag_startup`）跑在主线程的 `init()` 中。把一个可能 346 秒的调用加进去，会在 adjust 定时器都还没排上的时候冻住整个启动——比原问题更糟。所以预热走独立守护线程，`init()` 立即返回。
+
+关掉它（服务端 local config）：
+
+```python
+BIGQMT_REDIS_CONFIG = {
+    # ...
+    "warm_context_data": False,
+}
+```
+
+#### 卡顿监控：区分「桥卡住」和「桥死了」
+
+handler 还在跑的时候就会报，不用等它结束：
+
+```
+[bigqmt_rpc] zmq handler STILL RUNNING method=get_financial_data 40s
+thread=bigqmt-zmq-rpc queued=3 -- the bridge is blocked, not dead
+```
+
+- 默认 **20 秒**触发。比实测最慢的健康调用（整市场快照 7.7s）长得多，又短于客户端 30 秒的默认超时，**所以日志会在调用方放弃之前就点名**
+- 指数退避，一次长阻塞不会把它自己要解释的日志淹掉
+- 调整或关闭（注意它在 **`zmq` 子块**里，不是顶层）：
+
+```python
+BIGQMT_REDIS_CONFIG = {
+    # ...
+    "zmq": {
+        "stall_warn_seconds": 45,   # 0 = 关闭
+    },
+}
+```
+
+**看到成片超时时，先在服务端日志里搜 `STILL RUNNING` 或 `slow handler`。** 有这两行之一，就说明桥没死，只是被一个慢调用堵住了——等它跑完，或者查那个方法。
+
+> 注意 `slow handler` 是**事后**打的（handler 返回才计时），`STILL RUNNING` 才是进行中的。
+
+
+### 版本检测与部署同步
+
+部署到 QMT 是**文件拷贝**，而 QMT 跨策略重跑保留 `sys.modules`。所以「忘了拷」和「拷了但没被加载」从外部看**一模一样**——这是本项目最容易浪费时间的一类问题：本地修好了，实盘却像没修。
+
+**启动时会打印实际加载的版本和目录：**
+
+```
+[bigqmt_shell] bigqmt_signal_trader 0.2.15 loaded from D:\...\python\bigqmt_signal_trader
+```
+
+**客户端可以直接问：**
+
+```python
+xtdata.get_deployment_info()
+# {'version': '0.2.15',
+#  'package_dir':    'D:\...\python\bigqmt_signal_trader',
+#  'qmt_python_dir': 'D:\...\python',
+#  'strategy_dir':   'D:\...\python',
+#  'python_version': '3.6.8'}
+```
+
+**版本不一致时，连接会告警：**
+
+```
+[WARNING] version mismatch: this client is 0.2.15, the QMT-side bridge is 0.2.9.
+A copy alone does not take effect -- QMT keeps modules across strategy re-runs,
+so the strategy must be restarted too. Set BIGQMT_AUTO_SYNC=1 (or call
+xt_trader.sync_deployment()) to push this client's package into the QMT python
+directory.
+```
+
+#### 同步
+
+```python
+xt_trader.sync_deployment(dry_run=True)   # 先看会动哪些文件
+xt_trader.sync_deployment()               # 真同步
+```
+
+目标目录来自 `get_deployment_info()`，**不必硬编码路径**。
+
+设环境变量 `BIGQMT_AUTO_SYNC=1` 后，连接时检测到版本不一致会自动同步。**默认关闭**——往实盘终端写文件不该是"连接"的副作用，源码树里若有半成品会直接进实盘。
+
+| 行为 | 说明 |
+|---|---|
+| **绝不写入配置文件** | `bigqmt_signal_trader_local_config.py` / `bigqmt_signal_trader_client_config.py` 存账号和凭据；对应的 `.example.py` 属文档，会更新 |
+| **不新增顶层文件** | 只刷新部署里已有的模块，加上策略入口（全新部署需要它）。否则 QMT 目录会变得没人说得清 |
+| **覆盖前备份** | 每个被覆盖的文件留 `.bak_<时间戳>` |
+| **原子写入** | 先写临时文件再替换，中断不会留下半个模块 |
+
+> **同步之后必须让策略重新加载。** QMT 跨重跑保留 `sys.modules`，拷贝本身不生效——每次同步结果都带 `restart_required` 并在日志里提示。
+
+#### 让同步生效：`reload_deployment()`（0.3.8 起，不用重启）
+
+```python
+xt_trader.reload_deployment("why")   # -> {'scheduled': True, 'version_before': '0.3.7'}
+xt_trader.reload_status()            # -> {'ok': True, 'modules_purged': 28,
+                                     #     'version_before': '0.3.7',
+                                     #     'version_after': '0.3.8', 'seconds': 0.79}
+```
+
+把所有 `bigqmt_signal_trader.*` 从 `sys.modules` 清掉、重新绑定策略模块 import 时持有的引用、再跑一次 `init()` 重建对象图。**约 0.8 秒。**
+
+**只是"已排期"**：执行它要 `reset_app()`，那会停掉正在应答这个请求的 RPC 服务，所以回复必须先发出去；真正的重载在下一个 adjust tick 上做，轮询 `reload_status()` 看结果。期间约 1 秒的查询会超时（服务正在重建）。
+
+| | |
+|---|---|
+| **能刷新** | `bigqmt_signal_trader/` 下的一切——适配器、RPC handler、models、传输层 |
+| **刷新不了** | `bigqmt_signal_trader_strategy.py` 和 `BIGQMT_REDIS_DRYRUN.py`。QMT 自己 exec 这两个文件，**模块没法 reload 自己所在的模块**——改这两个仍要重启策略 |
+
+用 purge 而不是 `importlib.reload`：reload 必须按依赖顺序（`order_bigqmt` 在 import 时 `from ..models import OrderSnapshot`，顺序错了会**静默**留住旧类），purge 没有顺序问题。
+
+**同步逻辑跑在客户端，不在 QMT 里。** 让交易进程盘中改写自己的代码，等于把源码树里的任何东西（包括改到一半的）直接送上实盘。
+
+### 可插拔传输层
+
+**决定延迟的是线程模式，不是传输。** 2026-09-22 在同一台实盘终端（0.3.53，
+`schedule_adjust_interval: "100nMilliSecond"`）把四种组合各重启一次，**等日志 cadence 回到
+`ticks≈100`**（回放窗口结束）再测，同一组只读探针各跑 20 轮、**轮间隔随机抖动**，
+min / **median** / max（ms）：
+
+| 方法 | redis + drain | zmq + drain | redis + 后台线程 | zmq + 后台线程 |
+|---|---|---|---|---|
+| ping | 16 / **41** / 99 | 8 / **42** / 98 | 7 / **36** / 106 | 5 / **150** / 285 |
+| get_full_tick（1 只） | 21 / **73** / 118 | 4 / **48** / 102 | 6 / **37** / 93 | 109 / **149** / 198 |
+| get_instrument_detail | 25 / **55** / 115 | 5 / **52** / 100 | 9 / **47** / 88 | 84 / **149** / 270 |
+| get_market_data_ex（1d×5）| 22 / **75** / 118 | 10 / **72** / 113 | 7 / **50** / 110 | 108 / **147** / 290 |
+| **query_stock_positions** | 20 / **70** / 121 | 5 / **51** / 97 | 74 / **143** / 199 | 218 / **456** / 573 |
+| **query_stock_orders** | 27 / **83** / 122 | 2 / **35** / 93 | 105 / **157** / 198 | 168 / **444** / 568 |
+| get_full_tick（"SH" 令牌）| 149 / **203** / 268 | 203 / **231** / 294 | 168 / **297** / 429 | 623 / **713** / 1536 |
+| get_market_data_ex（1m 三周窗口）| 58 / **113** / 166 | 32 / **68** / 160 | 39 / **165** / 278 | 123 / **370** / 474 |
+
+- **drain**（`rpc_background_threads: False`）：adjust 线程自己收 / 处理 / 发，分布是
+  **0–1 拍均匀、中位约半拍**（35–85ms），max 封在一拍多一点。redis 和 zmq 没有可感知差别。
+- **后台线程**（`True`）：收包线程每拿一次 GIL 就付约一个 tick。redis 的只读已被 #344
+  （回包合成一次 pipeline）追平到 36–50ms，但**交易查询仍多一拍**（143–157ms），重读也
+  更贵（后台线程模式下没有重读工作线程）。**zmq + 后台线程是唯一该避开的**：交易查询
+  约 5 拍（444–456ms），全市场快照 713ms。
+- **重读走工作线程**（0.3.53）：读本身短的（1m 窗口，12–19ms）在同一拍内就答完，不额外
+  付拍；只有读本身超过一拍的（全市场快照）才溢出到下一拍。
+
+> 自己复测请注意两件事，都是踩过的坑：**等 cadence 回到 `ticks≈100` 再测**（重启后的回放
+> 窗口里 adjust 每秒几千拍，什么都是毫秒级），**轮间隔要随机抖动**（固定 0.3s 正好是 3 拍，
+> 会把每一轮锁死在同一相位，中位数变成第一次调用撞上什么相位的产物）。详见
+> [docs/LATENCY_REPORT.md](LATENCY_REPORT.md) 的方法论。
+
+所以 **`rpc_background_threads` 一律 `False`**，redis 也是。0.3.28 那张「redis + 后台线程
+3.4ms 最快」的表是真的测出来的，但测在**重启后的回放窗口**里：策略一启动 QMT 先回放历史
+K 线，adjust 跟着每根 K 线跑（日志 `adjust cadence: ticks=51429 ... over 10s`，每秒 5000 拍），
+那几十秒里什么 RPC 都是毫秒级；回放完 `run_time` 才是 10Hz。稳态下只读两种模式同档，
+交易查询 drain 稳赢一拍（上表）。0.3.46 及之前
+后台线程模式下 adjust 每拍还会 LPOP 一次，后台线程忙着等 GIL 时请求被 adjust 拿走一拍答完，
+所以体感是 ~100ms 和 500–900ms 混着来；#321 关掉那次 LPOP 后全是 500–900ms（#351 说的
+「变慢」就是这个），drain 则是全部一拍。`bigqmt-init` 从 0.3.51 起对所有传输都写 `False`；
+**旧配置里显式写着 `True` 的不会自动切，改成 `False` 重启一次。**
+自己测延迟先看日志 cadence 回到 `ticks=100` 再测。
+
+**重读少占策略拍（0.3.53，#351）。** drain 把所有请求放到 adjust 线程上跑，一次 1.8s 的
+`get_market_data_ex` 就是你策略自己的 `tick_app` 停 1.8s——这正是 #321 当初把 LPOP 从 adjust
+上拿掉的原因。现在重的读请求交给一条工作线程，回包由 adjust 在下一拍发出：按方法
+（`get_financial_data`、`call_formula` 等）或按大小（市场令牌的 `get_full_tick`、超过 20 个代码、
+`period="tick"`、按日期窗口取 K 线）判定。重读往返多付 1~2 拍；单只 `get_full_tick`、最近 N 根
+K 线这类轻读和所有交易查询照旧一拍。
+实测（2026-09-22，100ms 拍，每种读在工作线程上连打，看终端 `adjust cadence` 的 avg / max）：
+全市场 `get_full_tick(["SH","SZ"])` 读本身 ~200ms，拍 0.100 / 0.25–0.33s；三只 4 个月 1m 窗口
+~500ms，拍 0.100 / 0.27–0.29s；`get_financial_data` 10 只 3 表 ~2.1s，拍 0.100 / ~0.5s——QMT 的
+C 接口大部分时间放 GIL，拍的均值不变、最坏从整段读缩到一段。`download_history_data2` 5 只 ~1.2s
+整段持 GIL，拍 0.56–0.63 / 1.3–1.5s，工作线程帮不上、回包还多付一两拍，所以 `download_*` 不列入，
+照旧 adjust 线程。
+`rpc_heavy_offload: False` 关掉，`rpc_heavy_codes_threshold` 调阈值；`probe_capabilities` 的
+`thread_routing.heavy_sample` 报每类走哪边。
+
+传输本身的取舍：redis 跨机、回报有 stream 短时回放、下载任务和全市场快照缓存都在；
+zmq 同机免 Redis；mysql 兼容兜底。
+**mysql 没有推送通道**：`on_stock_order` / `on_stock_trade` / `on_order_error` 一条都到不了
+（只有 redis pub/sub 和 zmq PUB 能推）。那里的 `order_stock_async` 会改成等服务端结算再回
+（调用方照样不阻塞），拒单靠 `server_error` 变成 `on_order_error`；成交要自己 `query_stock_trades`。
+
+六种渠道返回的**数据完全一致**：100 个方法逐项比对结构指纹（字段名 + 嵌套
+形状），零差异；另取 14 个方法做 sha256 全精度逐字节比对（zmq vs redis），
+也是零差异。**选传输只影响延迟，不影响数据。**
+
+> **这张表在 0.3.21 之前是反的**，写着 zmq「同机低延迟 p50~0.7ms」、redis 13ms。
+> 那个 0.7ms 是撞上 adjust 空窗的最好情况，不是 p50；redis 的 13ms 一直是准的。
+> 实测 **redis 比 zmq 快 8~60 倍**，而且只有 redis 上多线程并发能提升吞吐——
+> zmq 客户端整个请求周期持单 socket 锁，并发拿不到任何收益（#186）。
+> `transport` 没有特别理由就别改。
+
+### FormulaServer 直连快速路径（只读行情，默认开启）
+
+大 QMT 的 `58600` 端口是 **FormulaServer**——QMT 内置的 C++ 行情/参考数据服务（端口取自
+`config/formulaserver/formulaserver.ini` 的 `[server_formula] address`）。QMT 自带 Python
+的 `qmt_api` 包就是它的客户端。
+
+客户端对这些方法会**绕开整条 RPC 链路**（不经过 QMT 的 python 策略线程，也不抢 GIL），
+实测 **p50 0.07ms**，穿过完整客户端栈是 **0.145ms/次**：
+
+| 对比 | p50 |
+|------|-----|
+| redis RPC | ~10ms |
+| zmq RPC（drain）| ~95ms |
+| **FormulaServer 直连** | **0.07ms**（无 GIL 竞争）|
+
+直连覆盖 10 个方法：`get_instrument` / `get_instrument_detail` / `get_instrumentdetail` /
+`get_last_volume` / `get_total_share` / `get_contract_multiplier` / `get_main_contract` /
+`get_weight_in_index` / `get_stock_list_in_sector` / `get_market_data_ex`。
+
+**能力边界（重要）**：FormulaServer 只有行情/参考数据。所有账户、持仓、委托、成交、下单
+方法一律返回 `ErrorID 200005 未找到该服务`，`getFullTick`/`getQuote` 也不存在。所以它是
+**只读快速路径，不是 RPC 桥的替代品**——交易、账户查询、五档盘口仍然走 RPC。
+
+以下方法**刻意不走**直连，因为参数语义与我们的调用方不一致，宁慢勿错：
+
+- `get_trading_dates` —— FormulaServer 要**股票代码**（`000001.SZ`），传市场代码（`SH`）静默返回 `[]`，而我们的调用方传的是市场。
+- `get_divid_factors` / `get_risk_free_rate` —— 参数语义不同（区间 vs 单日、index vs timetag）。
+- **复权 K 线** —— 实测 `dividendType` 传 `none` 和 `front` 返回完全相同，复权未生效。因此只有
+  `dividend_type="none"` 才走直连，其余回退 RPC，避免静默返回未复权价格。
+  （复权数据还需**先在服务端下载原始数据**，见下文「复权数据下载陷阱」。）
+
+配置（客户端侧，默认就是开启，通常不用写）：
+
+```python
+BIGQMT_REDIS_CONFIG = {
+    "formula_server": {
+        "enabled": True,              # 或环境变量 BIGQMT_FORMULA_ENABLED=0 关闭
+        # "host": "127.0.0.1",        # 默认本机；FormulaServer 绑 0.0.0.0，跨机需放行防火墙
+        # "port": 58600,              # 不写则从 qmt_root 的 ini 读，再退回 58600
+        # "qmt_root": r"D:\QMT交易端",
+        # "timeout_seconds": 3.0,
+        # "methods": ["get_instrument"],       # 只路由白名单里的方法
+        # "failure_cooldown_seconds": 30.0,    # 连不上后停用多久再重试
+    },
+}
+```
+
+**失败一律自动回退 RPC**：方法未映射、参数translate 不了、服务没起、连接断——都退回原路径，
+所以连不上 58600 的客户端行为与改动前完全一致。BSON 编解码内置了无依赖实现（可选用
+pymongo 的 `bson`，两者输出实测逐字节一致），客户端不需要额外装包。
+
+### QMT 启停 / 自动重启（qmt_launcher）
+
+大 QMT 基本每天早上要重启一次，卡点在登录框。两条路绕过它：
+
+> **也可以干脆不重启**（issue #276，@pujfei）：QMT 设置里的「启用自动初始化」
+> 取消勾选后，终端不再每天自动重启策略，可长期不重启运行。
+> 不重启的部署仍然要注意：升级桥代码后必须手动重启策略（QMT 跨运行保留
+> `sys.modules`，光拷文件不生效）。
+>
+> **但不是每台终端都撑得住长期不重启**（issue #309，某券商 1.0.0.37973）：有部署在
+> 取消勾选后大 QMT 的持仓不再刷新——是终端的行情连接掉了，桥本身没坏。两条路：
+> 在 QMT 的「行情源」对话框底部把**交易中心自动更换服务器**和**自动优选**勾上，
+> 让终端断线后自己换站点；或者干脆保留每天早上定时重启（下面
+> `qmt_launcher restart` 就是干这个的）。下面是程序化启停的方案。
+
+> **依赖**：进程枚举优先用 `psutil`；Win11 起系统不再带 `wmic`，没有 psutil 时
+> `close_qmt`/`status` 会直接报 `cannot enumerate processes`（issue #128）。
+> 装上即可：`pip install psutil`。
+
+```bash
+python -m bigqmt_signal_trader.qmt_launcher status  --dir "D:\QMT交易端"
+python -m bigqmt_signal_trader.qmt_launcher restart --dir "D:\QMT交易端"
+```
+
+| mode | 做什么 | 需要登录框交互 |
+|------|--------|---------------|
+| `linkmini` | `XtMiniQmt.exe linkMini`，MiniQMT 免密启动 | 否 |
+| `bat` | 跑指定批处理（如 `免密登录qmt.bat`）| 否 |
+| `exe` | 直接起 `XtItClient.exe`，靠终端自身恢复会话 | 否 |
+| `login` | 起 exe 后向登录框输入账号密码 | 是，需 pywin32 + pyautogui |
+
+> ⚠️ **`linkmini` 对本项目不可用**：它起的是迷你终端（MiniQMT），没有策略编辑器和
+> ContextInfo 运行时，桥作为大 QMT 策略跑不进去。本项目的桥必须用 `exe` / `bat` /
+> `login` 三种模式（都起大终端）。`linkmini` 只在你**同时需要迷你终端**（给外部
+> xtquant SDK 提供行情/交易服务）时才有意义——那是另一个进程，与桥互不影响。
+
+**`login` 模式需要未锁屏的交互式桌面。** 它用的是 `keybd_event` / `mouse_event`
+物理输入（经 ctypes），不是 `SendMessage`——消息式输入投不到 Qt 对话框的焦点控件上，
+当别的窗口在前台时会静默失败，什么也不输入。物理输入要求对话框在最前，所以启动前会
+先把它置顶并核验；锁屏或 RDP 注销的会话直接抛 `QmtLauncherError` 而不是打一半密码。
+
+> 需要**无人值守定时重启**（重启的是**大终端**+桥策略）的话，用 `bat` / `exe` / `login`
+> 三种模式。`bat`/`exe` 不碰登录框、锁屏也能跑，但要求终端自身能恢复会话（设了自动登录）；
+> `login` 会替你输密码，但受锁屏限制。
+
+密码从环境变量 `BIGQMT_LOGIN_USER` / `BIGQMT_LOGIN_PASSWORD` 读，不走命令行参数——argv
+对同机任何进程可见。
+
+#### Python API
+
+除了命令行，也可以在代码/计划任务脚本里直接调函数（语义与 CLI 一致）：
+
+```python
+from bigqmt_signal_trader.qmt_launcher import (
+    close_qmt, open_qmt, restart_qmt,
+    is_qmt_running, find_qmt_processes, wait_until_ready, session_is_locked,
+)
+
+# 关：先礼貌 terminate（QMT 会冲刷本地数据），force_after_seconds 后才强杀。
+# 只终结该安装目录 bin.x64 下的进程；拿不到 exe 路径的进程直接跳过而不是误杀。
+close_qmt(r"D:\QMT交易端", force_after_seconds=20)
+
+# 开：mode 见上表（exe/bat/login；linkmini 对本项目不可用）。
+# login 模式自动填账号密码：Alt 解锁前台 + 置顶 + 字段级像素验证打字，
+# 打完逐段验证（账号必须进账号区、密码必须进密码区），错了清空中止，不提交错表单。
+open_qmt(
+    r"D:\QMT交易端",
+    mode="login",
+    credentials={"user": "你的账号", "password": "你的密码"},
+    window_title_prefix="QMT",          # 登录框标题包含串（模拟端 "券商QMT交易端模拟" 也能匹配）
+    ready_timeout_seconds=180,          # 等 FormulaServer(58600) 就绪的超时
+)
+
+# 一把重启：close_qmt → 等端口释放 → open_qmt。会话锁屏且需要 login 时直接抛错
+# （而不是关掉终端却登不回去）。
+restart_qmt(r"D:\QMT交易端", mode="login",
+            credentials={"user": "...", "password": "..."})
+
+# 状态查询
+is_qmt_running(r"D:\QMT交易端")      # 进程在不在
+find_qmt_processes(r"D:\QMT交易端")  # [(pid, 进程名, exe 路径)]
+wait_until_ready(port=58600)                       # 阻塞到 FormulaServer 可连接
+session_is_locked()                                # 交互式会话是否锁屏
+```
+
+两个设计要点：
+
+- **按安装目录隔离**。同机常并行跑多个 QMT，`taskkill /im XtItClient.exe` 会误杀别人的
+  实盘。这里只终结 `--dir` 对应 `bin.x64` 下的进程；拿不到 exe 路径的进程直接跳过而不是
+  猜。
+- **等就绪而不是 sleep 固定秒数**。启动完成的判据是 FormulaServer 端口（58600）能接受连接，
+  超时抛 `QmtLauncherError` 而不是静默返回，避免定时任务在没起来的终端上继续跑。
+
+`restart` 默认在关闭后等 5 秒再启动：ZMQ 传输是精确绑定配置端口（不扫描），socket 没
+完全释放就重启会绑定失败。
+
+### 独立 ZMQ 回测桥接
+
+`bigqmt_backtest` 与实盘 RPC 桥接完全分离，提供两个明确隔离的后端：
+
+- `QMT_NATIVE`：`BIGQMT_ZMQ_BACKTEST.py` 运行在 QMT 回测进程内。QMT 负责历史
+  行情推进、资金持仓、`passorder/cancel` 和原生撮合；ZMQ 只桥接 Bar、订单意图及
+  QMT 委托/成交结果。
+- `LOCAL_SIM`：端口 `16661` 的独立 CSV 工具，仅用于脱离 QMT 验证协议和策略逻辑，
+  使用本地撮合并输出本地结果文件。
+
+QMT 原生入口使用独立端口 `16662`、独立 `run_id/client_id`，强制验证
+`ContextInfo.do_back_test=true`，固定 `live_ready=false`，不会导入或修改
+`bigqmt_signal_trader`。
+
+启动 CSV 独立测试服务：
+
+```powershell
+python -m pip install -e .
+python -m bigqmt_backtest.server `
+  --data examples/backtest_bars.example.csv `
+  --config examples/backtest_config.example.json `
+  --run-id demo-001 `
+  --bind tcp://127.0.0.1:16661
+```
+
+另开一个终端运行外部策略：
+
+```powershell
+python examples/zmq_backtest_strategy.py `
+  --endpoint tcp://127.0.0.1:16661 `
+  --run-id demo-001 `
+  --symbol 600000.SH `
+  --fast 2 `
+  --slow 3
+```
+
+QMT 原生安装、逐 Bar 同步协议、CSV 备用模式和安全边界见
+[docs/ZMQ_BACKTEST_BRIDGE.md](ZMQ_BACKTEST_BRIDGE.md)。
+
+### 无 redis 版本（QMT 沙箱拒绝 import redis 时用）
+
+如果你的 QMT 环境**拒绝 `import redis`**（券商白名单拦截），用 `bigqmt_no_redis/` 目录下的无 redis 版本：
+
+- `bigqmt_no_redis/zmq_transport.py` — 自包含的 ZMQ transport，内联所有编码函数，**完全不 import redis_common/redis_rpc**，去掉 redis 服务发现（用静态派生端口）
+- `bigqmt_no_redis/DRYRUN_no_redis.py` — 无 redis 的 DRYRUN 入口，强制 `transport=zmq` + `background_threads=True`，只加载 zmq transport
+
+**用法**：QMT 策略编辑器加载 `BIGQMT_DRYRUN_NO_REDIS.py`（同步到 QMT 目录时用这个文件名），RPC 走纯 ZMQ，零 redis 依赖。其余功能（行情/交易/持仓查询）与标准版一致。
+
+### 单文件构建（QMT 沙箱禁止加载外部文件时用）
+
+部分券商的 QMT 更严：**白名单 + 不能加载文件、不能 import 外部模块**，只有把所有代码放进**一个策略文件**才能跑（Issue #56）。`tools/` 下两个生成器负责把整个包打成一个自包含文件：
+
+```bash
+python tools/build_single_file.py
+python tools/build_no_redis_single_file_flat.py
+```
+
+| 生成器 | 产物 | 内嵌方式 | 用于 |
+|---|---|---|---|
+| `build_single_file.py` | `src/BIGQMT_REDIS_DRYRUN_ALL_IN_ONE.py` | base64 | redis / zmq 均可 |
+| `build_no_redis_single_file_flat.py` | `src/BIGQMT_DRYRUN_NO_REDIS_FLAT_ALL_IN_ONE.py` | **明文真实代码** | 沙箱拒绝 `import redis` 时，强制 ZMQ |
+
+两者都内嵌 `bigqmt_signal_trader` 全部子模块 + `bigqmt_signal_trader_strategy` + `bigqmt_signal_trader_redis_rpc_runtime`，运行时用自定义 import 钩子从内存解析，**不从磁盘 import 任何自定义模块**；只依赖标准库和第三方库（redis / zmq / pandas）。
+
+**flat 版**把每个模块缩进进 `def _mod_N():` 函数体、再用其 `__code__` 在独立模块命名空间里 exec，所以内嵌源码在生成文件里**可搜索、可阅读、可直接改**，IDE 也能高亮跳转。它处理了两个坑：用 tokenize 保护多行字符串内部不被缩进改动；用 AST 收集模块级绑定名并在函数体开头注入 `global`，否则被嵌套函数闭包引用的模块级名字会变成 cell 变量，与 `global` 更新的模块 dict 失去同步。
+
+> 函数体 exec 也正是 `from X import *` 变成 `SyntaxError: import * only allowed at module level` 的原因（Issue #76）。整个包因此不允许出现星号导入，`tests/test_single_file_build.py` 会守住这条。
+
+**用法**：编辑生成文件顶部的 config block（`BIGQMT_ACCOUNT_ID` / `BIGQMT_ACCOUNT_TYPE` / `BIGQMT_REDIS_CONFIG`），把这**一个文件**拷进 QMT 的 python 目录当策略加载即可，不需要一并拷贝整个包。默认值与 `src/bigqmt_signal_trader_local_config.example.py` 保持一致——**`rpc_allow_order_methods` 默认为 `False`**，需要远程下单/撤单时才显式打开。
+
+产物约 900KB / 700KB，已加入 `.gitignore`——**用时重新生成，不要提交**。改动包内代码后需重新运行生成器。
+
+感谢 @heimo88 提供这两个脚本并在其券商环境实测。
+
+### 委托/成交查询的 strategy_name 陷阱（重要）
+
+`get_trade_detail_data` 按 `strategy_name` 过滤委托/成交——**下单时用的 strategy_name 必须和查询时一致**，否则查不到。
+
+- 下单时传 `strategy_name="rpc_test"` → 委托记在 `rpc_test` 下
+- 查询时传 `strategy_name="bigqmt_signal_trader"` → 返回空（不匹配）
+
+**修复**：`query_orders` / `query_trades` 默认传**空字符串 `""`**，返回该账户的**全部**委托/成交（不按 strategy_name 过滤）。如需过滤，显式传 `strategy_name`。
+
+实测验证（`get_trade_detail_data` 探测）：
+- `st=""` → ORDER=9, DEAL=9（全部）
+- `st="rpc_test"` → ORDER=3, DEAL=1（只有 rpc_test 的）
+- `st="bigqmt_signal_trader"` → ORDER=0, DEAL=0（空）
+
+### 复权数据下载陷阱（重要）
+
+**前/后复权 K 线必须先在服务端下载原始数据，否则返回全 0**。
+
+Big QMT 的复权（`dividend_type='front'`/`'back'`）是**服务端现场计算**的——需要原始 K 线 + 除权因子已经在服务端存在。直接请求 front 而服务端没下载过原始数据时，返回的 close 全是 `0.0`（只有最后一根有价）。
+
+实测复现（600654.SH / 600227.SH）：
+- 直接 `get_market_data_ex(dividend_type='front')` → 634 行全 0
+- 先 `download_history_data` 后再请求 → 真实复权价（front ≠ none，复权生效）
+
+**已修复**：`xtdata.download_history_data2(codes, period, dividend_type='front')` 现在会**自动先触发服务端原始数据下载**（拉原始 K 线 + 除权因子），再拉复权数据到本地缓存。用法不变：
+
+```python
+# 前复权下载（自动先服务端下载原始数据 + 除权因子）
+xtdata.download_history_data2(["600654.SH"], period="1d",
+                               start_time="20240101", dividend_type="front")
+
+# 之后本地读取（零 RPC）
+xtdata.get_local_data(["close"], ["600654.SH"], period="1d",
+                      start_time="20240101", dividend_type="front")
+```
+
+**读取类 API 也自愈**：`get_market_data_ex` / `get_market_data` 带复权参数时，若检测到返回全 0（服务端缺原始数据），会自动触发服务端下载、等待落盘、重试一次，拿到真实复权价。`get_local_data` 的 fallback 拉取同样受益。无需手动等待。
+
+注意：QMT 服务端下载是**异步落盘**的，自愈路径内置了等待 + 一次重试；极端大区间若一次重试仍全 0，可稍后重读或先显式 `download_history_data2`。
+
+> **下载是阻塞的，这是刻意的**：QMT 的下载全局「提交任务即返回」，数据异步落盘，桥在下载后轮询确认数据可见才返回——否则你下一行读到的就是旧数据（#66 的教训）。这个等待本身是亚秒级的。
+>
+> **0.3.37 之前单票下载要等满 60 秒，那是 bug，不是等待本身慢**（issue #275，由 @pujfei 定位）：轮询里的读经过了自愈，自愈看到「还没落地」就把刚提交的那笔下载**原样再提交一遍**、睡 2 秒、再读，每轮如此，等待目标被反复推后，只能打满 60 秒。修复后同一台终端单票 1d 冷宽窗 **0.06 秒**。批量形态之前之所以快（10 票 2.2s），是因为多码时自愈的多数判据不易触发，它绕开了这个 bug 而不是没有这个 bug。
+>
+> 批量下载仍建议 `download_history_data2(codes)` 整批传：一次服务端下载、一次等待，比逐票循环少付固定开销。但这是效率差异，不再是 60 秒对 2 秒的差异。
+
+### 实盘卖出方向误判修复（exec_events）
+
+实盘发现：QMT 回调里 `m_nDirection` **恒为 48**（即使是卖出），导致卖出被误判为买入。
+
+修复（`exec_events._extract_direction`）改为仲裁链：
+1. `m_nOffsetFlag`（最可靠，匹配 `query_orders`）
+2. `m_nDirection`（传统 EEntrustBS，但实盘可能恒为 48）
+3. 当 direction≠offset（期货：卖+开仓=49+48），用 `m_nOpType`（23=买/24=卖）仲裁
+4. `m_nOpType`/`order_type`（兜底）
+
+对股票现货，direction=offset（48=买/49=卖）；对期货，direction≠offset，仲裁保正确。
+
+### 多账号使用（股票+期货 / 普通+信用）
+
+两种方式。**同一个 QMT 客户端里登录了多个资金账号**（比如股票户加期货户）用方式一，一个策略实例同时服务它们；账号分属**不同客户端**（不同券商、不同机器）只能用方式二。
+
+RPC channel 都按 `account_id` 隔离（`bigqmt:rpc:req:{account_id}`），客户端连哪个账号就填哪个 `account_id`，两种方式对客户端代码没有区别。
+
+#### 方式一：单实例双账号（`BIGQMT_ACCOUNT_TYPE_MAP`）
+
+一个策略实例、每个账号一条 channel、共用同一套 QMT 句柄。服务端配置在单账号的基础上**多一张路由表**，其余不变：
+
+```python
+# bigqmt_signal_trader_local_config.py —— 单终端双账号：STOCK + FUTURE
+
+# 主账号：策略在 QMT 里以哪个账号加载运行，这里就填哪个。
+# 它的 channel 跑在 adjust 主线程上，所有账号的交易类请求最终都在这里执行。
+BIGQMT_ACCOUNT_ID = "你的股票账号"
+BIGQMT_ACCOUNT_TYPE = "STOCK"
+
+# 路由表：key=account_id，value=account_type（STOCK / CREDIT / FUTURE / STOCK_OPTION）。
+# 主账号也要在表里。表里除主账号外的每个 key 各起一个 secondary service，
+# 各有自己的 channel（bigqmt:rpc:req:{那个账号}）。
+# 每次请求按其 account_id 查这张表决定 account_type，再传给 QMT API。
+BIGQMT_ACCOUNT_TYPE_MAP = {
+    "你的股票账号": "STOCK",
+    "你的期货账号": "FUTURE",
+}
+
+BIGQMT_REDIS_CONFIG = {
+    "transport": "redis",
+    "host": "...", "port": 6379, "db": 5, "password": "...",
+    "account_id": BIGQMT_ACCOUNT_ID,
+    "rpc_allow_order_methods": True,      # 对这个实例上的所有账号一起生效
+    "rpc_process_in_listener": True,
+    "rpc_listener_methods": ("*",),
+    "schedule_adjust": True,
+    "schedule_adjust_interval": "500nMilliSecond",
+}
+```
+
+几点说明：
+
+- **只有 `BIGQMT_ACCOUNT_TYPE_MAP` 是桥读的键**。副账号不需要单独的变量，表里有它就够了；表为空或只有一条时，`build_multi_account_rpc_service` 原样返回单账号 service，行为零变化。
+- **`bigqmt-init` 只问一个账号**，生成的是单账号配置。双账号要在生成的文件里手工加 `BIGQMT_ACCOUNT_TYPE_MAP`。
+- **主账号 = 策略在 QMT 里绑定的那个**。QMT 的模型交易一个实例只绑一个账号（界面选定），`BIGQMT_ACCOUNT_ID` 必须是它，否则 `passorder` 走的账号和策略绑定的对不上。
+- **交易类请求不并发**。secondary 在后台线程收请求，但 `submit` / `cancel` / 持仓委托查询都 defer 到主账号的 adjust 线程排队执行——`get_trade_detail_data` 离开主线程返回空，这是 QMT 的约束，不是桥的。
+- **撤单按 `account_id` 路由**（#171 起）。此前 `cancel` 一律用网关自己的账号，双账号里撤期货委托会用股票账号发出去。
+- **zmq 也能跑方式一**（#334 起）。副账号在 zmq 下拿自己的端点：端口按副账号派生，和按该账号配置的 zmq 客户端派生的连接地址一致，host 继承主账号 `bind_address` 的；回报轮询走全推通道的 `exec:*` topic。mysql 没有按账号的寻址，不支持方式一。
+- **副账号的委托/成交回调靠轮询**（#320 起）。大 QMT 的 `order_callback` / `deal_callback` 只回策略绑定的主账号，副账号的单进程里根本看不到。桥在 adjust 拍上每秒对副账号查一次 `get_trade_detail_data`（ORDER / DEAL），状态有变化就发到该账号自己的 `bigqmt:order_events:<副账号>`——`on_stock_order` / `on_stock_trade` / 废单的 `on_order_error` 都有，延迟约一个轮询间隔（`rpc.secondary_exec_poll_seconds`，默认 1 秒），一个间隔内连跳多个状态只发最后一个；要每个中间状态就用方式二。主账号仍是即时回调。
+- **全推行情推送到每个账号**（#315 起）。推送通道按账号命名（`bigqmt:quote_push:<账号>:<topic>`），此前只发主账号的频道，按副账号配置的客户端「订阅成功但无回调」。现在表里每个账号各发一份，客户端不用改。
+- **已实盘验证**：上面这份配置的形状就是一套实际跑着的 STOCK + FUTURE 部署，dual-channel 收发、副账号的 `account_id` 注入、副账号交易请求被主线程 drain 三条路都在实盘走通了。#171 合并时 CHANGELOG 写的"本仓库从未实跑过"已经不再成立。换券商或换账号类型组合时，仍建议先用小单验一遍副账号的下单、撤单、持仓。
+
+#### 同一个账号、几种类型：港股通（`BIGQMT_ACCOUNT_TYPE` 写成列表）
+
+港股通不是另一个账号：股票户用**同一个资金账号**做沪港通 / 深港通，但终端把那些持仓、委托、
+成交记在 `get_trade_detail_data(账号, 'HUGANGTONG' | 'SHENGANGTONG', ...)` 下，按 `'STOCK'`
+查不到。`BIGQMT_ACCOUNT_TYPE_MAP` 一个账号只能对一个类型，写不出这件事——所以类型可以是**列表**，
+第一个是默认（0.3.54 起）：
+
+```python
+BIGQMT_ACCOUNT_ID = "你的股票账号"
+BIGQMT_ACCOUNT_TYPE = ["STOCK", "HUGANGTONG", "SHENGANGTONG"]   # 方式一的表里也可以：{"账号": ["STOCK", "HUGANGTONG"]}
+```
+
+客户端照 MiniQMT 的写法，用类型不同的 `StockAccount` 分别查：
+
+```python
+acc    = StockAccount("你的股票账号")                  # A 股
+acc_hk = StockAccount("你的股票账号", "SHENGANGTONG")  # 深港通（沪港通用 "HUGANGTONG"）
+xt_trader.query_stock_positions(acc)      # STOCK 持仓
+xt_trader.query_stock_positions(acc_hk)   # 深港通持仓
+xt_trader.order_stock(acc_hk, "00700.HK", xtconstant.STOCK_BUY, 100, xtconstant.FIX_PRICE, 300.0)
+```
+
+`StockAccount` 的类型随每个交易类请求以 `account_type` 参数传到服务端；在列表里就按它查、按它结算
+（港股通委托的合同编号回填要去 HUGANGTONG 的委托列表里找），不在列表里仍按默认答并记一次日志——部署
+的配置仍然决定这个账号是什么户（#92 那条不变）。`ping` 多报 `account_types`，客户端的「类型不一致」
+告警只在声明的类型不在这张表里时才响。下单本身不用改：`passorder` 的 23/24 对 `.HK` 代码就是港股通
+买卖。撤单也带类型。**没有港股通权限或不用列表的部署，行为零变化。**
+
+#### 方式二：多策略实例（账号在不同 QMT 客户端时的唯一选择）
+
+**适用条件：每个账号登录在各自的 QMT 客户端里**（不同券商、不同机器，或同一台机器上两个安装目录）。每个客户端是一个独立进程，各自有自己的 `python` 目录，所以什么都不用"指向"——每个目录里放一份**同名**的配置文件和一份入口，各写各的账号：
+
+```
+D:\QMT交易端\python\            ← 客户端 A，登录股票账号
+├── bigqmt_signal_trader/
+├── bigqmt_signal_trader_strategy.py
+├── bigqmt_signal_trader_redis_rpc_runtime.py
+├── BIGQMT_REDIS_DRYRUN.py
+└── bigqmt_signal_trader_local_config.py    BIGQMT_ACCOUNT_ID = "股票账号", BIGQMT_ACCOUNT_TYPE = "STOCK"
+
+E:\华泰QMT\python\                       ← 客户端 B，登录信用账号
+├── （同样 4 项）
+└── bigqmt_signal_trader_local_config.py    BIGQMT_ACCOUNT_ID = "信用账号", BIGQMT_ACCOUNT_TYPE = "CREDIT"
+```
+
+两份配置连同一个 Redis 即可（`host` / `port` / `db` / `password` 相同）。每个客户端在自己的模型交易里加载自己目录下的 `BIGQMT_REDIS_DRYRUN.py`，两个实例的 RPC channel 按 `account_id` 自动隔离（`bigqmt:rpc:queue:<账号>`），互不影响。`bigqmt-init` 在每台/每个目录各跑一遍就是这个结果。
+
+> **同一个 QMT 客户端里跑不了两个实例。** 同一客户端的所有策略共用一个 Python 进程和一份 `sys.modules`，配置模块名 `bigqmt_signal_trader_local_config` 在入口、runtime、strategy 三处写死，第二个实例 import 到的仍是第一份配置——两个实例绑同一个账号，而且都正常启动、不报错。**同一客户端里登录了多个账号，用方式一。**（#261 反馈的"每个指向不同的配置"此前没写清楚：不存在这样的指向，是靠目录隔离。）
+
+> **zmq 模式注意**：每个实例的 zmq 端口从 account_id 派生（`15560 + account_id mod 100`），不同账号自动不冲突；两个客户端在同一台机器上也一样。
+
+**客户端（外部程序）**：为每个账号创建独立的 client/trader 对象。
+
+```python
+from bigqmt_signal_trader.xtquant_compat import BigQmtRpcClient, BigQmtXtTrader, StockAccount
+
+# 股票账号
+stock_client = BigQmtRpcClient(account_id="股票账号", redis_config={...})
+stock_trader = BigQmtXtTrader(account_id="股票账号", redis_client=stock_client.redis_client)
+stock_acc = StockAccount("股票账号", "STOCK")
+
+# 信用账号
+credit_client = BigQmtRpcClient(account_id="信用账号", redis_config={...})
+credit_trader = BigQmtXtTrader(account_id="信用账号", redis_client=credit_client.redis_client)
+credit_acc = StockAccount("信用账号", "CREDIT")
+
+# 分别查询/下单
+stock_asset = stock_trader.query_stock_asset(stock_acc)
+credit_positions = credit_trader.query_stock_positions(credit_acc)
+```
+
+> **跨账号隔离**：每个账号的 RPC channel、持仓查询、委托回报完全隔离（按 `account_id` 路由），互不影响。
+
+---
+
+## 与 MiniQMT 的兼容性对照
+
+本项目的目标是让照着 MiniQMT (`xtquant`) 写的代码不改就能跑。下表列出**返回值契约**——类型不对不会报错，只会让判断悄悄反过来，所以单独列出来。
+
+### 返回值：与 MiniQMT 一致
+
+| 接口 | 返回 | 说明 |
+|---|---|---|
+| `order_stock()` | `int` | 成功为正数，失败 `-1` |
+| `order_stock_async()` | `int` | 请求序号 seq，结果走 `on_order_stock_async_response` |
+| `cancel_order_stock()` | `int` | **`0` 成功，`-1` 失败**（不是 True/False） |
+| `cancel_order_stock_sysid()` | `int` | 同上 |
+| `cancel_order_stock_async()` | `int` | seq |
+| `connect()` / `start()` | `int` | `0` 成功 |
+| `subscribe()` / `unsubscribe()` | `int` | `0` 成功 |
+| `query_stock_asset()` | 对象 | `.cash` / `.total_asset` 等属性 |
+| `query_stock_positions()` | `list[对象]` | |
+| `query_stock_orders()` / `query_stock_trades()` | `list[对象]` | |
+| `subscribe_quote()` / `subscribe_whole_quote()` | `int` | 订阅号，传给 `unsubscribe_quote()` |
+| `get_full_tick()` | `dict` | `{code: {...}}` |
+| `get_market_data_ex()` | `dict[str, DataFrame]` | |
+
+### 订单号：既是 int 也是 str
+
+MiniQMT 的 `order_id` 是 int（委托编号），`order_sysid` 是 str（柜台合同编号）。大 QMT **没有前者**——`get_trade_detail_data` 只给 `m_strOrderSysID` 这个字符串。
+
+所以这里的 `order_id` 是一个 int 子类，两种形态同时成立：
+
+```python
+order_id = xt_trader.order_stock(acc, "600000.SH", 23, 100, 11, 10.0, "s", "")
+
+isinstance(order_id, int)   # True —— MiniQMT 写法照常
+order_id > 0                # True
+order_id == -1              # 失败时才 True
+
+str(order_id)               # '合同编号' —— 券商给的原始字符串
+xt_trader.cancel_order_stock(acc, order_id)   # 撤单送回的是原始字符串
+```
+
+合同编号是纯数字时（多数券商），int 值就是那个数字，两种形态完全一致；不是纯数字时 int 是一个稳定的正数替身，而撤单、打印用的仍是真实编号。
+
+把 order_id 存进数据库再取出来（变成普通 int）也能撤单——客户端记着最近 4096 个的对应关系。想要字符串就用 `.order_sysid`，它一直是 str。
+
+同样的规则适用于 `XtOrder.order_id`、`XtTrade.order_id`，以及回调对象 `XtOrderError` / `XtCancelError` / `XtOrderResponse` 里的 `order_id`。
+
+### 行为差异（不是返回值，但会咬人）
+
+| 项目 | MiniQMT | 本项目 |
+|---|---|---|
+| `get_full_tick(["SH"])` | 全市场 | **默认只取股票**（1.08s）；要全部传 `types=["all"]`（7.4s，含地方债等 26744 只） |
+| `get_instrument_detail()` 查不到 | `None` | `{}`（两者都是 falsy，`if not detail` 通用） |
+| `download_history_data()` | 无返回 | 返回 `{"finished": n, "total": n}`（多给的信息，可忽略） |
+| 账户类型 | `StockAccount(id, "CREDIT")` 即可 | 服务端 `BIGQMT_ACCOUNT_TYPE` 决定；客户端的类型会随请求传来，但只在服务端配置（可以是列表，港股通）允许时才生效 |
+| 委托类型常量 | `xtconstant.order_type` | 内部会翻译成 `passorder` 的 opType（两套编号，专项两融 40–45 → 70–75） |
+
+### 本项目的扩展（MiniQMT 没有）
+
+这些不是兼容项，是多出来的：`order_stock_result()`（返回完整 dict 而非单个 id）、`order_stock_batch()`、`wait_async_orders()`、`ipo_subscribe_all()`、`sync_deployment()`、`get_deployment_info()`、`query_execution_snapshot()`、`local_cache_stats()`、`convert_bond()` / `sell_back_bond()`（可转债转股 / 回售，大 QMT passorder opType 80-83，按账户类型自动选普通户/信用户编号；`order_stock` 直接传 80-83 也认）。
+
+---
+
+## 环境要求与依赖安装
+
+本系统分两部分，各自需要自己的 Python 环境和依赖：
+
+| 部分 | 运行位置 | Python | 装什么 |
+|------|---------|--------|--------|
+| **客户端**（外部程序）| 你的开发机 | **3.8 ~ 3.13** | `pip install xtquant-big-convert` |
+| **服务端**（QMT 内）| QMT 的 `bin.x64/python.exe` | 3.6（QMT 自带，改不了）| 按传输装 1 个包 |
+
+### 版本约束（装之前先看这个）
+
+**客户端 Python 建议不超过 3.13。** 3.8~3.13 是实际跑过的范围。更高的版本没有
+测过 —— 直接依赖（pyzmq / msgpack / pandas / numpy）都已经有 3.14 的轮子，所以
+不是装不上的问题，只是没验证过，遇到怪问题请先退回 3.13 再报。
+
+**`redis` 包不要装 8.x。** 已在 `[redis]` extra 里限制为 `>=5.0.0,<8.0.0`。
+8.x 改了两个默认值，实测：
+
+| redis-py | `protocol` 默认 | 默认重试次数 |
+|---|---|---|
+| 5.2.1 | 2 | 0（不重试）|
+| 6.4.0 | 2 | 3 |
+| 7.4.0 | 2 | 3 |
+| **8.1.0** | **None** | **10** |
+
+重试次数要紧，因为 RPC 请求是用 `RPUSH` 发的，而 **`RPUSH` 不幂等**：redis-py
+的重试包住的是「发送 + 读应答」，服务端已经收下、只是应答丢了的情况下，同一条
+`RPUSH` 会被重发 —— 一次下单可能派发两次（#245）。服务端从 0.3.29 起按
+`request_id` 去重兜住了这条，但没有理由把默认重试次数从 3 抬到 10。
+
+**QMT 端（服务端）的 redis 更要小心:它是 Python 3.6。** redis-py 从 4.4 起要求
+Python 3.7+，所以 QMT 里能装的最高是 **4.3.x**；QMT 自带的是 3.5.3，本项目按版本
+能力透传参数，能直接用。在 QMT 目录里 `pip install -U redis` 是自找麻烦 ——
+issue #71「最新代码 QMT 报错」就是给 3.5.3 传了它不认识的 `protocol` 参数导致的
+`TypeError`。**没有特别理由，不要动 QMT 自带的 redis。**
+
+### A. 客户端（外部程序，推荐 pip 安装）
+
+客户端就是**写策略/调接口的那台电脑**（也叫「开发机」）。直接 pip 安装：
+
+```powershell
+# 基础安装（含 pyzmq，zmq 传输必需）
+pip install xtquant-big-convert
+
+# 含 redis 支持（redis 传输）
+pip install xtquant-big-convert[redis]
+
+# 含 mysql 支持（mysql 传输）
+pip install xtquant-big-convert[mysql]
+
+# 开发环境（含测试工具）
+pip install xtquant-big-convert[dev]
+
+# 从源码安装（开发模式）
+git clone https://github.com/litaolemo/xtquant_big_convert.git
+cd xtquant_big_convert
+pip install -e .
+```
+
+安装后可直接 import：
+
+```python
+from bigqmt_signal_trader.xtquant_compat import configure, xt_trader, xtdata
+from bigqmt_signal_trader.transports.factory import build_transport
+
+configure()
+print(xtdata.get_full_tick(["000001.SZ"]))
+```
+
+### B. 服务端（QMT 内 Python 3.6）
+
+> **前置：先在 QMT 界面里下载 Python 组件。** 全新安装的终端 `bin.x64\` 下**没有 `Lib\` 目录**，也没有 `python.exe`——那是 Python 组件带来的，不是终端自带的，**不要自己手动创建 `Lib\`**。在 QMT 客户端里下载安装该组件后，`bin.x64\Lib\site-packages\` 才会出现，下面的路径才成立。具体入口见迅投官方文档。
+
+QMT 自带 Python 3.6（`bin.x64/python.exe`），**只需按你选的传输装对应依赖**：
+
+| 传输 | 服务端需要的包 | 客户端需要的包 |
+|------|--------------|--------------|
+| **redis**（默认）| `redis`（QMT 通常已内置）| `redis` |
+| **zmq** | `pyzmq` | `pyzmq`（基础安装已含）|
+| **mysql** | `pymysql` + `DBUtils` | `pymysql` + `DBUtils` |
+
+> ⚠️ **用 redis 传输就不需要装 pyzmq / pymysql / DBUtils**——下面的安装说明是按需的，你用什么传输装什么。
+
+**安装到 QMT 的 Python（以 zmq / mysql 为例）：**
+
+QMT 的 Python 3.6 用旧 OpenSSL，pip 直连 HTTPS 镜像会报 SSL 错误。有两种方法：
+
+```powershell
+# 方法 A：从开发机拷贝纯 Python 包（推荐，绕过 SSL 问题）
+# pymysql / DBUtils 是纯 Python，可直接拷贝；在开发机（已装这些包）执行：
+$QMT_SITE = "D:\QMT交易端\bin.x64\Lib\site-packages"
+Copy-Item -Recurse "C:\Users\<你>\anaconda3\Lib\site-packages\pymysql" "$QMT_SITE\pymysql"
+Copy-Item -Recurse "C:\Users\<你>\anaconda3\Lib\site-packages\dbutils" "$QMT_SITE\dbutils"
+
+# 方法 B：用 QMT python pip 装（可能因 SSL 失败，需配置信任）
+cd D:\QMT交易端
+.\bin.x64\python.exe -m pip install --trusted-host mirrors.aliyun.com pymysql DBUtils
+```
+
+验证安装：
+```powershell
+.\bin.x64\python.exe -c "import pymysql; from dbutils.pooled_db import PooledDB; print('OK')"
+```
+
+> **pyzmq 特殊说明**：包含 C 扩展，不能直接拷贝。Python 3.6 需装 `pyzmq==19.0.2`（最后一个支持 3.6 的版本）。如果 SSL 装不上，可下载对应 wheel 手动 `pip install xxx.whl`。
+
+### C. Redis 服务本身（Windows 上怎么来）
+
+> 上面 B 节表里的 `redis` 是 **redis-py 这个 Python 包**（客户端库），**不是 Redis 服务**。用 redis 传输时你还需要一个**跑着的 Redis 服务**能连——服务端和客户端都连它。装完 redis-py 手里仍然没有 Redis，这一步补上。
+
+Redis 官方从来没有 Windows 版（微软那个老 port 早归档了）。Windows 上不装 WSL 拿到 Redis，最省事的是社区重打包 **redis-windows**：
+
+- 下载：<https://github.com/redis-windows/redis-windows/releases> —— 解压即用，无需 WSL / Linux 子系统。
+- 也可以指向**任何能连到的 Redis**：同机、内网另一台机器、或 Docker 里的都行。Redis 服务不必和 QMT 在同一台机器。
+
+> ⚠️ **redis-windows 是社区重打包，不是 Redis 官方发行**。是否采用由你判断；本项目只做说明，不分发它的二进制。
+
+解压后带一份最小配置启动（`redis.conf`）：
+
+```conf
+# 只监听本机；服务端和客户端都在这台机器时用这个
+bind 127.0.0.1
+port 6379
+# 必设密码：见下方安全提示
+requirepass 换成你自己的强密码
+```
+
+```powershell
+.\redis-server.exe .\redis.conf
+```
+
+配置里对应填法（`bigqmt_signal_trader_local_config.py` 和客户端配置一致）：
+
+```python
+BIGQMT_REDIS_CONFIG = {
+    "host": "127.0.0.1",   # 跨机时填 Redis 那台的内网 IP
+    "port": 6379,
+    "db": 5,
+    "username": "",        # redis-windows 默认无 ACL 用户，留空
+    "password": "换成你自己的强密码",  # 与 requirepass 一致
+    "transport": "redis",
+}
+```
+
+> 🔒 **务必设密码、只监听本机——这座桥的 RPC 层没有鉴权。** 访问控制只有两层：Redis 自己的凭据，和 `rpc_allow_order_methods` 开关。**能连上这个 Redis、知道队列名的人就能驱动这座桥**，而队列名是 `bigqmt:rpc:queue:<资金账号>`，账号本身就在队列名里、不算秘密。`rpc_allow_order_methods=True` 时这包括**下单和撤单**（默认 `False`）。
+>
+> 所以：**`requirepass` 设强密码 + `bind 127.0.0.1`（只本机）** 是最低要求，别用默认的空密码。**确需跨机**时——绑内网网卡、`requirepass` 照设、并用防火墙只放行客户端那台的 IP；**绝不要**把这个 Redis 暴露到公网。一个空密码、`bind` 放开、防火墙放行的 Windows Redis，挂着一个真实资金账号，是最危险的组合。
+
+---
+
+## 快速开始
+
+> 只想最短路径：[docs/DEPLOY_QUICKSTART.md](DEPLOY_QUICKSTART.md)。下面是同一条路，每一步多了一句「为什么」。
+>
+> 前置：客户端机器上 Python 3.8~3.13；QMT 已装好 Python 组件（`bin.x64\python.exe` 存在，见上面「B. 服务端」）；用 redis 传输就得有一个能连上的 Redis（见「C. Redis 服务本身」），同机 zmq 免 Redis。
+
+### 先看这张表：什么文件放哪、谁放
+
+整条链路只有三样东西：**QMT 里的服务端**（一个包 + 三个顶层文件，跑在 QMT 自带的 Python 3.6 里）、**外部的客户端**（pip 装的包，跑在你自己的 Python 里）、**中间的 Redis**（或同机 ZMQ）。两个 Python 互不相通：客户端能 `pip install`，QMT 那个不能（旧 OpenSSL），所以服务端文件靠**拷**。
+
+| 文件 | 放哪 | 谁放 |
+|---|---|---|
+| `bigqmt_signal_trader` 包（客户端用的那份） | 客户端机器的 site-packages | `pip install "xtquant-big-convert[redis]"` |
+| `bigqmt_signal_trader_client_config.py` | 客户端：**和你运行的脚本同一目录** | `bigqmt-init` 第二个目录问题写出（回车 = 当前目录） |
+| `bigqmt_signal_trader/`（整个包目录） | QMT 的 `python` 目录，如 `D:\QMT交易端\python\` | **你手动拷**，从 pip 装的包目录里 |
+| `bigqmt_signal_trader_strategy.py` | 同上 | 同上 |
+| `bigqmt_signal_trader_redis_rpc_runtime.py` | 同上 | 同上 |
+| `BIGQMT_REDIS_DRYRUN.py`（QMT 里加载的入口；纯 zmq 换 `BIGQMT_ZMQ_DRYRUN.py`） | 同上 | 同上 |
+| `bigqmt_signal_trader_local_config.py` | QMT 的 `python` 目录 | `bigqmt-init` 第一个目录问题写出（**必须手填这个目录**，回车 = 当前目录，服务端就找不到了） |
+
+三件事要记住：
+
+- **`bigqmt-init` 只写两份配置**，不拷包、不装依赖、不会自己去找 QMT 装在哪。
+- **QMT 的 `python` 目录**指 QMT 安装目录下那个叫 `python` 的子目录，不是 `bin.x64`。服务端 4 项文件和服务端配置都放这里。
+- **客户端配置跟着脚本走**，不是放 QMT 目录。它靠 `import bigqmt_signal_trader_client_config` 被找到，脚本同目录最省事（详见第 5 步）。
+
+### 第 1 步：客户端装包
+
+在你写策略的那台电脑上：
+
+```powershell
+pip install "xtquant-big-convert[redis]"
+```
+
+装的是客户端。服务端要拷进 QMT 的那 4 项也在这个包里（第 3 步取出来），所以就算客户端和 QMT 是同一台机器，这步也要做。用 zmq 传输可以不带 `[redis]`；mysql 传输用 `[mysql]`。
+
+### 第 2 步：`bigqmt-init` 生成两份配置
+
+在**能写到 QMT 的 python 目录的机器上**跑（通常就是 QMT 那台）：
+
+```powershell
+bigqmt-init
+```
+
+```powershell
+python -m bigqmt_signal_trader.init_config
+```
+
+两种写法等价；第一种是 pip 装包时注册的命令，找不到就用第二种。**只能在终端里交互着答，不能用管道喂**——密码那一问走 `getpass` 读终端。
+
+它按顺序问：资金账号、账号类型、传输方式、Redis 地址端口用户名密码（选 redis 才问）、是否允许远程下单、部署方式、然后是**两个目录**：
+
+| 问题 | 写出的文件 | 回车不填 |
+|---|---|---|
+| 「QMT 的 python 目录」 | `bigqmt_signal_trader_local_config.py`（服务端） | 写到**当前目录**——服务端启动找不到配置。**手填**，如 `D:\QMT交易端\python` |
+| 「客户端配置写到哪个目录」 | `bigqmt_signal_trader_client_config.py`（客户端） | 写到当前目录——如果这里就是你外部脚本所在的目录，回车正好 |
+
+两份由同一组答案生成，账号和连接参数不会对不上。跑完打印「=== 已写入 ===」和两个路径，核对一下路径是不是你想的那两个目录。完整的交互记录和每个问题的说明见 [docs/DEPLOY_QUICKSTART.md 第 2 步](DEPLOY_QUICKSTART.md#第-2-步用-bigqmt-init-生成配置)。
+
+<details>
+<summary>不用向导、手写服务端配置（点开看）</summary>
+
+在 QMT 的 `python` 目录创建 `bigqmt_signal_trader_local_config.py`（**不要提交此文件**）：
+
+```python
+# coding: utf-8
+BIGQMT_ACCOUNT_ID = "你的资金账号"        # 如 "1234567890"
+
+BIGQMT_REDIS_CONFIG = {
+    "host": "你的Redis地址",              # 如 "192.168.1.100"
+    "port": 6379,
+    "db": 5,
+    "password": "你的Redis密码",
+
+    # === 传输选择（默认 redis，生产推荐）===
+    # "transport": "redis",              # 不写就是 redis
+    # 切 zmq：装了 pyzmq 后只需这一行。端口按账号派生 127.0.0.1:1556x。
+    #   注意 zmq 实测比 redis 慢（ping 95ms vs 10ms，交易查询 95ms vs 4ms），
+    #   它的用途是「这台机器没有 redis」，不是低延迟。
+    # "transport": "zmq",
+    # 切 mysql（兼容兜底）：需装 pymysql+DBUtils。
+    # "transport": "mysql",
+    # "mysql": {"driver":"pymysql","host":"...","port":3306,"user":"root",
+    #           "password":"...","database":"bigqmt_rpc","charset":"utf8mb4"},
+
+    "rpc_allow_order_methods": False,    # 下单默认关闭
+    "rpc_process_in_listener": True,     # 只读请求在收包线程直接处理（低延迟）
+    "rpc_listener_methods": ("*",),      # * = 所有只读方法
+    "rpc_background_threads": False,     # adjust 线程 drain；True 每次跨线程交接付一个 tick（#343）
+    "schedule_adjust": True,
+    "schedule_adjust_interval": "100nMilliSecond",
+}
+```
+
+> **`rpc_background_threads` 一律 `False`**（实测见上面「可插拔传输层」那张四列表）：
+> drain 模式一个请求最多等一个 adjust tick；后台线程每拿一次 GIL 付一个 tick，redis 回包
+> 8 次往返就是 400ms（#343）。不写这个键，0.3.51 起各传输默认也是 drain；旧配置里写着
+> `True` 的改掉重启。`True` 只留给没有 drain 实现的传输。
+>
+> 安全性不依赖这个开关：碰交易上下文的方法（`LISTENER_DEFERRED_METHODS`）在展开
+> listener 名单时被无条件剔除，任何配置都无法把它们排到后台线程上（#244）。
+
+客户端那份照 [`src/bigqmt_signal_trader_client_config.example.py`](src/bigqmt_signal_trader_client_config.example.py) 写，账号和连接参数与服务端一致。
+
+</details>
+
+### 第 3 步：拷 4 项到 QMT 的 python 目录
+
+先找到 pip 装的包在哪（在装了客户端的那个 Python 里）：
+
+```powershell
+python -c "import bigqmt_signal_trader_strategy as m, os; print(os.path.dirname(m.__file__))"
+```
+
+把该目录里这 4 项复制到 QMT 的 `python` 目录（**和第 2 步第一个问题填的是同一个目录**）：
+
+```
+bigqmt_signal_trader/                   整个包目录，含 transports/ 和 adapters/
+bigqmt_signal_trader_strategy.py
+bigqmt_signal_trader_redis_rpc_runtime.py
+BIGQMT_REDIS_DRYRUN.py                  QMT 编辑器里加载的入口
+```
+
+4 项缺一不可：少了包目录报 `No module named bigqmt_signal_trader`，少了入口面板没有任何输出。拷完 QMT 的 `python` 目录里应该同时有这 4 项加第 2 步写的 `bigqmt_signal_trader_local_config.py`，共 5 个名字。
+
+> 同机纯 ZMQ、不想装 redis：多拷一个 `BIGQMT_ZMQ_DRYRUN.py`，第 4 步加载它。它强制 ZMQ、不创建 Redis client，并把 bootstrap 异常写到 `<QMT python>\logs\bigqmt-bootstrap-error.log`。**能力边界**：关闭确实依赖 Redis 的 `download_jobs`（下载任务队列）和 `full_tick_cache`（全市场快照缓存）；`on_stock_order` / `on_stock_trade` / `on_order_error` 回报走 ZMQ PUB 推送，MiniQMT 风格回调正常，但没有 Redis Stream 的短时回放。行情查询、下单/撤单、持仓查询等 RPC 全部正常。
+
+> 源码检出（不是 pip 装）的话，这 4 项在仓库的 `src/` 下，`bigqmt-init` 最后那句「把 src/ 下的包同步到 QMT 的 python 目录」说的就是它。
+
+### 第 4 步：QMT 里运行入口
+
+QMT **模型交易**里新建 Python 模型，加载并运行 `BIGQMT_REDIS_DRYRUN.py`（纯 zmq 是 `BIGQMT_ZMQ_DRYRUN.py`），运行模式切到**实盘**。输出面板看到这几行即成功：
+
+```
+[bigqmt_shell] reload entry paths=['D:\\QMT交易端\\python']
+[bigqmt_shell] local redis config loaded keys=['host', 'port', 'db', ...]
+[bigqmt_shell] local account config loaded=True
+[bigqmt_rpc] transport=redis mode process_in_listener=True listener_methods=('*',) ...
+[bigqmt_rpc] started channel=bigqmt:rpc:req:你的账号
+[bigqmt_signal_trader] init ok
+```
+
+两个会让它看起来启动了、其实没起来的坑：在**策略编辑器界面**直接点运行、勾了**「独立 python 进程」**。两种情况下 QMT 不注入任何 API 全局，文件被当普通脚本执行完就结束，`init()` 永远不会调用。面板里 `download globals bound=[]` 是空的就是这个（0.3.8 起入口会直接把这段话打出来，#123）。
+
+### 第 5 步：客户端验证、调用
+
+在客户端机器上，**先 `cd` 到放 `bigqmt_signal_trader_client_config.py` 的目录**（`python -c` 从当前目录找配置）：
+
+```powershell
+python -c "from bigqmt_signal_trader.xtquant_compat import configure, xtdata; configure(); print(xtdata.get_deployment_info())"
+```
+
+打出 `{'version': '0.3.xx', 'package_dir': 'D:\\...\\python\\bigqmt_signal_trader', 'python_version': '3.6.8', ...}` 就通了——这是**服务端**在跑的版本和目录。再拉一次行情：
+
+```powershell
+python -c "from bigqmt_signal_trader.xtquant_compat import configure, xtdata; configure(); print(xtdata.get_full_tick(['000001.SZ']))"
+```
+
+**客户端配置放哪、怎么被找到：** 客户端是靠 `import bigqmt_signal_trader_client_config` 找它的，
+所以它必须在 `sys.path` 上——最省事是**和你运行的脚本放同一目录**（`python xxx.py` 时脚本
+所在目录自动排在 `sys.path` 最前）；交互式或 `python -c` 时是**当前工作目录**。放在别处就
+把那个目录加进 `PYTHONPATH`，或用环境变量 `BIGQMT_CLIENT_CONFIG_MODULE=<模块名>` 指定。
+
+找不到时会退回 `bigqmt_signal_trader_local_config`（服务端那份）。所以把它放进 QMT 的
+`python` 目录、并从那个目录运行客户端也能跑——但那是碰巧命中回退，读到的是服务端配置，
+换台机器就找不到了。客户端和 QMT 不在同一台机器时，配置只能跟着客户端脚本走。
+
+**方式 A：用兼容层（推荐，旧代码零改动）**
+
+```
+D:\my_strategy\
+├── bigqmt_signal_trader_client_config.py   ← bigqmt-init 写的
+└── run.py                                  ← 你的脚本
+```
+
+```python
+# run.py
+from bigqmt_signal_trader.xtquant_compat import StockAccount, configure, xt_trader, xtdata
+
+configure()
+
+acc = StockAccount(xt_trader.client.account_id, "STOCK")
+
+# 行情
+ticks = xtdata.get_full_tick(["000001.SZ"])
+print(ticks["000001.SZ"]["lastPrice"])
+
+# 持仓 / 资金
+positions = xt_trader.query_stock_positions(acc)
+asset = xt_trader.query_stock_asset(acc)
+print(asset.cash, asset.total_asset)
+
+# K线（自动还原成 pandas DataFrame）
+klines = xtdata.get_market_data_ex(
+    field_list=["close"], stock_list=["000001.SZ"], period="1d", count=5
+)
+```
+
+**方式 B：直接 RPC 调用**
+
+```python
+from bigqmt_signal_trader.redis_rpc import call_redis_rpc
+import redis
+
+r = redis.Redis(host="192.168.1.100", port=6379, db=5, password="...")
+resp = call_redis_rpc(r, "你的账号", "get_full_tick", {"codes": ["000001.SZ"]})
+print(resp["data"]["000001.SZ"]["lastPrice"])
+```
+
+**方式 C：无缝替换旧 xtquant（最终切换）**
+
+把仓库 `src` 放到 `PYTHONPATH` 最前面，旧代码的 `from xtquant import xtdata` 自动命中本仓库 shim：
+
+```powershell
+$env:PYTHONPATH = "D:\gjzqqmt\xtquant_big_convert\src;$env:PYTHONPATH"
+```
+
+```python
+# 旧代码完全不改
+from xtquant import xtdata
+ticks = xtdata.get_full_tick(["600000.SH"])  # 走 RPC 到大 QMT
+```
+
+### 升级
+
+客户端 `pip install -U xtquant-big-convert`；服务端重做第 3 步（拷 4 项、清 `__pycache__`），三个顶层文件没变就 `xt_trader.reload_deployment()` 热更新，变了就重启策略。备份、3.6.8 编译、逐文件比对的完整清单见 [docs/DEPLOY_QUICKSTART.md「升级已有部署」](DEPLOY_QUICKSTART.md#升级已有部署package-模式)。
+
+### 入口文件 `BIGQMT_REDIS_DRYRUN.py` 的细节（排错时再看）
+
+它是 QMT 编辑器入口的「外壳」（shell），按顺序做这几件事：
+
+1. **定位 python 目录**：把 QMT 的 `python` 目录加到 `sys.path`，让 `bigqmt_signal_trader` 包能 import。
+2. **reload 模块**：`importlib.reload` 刷新 `redis_common` / `redis_rpc` / `strategy` / `runtime` —— QMT 在编辑器里重跑策略时，进程不退出，reload 确保新代码立即生效。
+3. **注入 Redis 配置**：读 `bigqmt_signal_trader_local_config.py` 里的 `BIGQMT_REDIS_CONFIG`，调 `configure_runtime_redis()`。
+4. **注入账号**：读 `BIGQMT_ACCOUNT_ID`，调 `configure_runtime_account()`。如果配置没给，fallback 用 QMT 全局变量 `account`。
+5. **绑定 QMT 原生 API**：把 QMT 内置的 `passorder` / `cancel` / `get_trade_detail_data` 函数绑进 runtime（用 `try/except NameError` 包住，因为这些名字只在大 QMT 进程内存在）。
+6. **导出 QMT 回调**：`init = _runtime.init` / `handlebar = _runtime.handlebar` / `adjust = _runtime.adjust` 等，让 QMT 能回调到我们的策略逻辑。
+
+部分券商 QMT 缺少标准 `importlib` 时，入口会注册仅包含 `import_module/reload` 的最小兼容模块。
+
+**python 目录定位（无硬编码）：** 入口先取 `__file__` 所在目录；`__file__` 不可用（exec 方式加载）时，`_known_qmt_python_dir()` 在 `sys.path` 里找第一个存在的 `*\python` 目录，找不到返回空。不写死券商安装路径，编辑器运行 / 粘贴运行 / exec 三种方式都能加载。
+
+> 旧版本曾用 `chr()` 码点拼出中文目录名，规避 QMT 编辑器按 GBK 保存时的乱码；现版本源码保持 ASCII，目录靠运行时探测，该技巧已移除。
+
+> **为什么是 GBK 编码？** QMT 的策略编辑器用本地代码页（中文 Windows 是 GBK）保存文件。文件头 `#coding:gbk` 声明编码，避免 QMT 保存时破坏 UTF-8 内容。源码本身是 ASCII，所以实际不会乱码。
+
+> **为什么不直接用 `bigqmt_signal_trader_redis_rpc_runtime.py`？** 那个文件是纯逻辑入口，不包含 reload 和 QMT API 绑定。QMT 编辑器应加载与 transport 对应的外壳：同机 ZMQ 使用 `BIGQMT_ZMQ_DRYRUN.py`，其它 transport 使用 `BIGQMT_REDIS_DRYRUN.py`；不要直接加载 runtime 文件。
+
+---
+
+## 切换传输层
+
+### 只需改一个字段
+
+服务端 + 客户端的配置文件里，`transport` 字段保持一致即可：
+
+```python
+BIGQMT_REDIS_CONFIG = {
+    "transport": "zmq",                  # redis / zmq / mysql
+    "zmq": {"host": "127.0.0.1"},        # 各传输子配置
+    # redis 配置保留（zmq 服务发现、mysql 不需要时的 fallback 都用它）
+}
+```
+
+### 各传输配置示例
+
+**Redis（默认）**：
+```python
+{"transport": "redis"}  # 或省略 transport 字段
+```
+
+**ZMQ**（无 redis 时的同机方案，需 pyzmq）：
+```python
+{
+    "transport": "zmq",
+    "rpc_background_threads": False,       # 0.3.21 起走 adjust drain，快 4~6 倍（#183）
+    "zmq": {
+        "host": "127.0.0.1",              # 默认端口从 account_id 派生
+        # "port": 5560,                   # 可显式指定
+        # 端口冲突时自动找空闲端口 + 通过 Redis 服务发现告知客户端
+    },
+}
+```
+
+**MySQL**（兼容兜底，需 pymysql + DBUtils）：
+```python
+{
+    "transport": "mysql",
+    "rpc_background_threads": False,       # 0.3.21 起走 adjust drain，快 4~6 倍（#183）
+    "mysql": {
+        "driver": "pymysql",
+        "host": "192.168.1.100", "port": 3306,
+        "user": "root", "password": "...",
+        "database": "bigqmt_rpc", "charset": "utf8mb4",
+        "poll_interval_seconds": 0.01,
+        "pool_config": {"mincached": 1, "maxcached": 3, "maxshared": 0, "maxconnections": 4},
+    },
+}
+```
+
+### ZMQ 端口与服务发现
+
+- 默认端口从 account_id 派生：`15560 + (账号数字 mod 100)`，不同账号自动不冲突。
+- 端口被占时，server 自动往上扫描找空闲端口，把真实地址写到 Redis key `bigqmt:zmq:addr:{account_id}`（TTL 300s）。
+- 客户端连接时按优先级解析地址：显式 `connect_address` > Redis 服务发现 > 默认派生端口。
+- server 退出时自动清理 discovery key。
+- 服务发现是可选的（没配 Redis client 时退化为静态派生端口）。
+
+完整传输层文档见 [docs/RPC_TRANSPORTS.md](RPC_TRANSPORTS.md)。
+
+---
+
+## 实测延迟对比（真实直连 QMT）
+
+稳态（回放窗口结束、`adjust cadence: ticks=100`）下，2026-09-22 同一台实盘终端，
+`100nMilliSecond`，每种组合重启后等 cadence 回到 10Hz 再测，min / median / max（ms）：
+
+| 传输 + 模式 | ping | query_stock_positions | 说明 |
+|------|------|------|------|
+| **redis + drain**（默认）| 23 / 102 / 106 | 85 / 103 / 109 | 一拍；跨机、回报有 stream 回放 |
+| **zmq + drain** | 10 / 87 / 108 | 8 / 88 / 103 | 一拍；没有 redis 时用 |
+| redis + 后台线程 | 199 / 407 / 605 | 102 / 197 / 320 | 每条 Redis 命令一拍 |
+| zmq + 后台线程 | 98 / 103 / 303 | 396 / 490 / 600 | 交易查询要跨两次线程 |
+| **MySQL** | ~104 | — | 轮询，仅作兜底 |
+
+**地板是一个 adjust tick。** drain 下请求等下一拍拾取，串行调用锁相到整拍，所以 median
+≈ 100ms、min 是撞上拍边的运气；并发发请求（`call_async`）一拍最多处理 20 条，平均只等
+半拍。想再低只有缩 `schedule_adjust_interval`（需验证 `run_time` 是否认更小的值）或把
+serving 挪出 QMT 进程。读行情走 FormulaServer 直连 0.07ms，不经过这条链路。
+
+> 0.3.21–0.3.50 的 README 在这里写过「Redis ping 10ms / 交易查询 4ms / 195 次每秒」，那是
+> 在重启后的回放窗口里测的（见上一节），稳态下不存在。
+
+复现基准：
+```powershell
+python bench_latency.py        # Redis 单传输延迟
+python bench_transports.py -n 100  # Redis vs ZMQ 对比
+```
+
+---
+
+## 目录结构
+
+```
+src/bigqmt_signal_trader/
+├── transports/                    可插拔传输层
+│   ├── base.py                    RpcTransport 抽象接口
+│   ├── redis_transport.py         Redis（默认，rpush/blpop/brpop）
+│   ├── zmq_transport.py           ZMQ（ROUTER/DEALER + 服务发现）
+│   ├── mysql_transport.py         MySQL（轮询 + DBUtils 连接池）
+│   └── factory.py                 build_transport 工厂
+├── adapters/                      QMT API 适配器
+│   ├── market_bigqmt.py           行情（ContextInfo 封装）
+│   ├── order_bigqmt.py            下单（passorder）
+│   ├── position_bigqmt.py         持仓（get_trade_detail_data）
+│   └── redis_common.py            Redis 连接/编解码
+├── redis_rpc.py                   RPC 服务（handlers + service + transport 集成）
+├── xtquant_compat.py              客户端兼容层（xt_trader / xtdata + 异步回调）
+├── exec_events.py                 委托/成交/错误事件推送（Redis pubsub）
+├── quote_push_channel.py          全推行情推送通道（redis/zmq PUB/SUB）
+├── quote_subscription_manager.py  服务端全推订阅管理（引用计数 + 组合键去重）
+├── whole_quote_session.py         客户端全推订阅会话（心跳 + 重启恢复）
+├── full_tick_cache.py             全市场行情快照缓存（可选降载）
+├── strategy.py 之类               策略骨架、风控、价格引擎等
+bigqmt_no_redis/                   无 redis 版本（QMT 沙箱拒绝 import redis 时用）
+│   ├── zmq_transport.py           自包含 ZMQ transport（内联编码，零 redis 依赖）
+│   └── DRYRUN_no_redis.py         无 redis DRYRUN 入口
+src/xtquant/                       可选 xtquant import shim
+src/bigqmt_signal_trader_strategy.py        策略入口（init/handlebar/adjust + 启动诊断）
+src/bigqmt_signal_trader_redis_rpc_runtime.py  Redis RPC runtime 入口
+src/BIGQMT_REDIS_DRYRUN.py                  QMT 编辑器加载入口（GBK）
+src/BIGQMT_ZMQ_DRYRUN.py                    同机 ZMQ QMT 编辑器入口（GBK）
+src/BIGQMT_ZMQ_BACKTEST.py                  独立 QMT 回测 ZMQ 入口（GBK）
+src/bigqmt_backtest/                        独立历史驱动、模拟撮合、ZMQ 协议与客户端
+tests/bigqmt_signal_trader/        单元测试（无 QMT 环境可跑）
+tests/bigqmt_backtest/             回测、确定性、隔离和 ZMQ 往返测试
+qmt-trader/                        AI 助手 Skill（大模型直接操作 QMT，见下文专节）
+│   ├── SKILL.md                   skill 说明书（命令速查 + 工作流 + 安全须知）
+│   ├── scripts/qmt.py             统一 CLI（47 子命令 + rpc 兜底）
+│   └── references/api_reference.md  完整 API 参考
+docs/                              详细文档
+test_all_apis.py                   端到端 API 测试（发现生产问题）
+bench_latency.py / bench_transports.py  延迟基准脚本
+```
+
+---
+
+## 本地测试
+
+```powershell
+python -m pytest tests/bigqmt_signal_trader/ -q
+```
+
+当前覆盖 **199 个用例**（含传输层往返、Redis RPC、客户端兼容、持仓/行情/下单 handlers、异步回调、执行事件）。
+
+### 端到端 API 测试（发现生产问题）
+
+`test_all_apis.py` 是**端到端验证**测试——不只测「调用成功」，还测「结果正确」，能发现这些生产问题：
+
+| 验证项 | 检测什么 | 为什么重要 |
+|--------|---------|-----------|
+| **客户端/服务端一致性** | ping 超时 → transport 不匹配 | Issue #24 根因：客户端 redis / 服务端 zmq 连不上 |
+| **持仓查询** | `get_positions` 返回空但账户有持仓 | 容错设计把「失败返回空」当成「正常」 |
+| **委托查询** | `query_orders` 返回空 | strategy_name 不匹配（默认应为 `""` 返回全部） |
+| **买入/卖出** | `submit_order` 成功但委托没进系统 | 静默失败（passorder 被 QMT 拒绝但没报错） |
+| **server_error** | 显示 QMT 端拒绝原因 | 委托被 QMT 静默拒绝时返回具体原因 |
+
+**用法**：
+```powershell
+# 方式 A：用环境变量
+$env:BIGQMT_ACCOUNT_ID="你的账号"
+$env:BIGQMT_REDIS_HOST="你的Redis地址"
+$env:BIGQMT_REDIS_PORT="6379"
+$env:BIGQMT_REDIS_DB="5"
+$env:BIGQMT_REDIS_PASSWORD="你的密码"
+python test_all_apis.py
+
+# 方式 B：用 QMT 端配置（需 bigqmt_signal_trader_local_config.py 在 PYTHONPATH）
+$env:PYTHONPATH="D:\QMT交易端\python;$env:PYTHONPATH"
+python test_all_apis.py
+```
+
+**示例输出**（发现问题时）：
+```
+--- 端到端验证: 客户端/服务端一致性 ---
+客户端配置 transport: redis
+❌ ping 失败: redis rpc timeout: ping
+   可能原因: 客户端 transport 和服务端不匹配
+   - 客户端配置 transport=redis
+   - 如果服务端是 zmq, 客户端也要设 transport=zmq
+
+--- 端到端验证: 持仓查询 ---
+⚠️  get_positions 返回空 — 账户可能真的没持仓, 或查询失败 (检查 QMT 上下文)
+
+--- 端到端验证: 买入/卖出 ---
+✅ submit_order OK
+❌ 委托没进系统 — submit_order 成功但 query_orders 找不到
+   这是静默失败 (passorder 被 QMT 拒绝但没报错)
+   检查: 1) 价格是否超出范围 2) 账户权限 3) QMT 风控
+```
+
+---
+
+## 日志与排错（出错去哪看）
+
+系统自带**文件日志**——所有报错/异常同时写 QMT 输出面板和本地日志文件，重启/崩溃后也能回溯。
+
+### 下单报错对照（先查这张表）
+
+下单失败有四种完全不同的原因，**报错长得不一样，别混**：
+
+| 你看到的报错 | 原因 | 怎么修 |
+|---|---|---|
+| `ValueError: rpc method is not allowed: order_stock` | **`rpc_allow_order_methods` 是 `False`**（默认值），下单方法根本没进服务端白名单 | 服务端配置改 `True`，**重启策略** |
+| `RuntimeError: passorder is not available in Big QMT runtime` | QMT 没注入 API 全局 —— 这个文件被当成**普通脚本**执行了 | 加到**模型交易**里运行，别在策略编辑器窗口点运行；检查没勾「独立 python 进程」 |
+| `server_error: passorder submitted but order not found in system` | 委托没进系统。最常见是 QMT 模型交易的**运行模式是「模拟」**（默认值）—— `passorder` 内部撮合，永远到不了券商 | 运行模式改**实盘** |
+| `order_gateway is not configured` | 策略 `init` 挂了 | 看启动日志找真正的异常 |
+| `直接还款 (order_type 32): the repayment amount goes in order_volume as integer yuan, price is ignored` | 归还融资把金额放在了 `price`（#330）。`passorder` 的直接还款金额走 **volume 槽**，`price` 不看 | `order_stock(acc, code, CREDIT_DIRECT_CASH_REPAY, 还款金额, FIX_PRICE, 0, ...)`，金额整数元 |
+| `server_error: passorder submitted but order not found in system`（运行模式已是实盘） | **终端在下单前拦下了**——资金/仓位不足、价格越界、无权限。终端弹窗、不建委托记录、不发任何回调，这条回复是唯一信号（#345） | 看 QMT 屏幕上的弹窗；异步下单收 `on_order_error`（`source="settlement"`） |
+| `RequestExpired: ... NOT dispatched` / `TimeoutError: ... The bridge did NOT place this order` | **并发下单撞上串行 `passorder`**（每笔 ~200ms，在 QMT 策略线程上一笔一笔跑）：轮到这单时已过你的超时，桥**拒绝而没下**（#303） | 可安全重试；降并发或加大 `timeout_seconds`。超时后客户端会自动问 `get_request_outcome`，报错里写明下了没下 |
+
+**最常见的是第一条。** 一句话确认：
+
+```python
+xt_trader.client.call("ping")["allow_order_methods"]
+# False -> 就是它
+```
+
+服务端 `bigqmt_signal_trader_local_config.py`：
+
+```python
+BIGQMT_REDIS_CONFIG = {
+    # ...
+    "rpc_allow_order_methods": True,     # 默认 False
+}
+```
+
+> 改完**必须重启策略**，`reload_deployment()` 刷不了顶层的 `bigqmt_signal_trader_strategy.py`。
+
+> 这个默认值是**有意保守**的（见下文「安全默认值」）：任何能连上这条通道的程序都能下单，所以要显式打开。
+
+### 日志位置
+
+| 环境 | 日志文件 |
+|------|---------|
+| **QMT 内（服务端）** | `<QMT python 目录>\logs\bigqmt.log`（如 `D:\QMT交易端\python\logs\bigqmt.log`）|
+| **外部客户端** | `~\.cache\bigqmt\logs\bigqmt.log`（用户目录下）|
+
+- **按天轮转**（午夜），**默认保留最近 7 天**。
+- 每行带时间戳 + 级别 + 模块标签：`2026-08-14 21:45:59 [ERROR] [bigqmt.quote_push] publisher start failed: ...`
+
+### 查看方式
+
+```powershell
+# 实时跟踪日志
+Get-Content "D:\QMT交易端\lempython\logs\bigqmt.log" -Wait -Tail 50
+
+# 只看错误
+Get-Content "D:\...\python\logs\bigqmt.log" | Select-String "ERROR|WARN"
+```
+
+### 配置
+
+| 环境变量 | 默认 | 说明 |
+|---------|------|------|
+| `BIGQMT_LOG_ENABLED` | `1` | 置 `0` 关闭文件日志 |
+| `BIGQMT_LOG_TO_STDOUT` | `1` | 置 `0` 不输出到 QMT 面板 |
+| `BIGQMT_LOG_RETENTION_DAYS` | `7` | 日志保留天数 |
+
+> **排错首选看日志文件**：QMT 面板内容重启/清空后丢失，日志文件保留 7 天，包含启动诊断（`[bigqmt_diag]`）、崩溃原因、端口冲突等。
+
+---
+
+## 安全默认值
+
+- `rpc_allow_order_methods` 默认 `False`：远程 `order_stock` / `cancel_order` 被拒绝。确认接入方、账号、风控后再显式开启。
+- 回测桥接永久 `live_ready=false`，协议中没有真实账户和实盘下单方法。
+- 配置文件含资金账号和密码，`bigqmt_signal_trader_local_config.py` / `bigqmt_signal_trader_client_config.py` 已在 `.gitignore`，**不要提交**。
+- 请求负载经过 base64 + 数字混淆编码（`encode_rpc_request_payload`），避免 QMT 的 Redis 客户端拦截含股票代码的明文。
+
+---
+
+## AI 助手 Skill：qmt-trader（大模型直接操作 QMT）
+
+仓库内置一个 **Agent Skill**——[qmt-trader/](../qmt-trader/)，让支持 SKILL.md 约定的 AI 编程助手（Claude Code / ZCode / Cursor / Codex 等）**直接用命令行驱动 QMT 的全部交易与行情能力**，无需每次现场写 Python 调用代码。人也可以脱离 AI 手动执行其中的 CLI 脚本。
+
+### 目录结构
+
+```
+qmt-trader/
+├── SKILL.md                        skill 说明书（触发条件 + 命令速查 + 典型工作流 + 安全须知）
+├── scripts/qmt.py                  统一 CLI 入口（47 个子命令 + 通用 rpc 兜底，约 1000 行）
+└── references/api_reference.md     完整 API 参考（参数/返回值/常量/已知陷阱）
+```
+
+### 工作原理
+
+- AI 助手匹配到 `SKILL.md` 里的 `description`（"查行情 / 查持仓 / 下单 / 龙虎榜 / 北向资金…时触发"）后自动加载本 skill；
+- 之后助手调用 `python qmt-trader/scripts/qmt.py <子命令>` 执行**确定性命令**，不再临时生成 RPC 调用代码，避免参数写错；
+- 所有命令默认输出 JSON（`ok` / `data` / `ts` 三字段，便于模型解析），加 `--table` 切换人类可读表格；出错时返回 `ok: false` + `error` / `detail` / `code`，退出码 1；
+- `qmt.py` 自动把仓库 `src/` 加入 `sys.path`（开发模式免 pip install），并自动发现 QMT 的 python 目录读取客户端配置。
+
+### 启用方式
+
+**方式 A：安装到 AI 助手的 skills 目录**（推荐，全局生效）：
+
+```powershell
+# Claude Code
+cp -r qmt-trader ~/.claude/skills/qmt-trader
+# ZCode / 其他遵循 agents skills 约定的助手
+cp -r qmt-trader ~/.agents/skills/qmt-trader
+```
+
+安装后正常提需求即可，例如"帮我看下工商银行最近的走势""我账户现在什么持仓"，助手会自动触发。
+
+**方式 B：不安装，对话里显式指定**：
+
+> 阅读 qmt-trader/SKILL.md，之后用里面的 qmt.py 命令帮我查行情 / 持仓 / 下单。
+
+**方式 C：纯手动**（不经过 AI，人直接当 CLI 用）：
+
+```powershell
+python qmt-trader/scripts/qmt.py ping
+python qmt-trader/scripts/qmt.py snapshot --table
+```
+
+### 前置条件
+
+与「快速开始」的客户端一致：
+
+1. QMT 端 RPC 服务已启动（同机 ZMQ 运行 `BIGQMT_ZMQ_DRYRUN.py`，其它 transport 运行 `BIGQMT_REDIS_DRYRUN.py`，输出面板/日志看到启动诊断 OK）；
+2. 客户端配置就绪——环境变量（`BIGQMT_ACCOUNT_ID` / `BIGQMT_REDIS_HOST` / `BIGQMT_REDIS_PORT` / `BIGQMT_REDIS_DB` / `BIGQMT_REDIS_PASSWORD`）或配置文件；
+3. 先 `ping` 确认连通：redis 约 10ms / zmq 约 95ms 为正常，超时说明 transport 或配置不匹配。
+
+### 一分钟上手
+
+```powershell
+# 0. 连通性检测（含延迟测量）
+python qmt-trader/scripts/qmt.py ping
+
+# 1. 账户全景：资产 + 持仓 + 委托 + 成交（一次往返）
+python qmt-trader/scripts/qmt.py snapshot
+
+# 2. 实时五档盘口（含涨跌幅）
+python qmt-trader/scripts/qmt.py tick 600000.SH
+
+# 3. 前复权日 K 60 根（含 MA5/20/60 统计）
+python qmt-trader/scripts/qmt.py kline 600000.SH --period 1d --count 60 --dividend front
+
+# 4. 干跑下单（只打印不提交，确认参数）
+python qmt-trader/scripts/qmt.py buy 600000.SH 100 --price 7.50 --dry-run
+```
+
+### 命令概览
+
+| 分类 | 命令 |
+|------|------|
+| **连通/全景** | `ping` / `snapshot` |
+| **账户** | `account`（资产）/ `positions`（持仓含浮动盈亏）/ `orders`（委托含语义化状态）/ `trades`（成交） |
+| **行情** | `tick` / `kline` / `instrument` / `sector` / `trading-dates` / `north`（北向）/ `longhubang`（龙虎榜）/ `financial`（财务）/ `download`（历史数据下载）/ `quote-subscribe`（全推订阅） |
+| **期权分析** | `option-greeks <option_code>`（单合约）/ `option-greeks 510050.SH --expiry 202609`（整条链，本地 IV + Delta/Gamma/Vega/Theta/Rho） |
+| **扩展查询（25 个快捷命令）** | `holiday` / `stock-name` / `instrument-type` / `divid-factors` / `market-times` / `trading-calendar` / `option-list` / `bsm-price` / `bsm-iv` / `hkt-stats` / `hkt-details` / `hkt-rate` / `top10-holder` / `holder-num` / `ipo` / `ipo-limit` / `credit-assure` / `credit-short` / `credit-debt` / `his-st` / `index-weight` / `industry` / `sector-info` / `local-data` / `timetag2dt` / `dt2timetag` |
+| **交易** | `buy` / `sell` / `cancel`（均支持 `--dry-run`，buy/sell 支持 `--latest` / `--strategy` / `--remark`） |
+| **通用兜底** | `rpc <method> [json]` — 调用白名单内**任意**方法（如 `rpc get_l2_quote '{"stock_code":"600000.SH"}'`），未列出的方法都能这样调 |
+
+### 安全设计
+
+- 下单三命令（`buy` / `sell` / `cancel`）受服务端白名单控制，`rpc_allow_order_methods` 默认 `False`，未显式开启时返回 `ORDER_DISABLED`；
+- 下单前先用 `tick` 看价 + `--dry-run` 确认参数；
+- 报 `ORDER_TIMEOUT` 时**不要直接重试**，先 `orders` 查询确认委托是否已进系统，避免重复下单；
+- 下单的 `--strategy` 与查询的 `--strategy` 需一致；查全部委托用 `orders --strategy ""`（空 = 不过滤）。
+
+完整命令表、四个典型工作流（行情分析 / 持仓监控 / 下单交易 / 批量分析）和 API 参数细节见 [qmt-trader/SKILL.md](../qmt-trader/SKILL.md) 与 [qmt-trader/references/api_reference.md](../qmt-trader/references/api_reference.md)。
+
+---
+
+## 相关文档## 相关文档
+
+- [CHANGELOG.md](../CHANGELOG.md) — **版本变更记录**（新增/修复/变更）
+- [docs/DEPLOY_QUICKSTART.md](DEPLOY_QUICKSTART.md) — **单账号部署快速开始**（最短路径 + 部署期常见问题表）
+- [docs/LATENCY_REPORT.md](LATENCY_REPORT.md) — **延迟测试报告**（传输层对比、FormulaServer 直连、下单链路、方法论）
+- [docs/RPC_API_REFERENCE.md](RPC_API_REFERENCE.md) — **全部 RPC 方法参考**（参数、返回值、别名、大 QMT 能力边界）
+- [docs/FORMULA_SERVER_FASTPATH.md](FORMULA_SERVER_FASTPATH.md) — FormulaServer(58600) 直连快速路径：协议、映射表、能力边界与回退行为
+- [docs/SUBSCRIBE_WHOLE_QUOTE_PUSH.md](SUBSCRIBE_WHOLE_QUOTE_PUSH.md) — 全推行情订阅推送机制设计
+- [docs/SUBSCRIBE_WHOLE_QUOTE_LIVE_VERIFICATION.md](SUBSCRIBE_WHOLE_QUOTE_LIVE_VERIFICATION.md) — 全推行情实盘验证报告
+- [docs/BIG_QMT_REDIS_RPC.md](BIG_QMT_REDIS_RPC.md) — Redis RPC 协议与入口脚本详解
+- [docs/RPC_TRANSPORTS.md](RPC_TRANSPORTS.md) — 可插拔传输层完整说明
+- [docs/XTQUANT_COMPAT_REPLACEMENT.md](XTQUANT_COMPAT_REPLACEMENT.md) — 用兼容层替换旧 xtquant 的步骤
+- [docs/BIG_QMT_SIGNAL_TRADER_RUNBOOK.md](BIG_QMT_SIGNAL_TRADER_RUNBOOK.md) — 信号交易运行手册
+- [docs/ZMQ_BACKTEST_BRIDGE.md](ZMQ_BACKTEST_BRIDGE.md) — 独立 ZMQ 回测协议、撮合规则和 QMT 入口
+- [qmt-trader/](../qmt-trader/) — **QMT Trader skill**：AI 助手统一 CLI 驱动全部 QMT API（47 子命令 + 通用 rpc 兜底），用法见上文「AI 助手 Skill：qmt-trader」
+
+---
+
+## 为什么不直接连大 QMT## 为什么不直接连大 QMT
+
+官方 `xtquant.xttrader.XtQuantTrader` 依赖客户端侧 XtQuantServer 通道。当前实测的大 QMT 环境中直接连 `connect()` 返回 `-1`，**交易能力**因此必须放在大 QMT 内部策略进程里，外部通过 RPC 驱动。
+
+**但只读行情不必走 RPC。** `58600` 是 FormulaServer，它同时就是行情/参考数据服务——QMT 自带 Python 里的 `qmt_api` 包（`bin.x64/Lib/site-packages/qmt_api`）正是它的客户端。本仓库已接入这条直连快速路径，见上文「FormulaServer 直连快速路径」。
+
+如果后续券商开通 XtQuantServer 权限且 `connect()==0`，可再加交易直连模式。

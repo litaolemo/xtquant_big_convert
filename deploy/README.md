@@ -72,4 +72,4 @@ powershell -File .\deploy_qmt_bridge.ps1 -QmtDir "..." -Account "..." -WorkDir "
 注意检查 `order_config.json` 里的 `account_num` 与 `-Account` 一致。
 
 ## 细节文档
-部署原理、传输层对比、排错见仓库根目录 [README](../README.md) 与 [docs/DEPLOY_QUICKSTART.md](../docs/DEPLOY_QUICKSTART.md)。
+部署原理、传输层对比、排错见 [docs/USER_GUIDE.md](../docs/USER_GUIDE.md) 与 [docs/DEPLOY_QUICKSTART.md](../docs/DEPLOY_QUICKSTART.md)。
