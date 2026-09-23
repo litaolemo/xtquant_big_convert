@@ -292,6 +292,25 @@ def _quote_push_zmq_address(client):
     return "tcp://%s:%d" % (host, base_port + 1)
 
 
+def _build_quote_push_channel(client):
+    """Build the push-channel subscriber matching the RPC transport: redis
+    deployments derive the channel locally; zmq deployments connect to the
+    server PUB socket (host from zmq config, RPC port + 1).
+
+    Module-level on purpose: BigQmtXtTrader's exec-event listener needs it too,
+    and when it lived only on BigQmtXtData the trader's call raised
+    AttributeError into a silent retry loop — zmq deployments never got a
+    single exec callback (#366, broken since #76).
+    """
+    from .quote_push_channel import RedisQuotePushChannel, ZmqQuotePushChannel
+
+    transport_name = str(getattr(client, "transport_name", "redis") or "redis").lower()
+    if transport_name in ("zmq",):
+        address = _quote_push_zmq_address(client)
+        return ZmqQuotePushChannel(connect_address=address)
+    return RedisQuotePushChannel(client._redis(), account_id=client.account_id)
+
+
 def _missing_account_id_message():
     """Say what was searched and what to do, not just that something is missing.
 
@@ -2660,6 +2679,7 @@ class BigQmtXtData:
         backfill_pre_close=True,
         resynth_ongoing_multiday=True,
         heal=True,
+        subscribe=None,
     ):
         """Pull bars over RPC, in batches of ``chunk_size`` codes.
 
@@ -2669,6 +2689,11 @@ class BigQmtXtData:
         waiting for a download it just submitted, and healing there
         re-submits that same download every 1.5s round, pushing the landing
         it is waiting for further back until the 60s budget is gone.
+
+        ``subscribe`` 是 QMT 原生签名的最后一个参数：True（大 QMT 默认）会把
+        查过的标的塞进常驻内存订阅池，批量拉分钟线时终端内存单调上涨直到崩溃
+        （#361）；False 只读本地已下载数据。缺省 None = 不传、维持原生默认。
+        批量历史回补请显式传 ``subscribe=False``。
 
         Cache-through: whatever is fetched is written to the local cache (keyed
         by dividend_type), so it stays the latest -- important for 前复权 data,
@@ -2704,6 +2729,9 @@ class BigQmtXtData:
             dividend_type=dividend_type,
             fill_data=fill_data,
         )
+        if subscribe is not None:
+            # 只在调用方给了才传（#361）：不给 = 大 QMT 原生默认 True，行为不变。
+            base["subscribe"] = bool(subscribe)
         step = DEFAULT_MARKET_DATA_CHUNK if chunk_size is None else int(chunk_size)
 
         if step <= 0 or len(codes) <= step:
@@ -3170,17 +3198,7 @@ class BigQmtXtData:
         )
 
     def _build_quote_push_channel(self):
-        """Build the push-channel subscriber matching the RPC transport: redis
-        deployments derive the channel locally; zmq deployments connect to the
-        server PUB socket (host from zmq config, RPC port + 1)."""
-        client = self.client
-        from .quote_push_channel import RedisQuotePushChannel, ZmqQuotePushChannel
-
-        transport_name = str(getattr(client, "transport_name", "redis") or "redis").lower()
-        if transport_name in ("zmq",):
-            address = _quote_push_zmq_address(client)
-            return ZmqQuotePushChannel(connect_address=address)
-        return RedisQuotePushChannel(client._redis(), account_id=client.account_id)
+        return _build_quote_push_channel(self.client)
 
     def quote_subscription_status(self):
         """What whole-quote combos the bridge thinks are alive, and how stale.
@@ -3412,7 +3430,7 @@ class BigQmtXtData:
         # or the result is all zeros.
         server_download_error = None
         try:
-            self.client.call(
+            download_reply = self.client.call(
                 "download_history_data2",
                 {
                     "stock_list": codes,
@@ -3422,6 +3440,14 @@ class BigQmtXtData:
                 },
                 timeout_seconds=float(download_timeout_seconds),
             )
+            if not download_reply:
+                # 服务端显式回 False = 下载任务没被受理（#339：恒 False 曾经
+                # 从这里漏过去，下面的空拉被当成「停牌/退市」容忍掉，最终报出
+                # finished==total 的假进度）。失败必须响（#47 契约）。
+                server_download_error = RuntimeError(
+                    "server reported download_history_data2 = %r: the terminal "
+                    "did not accept the download task (codes=%d period=%s)" % (
+                        download_reply, len(codes), period))
         except Exception as exc:
             # Best-effort only while the pull below can still save the
             # download (data already on the server). With the local cache
@@ -4544,7 +4570,7 @@ class BigQmtXtTrader:
         channel = None
         account_id = str(self.client.account_id or "")
         try:
-            channel = self._build_quote_push_channel()
+            channel = _build_quote_push_channel(self.client)
             channel.start_subscriber(topics, self._on_push_exec_event)
             self._event_ready.set()          # see the redis path (#247)
             while self._event_running:
@@ -4552,6 +4578,9 @@ class BigQmtXtTrader:
                     return       # account changed -> rebuild against the new address
                 time.sleep(0.5)
         except Exception:
+            # 静默重试养大了 #366（方法不存在 -> AttributeError -> 永远收不到
+            # 回调，外面什么都看不见）。失败必须留痕。
+            log.exception("exec event push-channel round failed; retrying")
             time.sleep(1.0)
         finally:
             if channel is not None:
@@ -4705,7 +4734,10 @@ class BigQmtXtTrader:
                         error_msg=event.get("error_msg") or "",
                         order_sysid=_sysid,       # MiniQMT 规范名 (issue #65)
                         order_sys_id=_sysid,      # 兼容别名
-                        order_id=_sysid,
+                        # order_id 必须和 on_stock_order/order_stock 同型
+                        # (OrderId int 子类)，否则调用方拿到的废单号对不上
+                        # 下单返回值，也没法拿它撤单 (#363)。
+                        order_id=self._order_object_id(_sysid),
                         stock_code=event.get("stock_code") or "",
                         order_remark=str(
                             event.get("order_remark") or event.get("remark")
@@ -4726,7 +4758,7 @@ class BigQmtXtTrader:
                         error_msg=event.get("error_msg") or "",
                         order_sysid=_sysid,       # MiniQMT 规范名 (issue #65)
                         order_sys_id=_sysid,
-                        order_id=_sysid,
+                        order_id=self._order_object_id(_sysid),  # 同 #363
                         stock_code=event.get("stock_code") or "",
                         order_remark=str(
                             event.get("order_remark") or event.get("remark")

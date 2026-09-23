@@ -182,15 +182,26 @@ class ShadowSettlementTest(unittest.TestCase):
 
 class NotFoundMessageTest(unittest.TestCase):
     def test_it_names_the_pre_record_refusal(self):
+        """The refusal text is unchanged -- but since #360 it arrives via the
+        extended shadow watch, not the synchronous reply."""
         redis_client, handlers, service = _service(_Gateway(reveal_after=None), timeout=0.0)
         payload = _async_order()
         del payload["params"]["wait_settlement"]
         service.enqueue_payload(payload)
         service.drain_pending()
         reply = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:a1"])
-        self.assertIn("BEFORE creating a record", reply["server_error"])
-        self.assertIn("insufficient funds", reply["server_error"])
-        self.assertIn("运行模式", reply["server_error"])
+        self.assertFalse(reply.get("server_error"))
+        self.assertIn("UNCONFIRMED", reply["data"]["message"])
+        # Expire the extended watch -> the refusal push carries the text.
+        shadow = service._shadow_settlements.get_nowait()
+        shadow.deadline = 0.0
+        service._shadow_settlements.put(shadow)
+        service.drain_pending()
+        errors = handlers.order_identity_redis_client.order_errors()
+        self.assertEqual(1, len(errors))
+        self.assertIn("BEFORE creating a record", errors[0]["error_msg"])
+        self.assertIn("insufficient funds", errors[0]["error_msg"])
+        self.assertIn("运行模式", errors[0]["error_msg"])
 
 
 class CashRepayNoRowTest(unittest.TestCase):
@@ -234,13 +245,28 @@ class CashRepayNoRowTest(unittest.TestCase):
         redis_client, handlers, service = self._repay(wait=False)
         self.assertEqual([], handlers.order_identity_redis_client.order_errors())
 
-    def test_an_ordinary_order_with_no_row_still_errors(self):
+    def test_an_ordinary_order_with_no_row_is_unconfirmed_then_errors(self):
+        """#360: a deadline miss is "unconfirmed", not "failed" -- the reply
+        carries no server_error and the watch continues on the shadow queue;
+        only the extended watch expiring with no row pushes the refusal."""
         redis_client, handlers, service = _service(_Gateway(reveal_after=None), timeout=0.0)
         payload = _async_order()
         del payload["params"]["wait_settlement"]
         service.enqueue_payload(payload)
         service.drain_pending()
-        self.assertIn("not found in system", json.loads(redis_client.kv["bigqmt:rpc:resp:acct:a1"])["server_error"])
+        reply = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:a1"])
+        self.assertTrue(reply["ok"])
+        self.assertFalse(reply.get("server_error"))
+        self.assertIn("UNCONFIRMED", reply["data"]["message"])
+        self.assertEqual(1, service.shadow_settlement_count())
+        # Force the extended watch to expire -> the refusal surfaces as a push.
+        shadow = service._shadow_settlements.get_nowait()
+        shadow.deadline = 0.0
+        service._shadow_settlements.put(shadow)
+        service.drain_pending()
+        errors = handlers.order_identity_redis_client.order_errors()
+        self.assertEqual(1, len(errors))
+        self.assertIn("not found in system", errors[0]["error_msg"])
 
 
 class PushlessClientTest(unittest.TestCase):

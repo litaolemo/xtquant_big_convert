@@ -825,7 +825,18 @@ class BigQmtMarketDataProvider:
         big_kwargs_filled = dict(big_kwargs, fill_data=fill_data)
         positional_tail_filled = dict(positional_tail_kwargs, fill_data=fill_data)
 
-        return [
+        # subscribe 是 QMT 签名的最后一个参数（fill_data 之后）：True（大 QMT
+        # 默认）把查过的标的塞进常驻内存订阅池，批量拉分钟线时终端内存单调涨到
+        # 崩溃（#361）；False 只读本地已下载数据。和 fill_data 一样单独成
+        # shape、只在调用方给了才传——签名没有 subscribe 的终端 TypeError 后
+        # 仍落到下面的裸 shape。
+        subscribe = params.get("subscribe")
+        shapes = []
+        if subscribe is not None:
+            shapes.append(
+                (method_name, (), dict(big_kwargs_filled, subscribe=bool(subscribe))))
+
+        shapes.extend([
             (method_name, (), big_kwargs_filled),
             (method_name, (), big_kwargs),
             (method_name, (), mini_kwargs),
@@ -861,7 +872,8 @@ class BigQmtMarketDataProvider:
                     "fill_data": fill_data,
                 },
             ),
-        ]
+        ])
+        return shapes
 
     def _sector_codes(self, sector):
         """Cached sector listing. Membership does not change intraday and the

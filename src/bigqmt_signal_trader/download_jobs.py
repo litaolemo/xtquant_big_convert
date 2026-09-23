@@ -185,11 +185,21 @@ def _acquire_current_job(redis_client, account_id):
 
 
 def _download_chunk(market_data, method, chunk, period, start_time, end_time, incrementally):
+    # Falsy-but-not-None native return = the terminal rejected the task (#339).
+    # It must fail the job loudly; counting it as done was the fake progress.
     if method == "download_history_data":
         for code in chunk:
-            market_data.download_history_data(code, period, start_time, end_time, incrementally)
+            result = market_data.download_history_data(code, period, start_time, end_time, incrementally)
+            if result is not None and not result:
+                raise RuntimeError(
+                    "download_history_data rejected by terminal (return %r) code=%s"
+                    % (result, code))
     else:
-        market_data.download_history_data2(chunk, period, start_time, end_time, incrementally)
+        result = market_data.download_history_data2(chunk, period, start_time, end_time, incrementally)
+        if result is not None and not result:
+            raise RuntimeError(
+                "download_history_data2 rejected by terminal (return %r) codes=%s"
+                % (result, ",".join(str(c) for c in chunk)))
 
 
 def pump_download_jobs(

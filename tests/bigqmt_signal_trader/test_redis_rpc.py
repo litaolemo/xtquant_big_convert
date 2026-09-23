@@ -515,6 +515,9 @@ class AsyncOrderSettlementTest(unittest.TestCase):
         self.assertEqual(service.pending_settlement_count(), 0)
 
     def test_order_that_never_lands_reports_after_the_deadline(self):
+        """#360: the first deadline miss answers "unconfirmed" (no
+        server_error) and keeps watching on the shadow queue; the refusal
+        text only surfaces when the extended watch also expires."""
         gateway = LateLandingOrderGateway(never=True)
         redis_client, service = self._service(gateway, timeout=0.0)
         self._submit(service)
@@ -522,7 +525,15 @@ class AsyncOrderSettlementTest(unittest.TestCase):
 
         response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:ord-1"])
         self.assertTrue(response["ok"])
-        self.assertIn("not found in system", response["server_error"])
+        self.assertFalse(response["server_error"])
+        self.assertIn("UNCONFIRMED", response["data"]["message"])
+        self.assertEqual(service.shadow_settlement_count(), 1)
+
+        shadow = service._shadow_settlements.get_nowait()
+        shadow.deadline = 0.0
+        service._shadow_settlements.put(shadow)
+        service.drain_pending()
+        self.assertIn("not found in system", shadow.server_error)
 
     def test_native_lookup_error_keeps_submission_without_resubmitting(self):
         submissions = []
@@ -564,13 +575,19 @@ class AsyncOrderSettlementTest(unittest.TestCase):
         redis_client, service = self._service(gateway, timeout=0.0)
         self._submit(service)
         service.drain_pending()
-        self.assertIn("not found in system",
-                      json.loads(redis_client.kv["bigqmt:rpc:resp:acct:ord-1"])["server_error"])
+        # #360: the first deadline miss is "unconfirmed"; the refusal lands on
+        # the settlement (shadow queue), not on this or any later response.
+        self.assertFalse(
+            json.loads(redis_client.kv["bigqmt:rpc:resp:acct:ord-1"])["server_error"])
+        shadow = service._shadow_settlements.get_nowait()
+        shadow.deadline = 0.0
+        service._shadow_settlements.put(shadow)
 
         service.enqueue_payload({"request_id": "later-ping", "account_id": "acct",
                                  "method": "ping", "params": {}})
         service.drain_pending()
 
+        self.assertIn("not found in system", shadow.server_error)
         self.assertEqual(
             json.loads(redis_client.kv["bigqmt:rpc:resp:acct:later-ping"])["server_error"], "")
 
@@ -1466,21 +1483,41 @@ class DownloadHistoryDataTest(unittest.TestCase):
     def test_download_history_data_fallback_to_adapter_when_no_global(self):
         """When qmt_api has no download_history_data (e.g. outside QMT),
         the handler falls back to the adapter path. With a FakeMarketData
-        that lacks the method, the handler returns False (graceful, not crash)."""
+        that lacks the method there is NO channel at all -- and since #339
+        that must raise (the #47 contract: failure is loud), not return the
+        False that became the client's fake finished==total progress."""
         handlers = BigQmtRpcHandlers(
             account_id="acct",
             market_data=FakeMarketData(),
             position_provider=FakePositionProvider(),
             qmt_api={},
         )
-        result = handlers.handle("download_history_data", {
-            "stock_code": "000001.SZ",
-            "period": "1d",
-            "start_time": "20230101",
-            "end_time": "",
-        })
-        # No global func and adapter lacks the method → returns False, not crash.
-        self.assertFalse(result)
+        with self.assertRaises(RuntimeError) as caught:
+            handlers.handle("download_history_data", {
+                "stock_code": "000001.SZ",
+                "period": "1d",
+                "start_time": "20230101",
+                "end_time": "",
+            })
+        self.assertIn("no download channel", str(caught.exception))
+        self.assertIn("probe_capabilities", str(caught.exception))
+
+    def test_download_history_data2_false_native_return_raises(self):
+        """#339: a falsy native return is the terminal NOT accepting the task
+        (the reporter's terminal: 恒 False、数据从不落盘) -- not a verdict to
+        pass back as a quiet False."""
+        handlers = self._handlers_with_qmt_global(
+            "down_history_data", lambda *args: False)
+        with self.assertRaises(RuntimeError) as caught:
+            handlers.handle("download_history_data2", {
+                "stock_list": ["600000.SH", "000001.SZ"],
+                "period": "tick",
+                "start_time": "20260910",
+                "end_time": "20260910",
+            })
+        # The per-code failure is named, not collapsed into the last result.
+        self.assertIn("600000.SH", str(caught.exception))
+        self.assertIn("000001.SZ", str(caught.exception))
 
     def test_download_history_data_falls_back_to_down_history_data(self):
         # issue #54: QMT builds that only expose down_history_data must still work.

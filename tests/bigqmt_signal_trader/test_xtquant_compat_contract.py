@@ -188,6 +188,49 @@ class CallbackContractTest(unittest.TestCase):
         self.assertEqual(len(cb.order_errors), 1)
         self.assertEqual(cb.order_errors[0].order_remark, "")
 
+    def test_order_error_order_id_is_the_int_wrapper_not_the_raw_str(self):
+        """#363: the error callback used to hand over the raw broker string
+        ('xt1082186097') as order_id, where every other path -- on_stock_order,
+        order_stock's return -- carries the OrderId int subclass. The caller
+        could neither correlate the error with the submit's id nor cancel with
+        it. int now, str() still round-trips the broker string."""
+        cb = _RecordingCallback()
+        trader = self._trader(cb)
+        trader._deliver_event(
+            {
+                "event_type": "order_error",
+                "account_id": "acct",
+                "order_sys_id": "xt1082186097",
+                "error_id": 2147483647,
+                "error_msg": "[COUNTER] 可用资金不足",
+            }
+        )
+        self.assertEqual(len(cb.order_errors), 1)
+        err = cb.order_errors[0]
+        self.assertIsInstance(err.order_id, int)
+        self.assertEqual(str(err.order_id), "xt1082186097")
+        self.assertEqual(err.order_sysid, "xt1082186097")
+        # Same surrogate int the submit path hands back for this sysid.
+        self.assertEqual(err.order_id, trader._order_object_id("xt1082186097"))
+
+    def test_cancel_error_order_id_is_the_int_wrapper_too(self):
+        """#363's twin: cancel_error had the same raw-str order_id."""
+        cb = _RecordingCallback()
+        trader = self._trader(cb)
+        trader._deliver_event(
+            {
+                "event_type": "cancel_error",
+                "account_id": "acct",
+                "order_sys_id": "xt1082186097",
+                "error_id": -1,
+                "error_msg": "cancel rejected",
+            }
+        )
+        self.assertEqual(len(cb.cancel_errors), 1)
+        err = cb.cancel_errors[0]
+        self.assertIsInstance(err.order_id, int)
+        self.assertEqual(str(err.order_id), "xt1082186097")
+
     def test_cancel_error_local_exception_carries_order_id(self):
         cb = _RecordingCallback()
         client = _CancelFakeClient(cancel_exc=RuntimeError("boom"))

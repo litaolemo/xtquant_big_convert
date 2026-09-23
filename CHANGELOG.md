@@ -7,6 +7,38 @@
 
 ### 修复
 
+- **委托实际成功却报「order not found in system」**（#360）。判决原来钉在「提交后固定窗口内查到
+  ORDER 行」上，而实盘柜台→终端→回调的延迟可以超过任何固定窗口（实盘实测回调 +4.1s 才到，窗口
+  1s 就已报失败，委托随后正常成交）。现在首个窗口到期查不到只判 **UNCONFIRMED**：应答
+  `ok=True`、不带 `server_error`、写明「不要重提」，结算搬进影子队列延长监视（窗口
+  `max(4×order_settle_timeout_seconds, 10s)`）——迟到回调到了就静默了结；延长窗口也查不到才推
+  `order_error`，文案保留 #122 的运行模式指引并补上「回调迟到」这第三个原因。`order_stock`
+  对该应答返回 -1 不抛异常（与 #330 直接还款同款）。inline 模式（无 adjust drain 的运行时）
+  没有续看队列，维持原即时判决。
+- **程序化历史回补失败不再报假进度**（#339 服务端那一半）。（1）三个下载全局一个都没绑定时，
+  裸 RPC 原来吞掉 `NotImplementedError` 恒回 `False`——现在抛错并指向 `probe_capabilities` 的
+  `qmt_globals`；（2）原生返回 falsy（终端没受理）原来被 `bool()` 强转成成功/失败不明的
+  返回值——现在判失败并点名具体代码，逐码循环也不再只留最后一个的结果；（3）客户端
+  `download_history_data2` 原来把 False 应答整个丢掉，空拉按停牌容忍掉、报出
+  `finished==total`——现在 False 应答就是服务端宣告失败，走 #47 的抛错路径。下载任务队列
+  （`submit_download_history_data2`）同规矩：falsy 返回 Job 置 FAILED 而不是盲报 DONE。
+- **zmq + 无 redis 部署收不到任何执行回报**（#366）。`_build_quote_push_channel` 只定义在
+  `BigQmtXtData` 上，而执行回报监听在 `BigQmtXtTrader` 上——`self._build_quote_push_channel()`
+  每轮抛 `AttributeError`，被静默 `except: sleep` 吞掉死循环（自 #76 起就没真正工作过；测试
+  全绿是因为每个用例都把方法猴补到实例上，从没走过真实解析路径）。构建函数提到模块级，两个
+  类共用；监听循环的裸 except 补上日志。回归测试改为不打猴补丁直跑监听循环。
+- **`on_order_error` / `on_cancel_error` 的 `order_id` 是原始字符串**（#363）。柜台拒单（如
+  可用资金不足）时回调里的 `order_id` 是 `'xt1082186097'` 这样的原始编号字符串，与下单返回值
+  和 `on_stock_order` 的 `OrderId`（int 子类）对不上，也没法拿它撤单。现在经同一个
+  `_order_object_id` 包装：int 语义对齐，且能与下单返回值相等关联。
+- **`get_market_data_ex` 支持透传 `subscribe=False`**（#361）。大 QMT 原生默认
+  `subscribe=True` 会把查过的标的塞进常驻内存订阅池，批量拉 1m 历史时终端内存单调上涨直至
+  崩溃。客户端新增 `subscribe` 参数（缺省不传、维持原生默认），服务端和 `fill_data` 一样单独
+  成 shape 下发；签名没有 `subscribe` 的老终端 TypeError 后落回原 shape。批量回补历史请显式
+  传 `subscribe=False`。
+- **CHANGELOG 补回 0.3.54 段**：#359 提交把 0.3.54 的内容吞进了「未发布」段头，版本钉测试
+  （`test_version_stamp`）在 main 上因此是红的；0.3.54 段已还原。
+
 - **订阅 >100 只时，可转债 / 基金 / ETF / 指数没有首帧**（#358）。`subscribe_whole_quote`
   的打底走两条路：≤100 只逐码取数并明确传 `types=["all"]`，>100 只按交易所 token 取数
   却**什么都没传**——服务端于是回落到 `DEFAULT_TICK_TYPES=("stock",)`，把 `SH` 展开成
@@ -19,6 +51,8 @@
   实测（国金 0.3.54 实盘桥接，只读）：150 只沪市股票 + 5 只转债 + 5 只 ETF，修正前首帧
   150 行、10 只静默缺失，修正后 160 行全到齐，0.31s → 0.42s。品种推断拿终端自己的板块
   清单核过：10508 个在册标的里 10488 个判对、20 个（`980xxx.SZ` 指数段）落到直读，**0 个判错**。
+
+## [0.3.54] - 2026-09-22
 
 港股通：同一个账号几种类型，`BIGQMT_ACCOUNT_TYPE` 可写列表，客户端 `StockAccount` 的类型随请求传到服务端；延迟报告用 0.3.53 稳态重测四种组合，并修正探针的相位锁死和回放窗口两处偏差。
 

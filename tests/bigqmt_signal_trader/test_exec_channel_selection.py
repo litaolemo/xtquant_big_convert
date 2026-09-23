@@ -124,6 +124,37 @@ def _trader(transport, redis_client):
     return trader, recorder
 
 
+class _patched_channel_builder(object):
+    """Patch the module-level push-channel builder (#366).
+
+    These tests used to monkeypatch ``trader._build_quote_push_channel`` onto
+    the instance -- which is exactly how #366 stayed invisible: the real
+    trader class never had that method, so the zmq exec listener raised
+    AttributeError into a silent retry loop while every test greened. The
+    builder is module-level now; patch there.
+    """
+
+    def __init__(self, channel=None, raiser=None):
+        self._channel = channel
+        self._raiser = raiser
+        self._real = None
+        self._mod = None
+
+    def __enter__(self):
+        import bigqmt_signal_trader.xtquant_compat as compat
+        self._mod = compat
+        self._real = compat._build_quote_push_channel
+        if self._raiser is not None:
+            compat._build_quote_push_channel = lambda client: self._raiser()
+        else:
+            compat._build_quote_push_channel = lambda client: self._channel
+        return self
+
+    def __exit__(self, *exc):
+        self._mod._build_quote_push_channel = self._real
+        return False
+
+
 class ChannelSelectionTest(unittest.TestCase):
     def test_zmq_transport_with_working_redis_subscribes_redis_channels(self):
         """The #144 shape: zmq transport, Redis reachable -> Redis channels."""
@@ -137,10 +168,10 @@ class ChannelSelectionTest(unittest.TestCase):
         # straight to the push channel) fails cleanly instead of hanging.
         push = _FakePushChannel(
             stop=lambda: setattr(trader, "_event_running", False))
-        trader._build_quote_push_channel = lambda: push
 
         trader._event_running = True
-        trader._event_loop()
+        with _patched_channel_builder(push):
+            trader._event_loop()
 
         self.assertIsNone(push.topics,
                           "push channel must not be built when Redis is reachable")
@@ -160,10 +191,10 @@ class ChannelSelectionTest(unittest.TestCase):
         trader.client._redis = lambda: redis_client
         push = _FakePushChannel(
             stop=lambda: setattr(trader, "_event_running", False))
-        trader._build_quote_push_channel = lambda: push
 
         trader._event_running = True
-        trader._event_loop()
+        with _patched_channel_builder(push):
+            trader._event_loop()
 
         self.assertEqual(
             set(push.topics or []),
@@ -177,11 +208,11 @@ class ChannelSelectionTest(unittest.TestCase):
             stop=lambda: setattr(trader, "_event_running", False),
         )
         trader.client._redis = lambda: redis_client
-        trader._build_quote_push_channel = lambda: self.fail(
-            "redis transport must not build a push channel")
 
         trader._event_running = True
-        trader._event_loop()
+        with _patched_channel_builder(raiser=lambda: self.fail(
+                "redis transport must not build a push channel")):
+            trader._event_loop()
 
         self.assertEqual(len(redis_client.pubsubs), 1)
         self.assertEqual(recorder.names(), ["order"])
@@ -199,7 +230,6 @@ class ChannelSelectionTest(unittest.TestCase):
                 trader._event_running = False
 
         push = _FakePushChannel(stop=stop_after_first_retry)
-        trader._build_quote_push_channel = lambda: push
 
         real_sleep = time.sleep
         def fast_sleep(seconds):
@@ -208,7 +238,8 @@ class ChannelSelectionTest(unittest.TestCase):
 
         trader._event_running = True
         with _patched_sleep(fast_sleep):
-            trader._event_loop()
+            with _patched_channel_builder(push):
+                trader._event_loop()
 
         self.assertGreaterEqual(redis_client.pings, 1)
         self.assertIsNone(push.topics, "redis transport must not fall to the "
@@ -240,7 +271,6 @@ class ChannelSelectionTest(unittest.TestCase):
 
         push = _FakePushChannel(
             stop=lambda: setattr(trader, "_event_running", False))
-        trader._build_quote_push_channel = lambda: push
 
         real_sleep = time.sleep
         def fast_sleep(seconds):
@@ -248,9 +278,37 @@ class ChannelSelectionTest(unittest.TestCase):
 
         trader._event_running = True
         with _patched_sleep(fast_sleep):
-            trader._event_loop()
+            with _patched_channel_builder(push):
+                trader._event_loop()
 
         self.assertIsNotNone(push.topics)
+
+
+class PushChannelBuilderResolutionTest(unittest.TestCase):
+    """#366: BigQmtXtTrader never had `_build_quote_push_channel` -- it lives
+    on BigQmtXtData. The exec-event listener calling it as `self.<method>`
+    raised AttributeError into a silent retry loop, so a zmq deployment
+    without Redis got ZERO exec callbacks (single-file zmq deploys hit this
+    from day one). The builder is module-level now; this test drives the
+    listener with no instance monkeypatching -- the thing the old tests did
+    everywhere, which is exactly how the bug stayed invisible since #76."""
+
+    def test_the_trader_class_has_no_such_method(self):
+        self.assertFalse(hasattr(BigQmtXtTrader, "_build_quote_push_channel"))
+
+    def test_the_listener_resolves_the_module_level_builder(self):
+        trader, _ = _trader("zmq", None)
+        push = _FakePushChannel(
+            stop=lambda: setattr(trader, "_event_running", False))
+
+        trader._event_running = True
+        with _patched_channel_builder(push):
+            trader._event_loop_push_channel()
+
+        self.assertEqual(
+            set(push.topics or []),
+            {"exec:order", "exec:trade", "exec:order_error", "exec:cancel_error"})
+        self.assertTrue(push.stopped)
 
 
 class _patched_sleep(object):

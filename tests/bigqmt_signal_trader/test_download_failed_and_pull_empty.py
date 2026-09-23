@@ -23,9 +23,10 @@ class _EmptyPullClient(FakeClient):
     """Server-side download raises; the pull answers zero rows (the #339
     shape: nothing landed on the terminal, nothing for the client to save)."""
 
-    def __init__(self, cache_dir, download_error=True):
+    def __init__(self, cache_dir, download_error=True, download_reply=True):
         super(_EmptyPullClient, self).__init__(cache_dir)
         self.download_error = download_error
+        self.download_reply = download_reply
 
     def call(self, method, params=None, account_id=None, timeout_seconds=None):
         self.calls.append(method)
@@ -33,7 +34,7 @@ class _EmptyPullClient(FakeClient):
         if method == "download_history_data2":
             if self.download_error:
                 raise RuntimeError("download_history_data2 unavailable on this terminal")
-            return False
+            return self.download_reply
         if method == "get_market_data_ex":
             import pandas as pd
             codes = (params or {}).get("stock_list") or []
@@ -48,9 +49,10 @@ class FailedDownloadWithEmptyPullTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.dir, ignore_errors=True)
 
-    def _xt(self, download_error=True):
+    def _xt(self, download_error=True, download_reply=True):
         from bigqmt_signal_trader.xtquant_compat import BigQmtXtData
-        return BigQmtXtData(_EmptyPullClient(self.dir, download_error=download_error))
+        return BigQmtXtData(_EmptyPullClient(self.dir, download_error=download_error,
+                                             download_reply=download_reply))
 
     def test_failed_download_and_empty_pull_raises_instead_of_finished(self):
         xt = self._xt()
@@ -81,11 +83,26 @@ class FailedDownloadWithEmptyPullTest(unittest.TestCase):
 
     def test_download_ok_and_empty_pull_keeps_tolerant_finish(self):
         """A download that did not fail plus an empty code (suspended /
-        delisted) is the case the poll timeout was written for: unchanged."""
-        xt = self._xt(download_error=False)
+        delisted) is the case the poll timeout was written for: unchanged.
+
+        Note the server contract changed with #339: "did not fail" now means
+        an explicit True reply; a False reply is a declared failure (next test).
+        """
+        xt = self._xt(download_error=False, download_reply=True)
         result = xt.download_history_data2(["600519.SH"], "tick", "20260910", "20260910",
                                            data_wait_seconds=0)
         self.assertEqual(result, {"finished": 1, "total": 1})
+
+    def test_server_false_reply_raises_instead_of_finished(self):
+        """#339 的另一半：裸 RPC 恒 False 是「终端没受理这个下载任务」，不是
+        成功——此前 False 被原样丢掉，空拉被当成停牌容忍掉，最终报出
+        finished==total 的假进度。"""
+        from bigqmt_signal_trader.xtquant_compat import BigQmtXtData
+        xt = BigQmtXtData(_EmptyPullClient(self.dir, download_error=False,
+                                           download_reply=False))
+        with self.assertRaisesRegex(RuntimeError, "did not accept the download task"):
+            xt.download_history_data2(["600519.SH"], "tick", "20260910", "20260910",
+                                      data_wait_seconds=0)
 
 
 if __name__ == "__main__":

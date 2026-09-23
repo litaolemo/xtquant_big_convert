@@ -208,7 +208,12 @@ class DeadlineTest(_Service):
 
 
 class MissingOrderIsStillMissingTest(_Service):
-    """The neighbouring branch must keep its own meaning (#41, #122)."""
+    """The neighbouring branch must keep its own meaning (#41, #122).
+
+    Since #360 the first deadline miss is "unconfirmed" (reply carries no
+    server_error and the watch moves to the shadow queue); the refusal text
+    arrives only when the extended watch also expires with no row.
+    """
 
     def test_no_remark_match_at_the_deadline_still_says_not_in_system(self):
         class NeverLands(DryRunOrderGateway):
@@ -219,9 +224,21 @@ class MissingOrderIsStillMissingTest(_Service):
         self._submit(service)
         service.drain_pending()
 
-        error = self._response(redis_client).get("server_error") or ""
-        self.assertIn("not found in system", error)
-        self.assertIn("运行模式", error)
+        response = self._response(redis_client)
+        self.assertFalse(response.get("server_error"))
+        self.assertIn("UNCONFIRMED", response["data"]["message"])
+        self.assertEqual(service.shadow_settlement_count(), 1)
+
+        # Extended window expires -> the refusal text, unchanged. No event
+        # sink is wired here, so assert on the settlement itself.
+        shadow = service._shadow_settlements.get_nowait()
+        shadow.deadline = 0.0
+        service._shadow_settlements.put(shadow)
+        service.drain_pending()
+
+        self.assertIn("not found in system", shadow.server_error)
+        self.assertIn("运行模式", shadow.server_error)
+        self.assertEqual(service.shadow_settlement_count(), 0)
 
 
 if __name__ == "__main__":

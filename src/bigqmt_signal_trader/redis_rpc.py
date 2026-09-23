@@ -2343,15 +2343,25 @@ class BigQmtRpcHandlers:
                 start_time = str(params.get("start_time") or "")
                 end_time = str(params.get("end_time") or "")
                 result = func(stock_code, period, start_time, end_time)
-                return bool(result) if result is not None else True
+                if result is not None and not result:
+                    raise RuntimeError(
+                        "download_history_data: terminal rejected the task "
+                        "(native return %r) code=%s period=%s"
+                        % (result, stock_code, period))
+                return True
             except Exception as exc:
                 raise RuntimeError("download_history_data failed: %s" % exc)
         # Fallback: adapter tries native xtdata SDK then ContextInfo.
-        # If the adapter lacks the method, return False (not crash).
+        # #339: no channel at all must raise (the #47 contract: failure is
+        # loud), not return False — a silent False became the client's fake
+        # finished==total progress over zero landed rows.
         try:
             return self._handle_market_data_method("download_history_data", params)
         except (NotImplementedError, AttributeError):
-            return False
+            raise RuntimeError(
+                "download_history_data: no download channel on this terminal "
+                "(download_history_data/down_history_data unbound, ContextInfo "
+                "has no download method) -- check probe_capabilities qmt_globals")
 
     def _handle_download_history_data2(self, params):
         """download_history_data2 is a QMT global function (issue #32).
@@ -2378,22 +2388,42 @@ class BigQmtRpcHandlers:
                     result = func(stock_list, period, start_time, end_time, lambda data: None)
                 except TypeError:
                     result = func(stock_list, period, start_time, end_time)
-                return bool(result) if result is not None else True
+                if result is not None and not result:
+                    raise RuntimeError(
+                        "terminal rejected the download task (native return %r) "
+                        "codes=%d period=%s" % (result, len(stock_list), period))
+                return True
             except Exception as exc:
                 raise RuntimeError("download_history_data2 failed: %s" % exc)
         single = self.qmt_api.get("download_history_data") or self.qmt_api.get("down_history_data")
         if single is not None:
-            try:
-                result = None
-                for code in stock_list:
+            rejected = []
+            errors = []
+            for code in stock_list:
+                try:
                     result = single(code, period, start_time, end_time)
-                return bool(result) if result is not None else True
-            except Exception as exc:
-                raise RuntimeError("download_history_data2 per-code fallback failed: %s" % exc)
+                except Exception as exc:
+                    errors.append("%s: %s" % (code, exc))
+                    continue
+                if result is not None and not result:
+                    rejected.append(code)
+            if errors or rejected:
+                raise RuntimeError(
+                    "download_history_data2 per-code fallback failed "
+                    "(rejected=%s errors=%s)" % (",".join(rejected) or "-",
+                                                 "; ".join(errors) or "-"))
+            return True
+        # #339: was `return False` — a constant False with no channel is the
+        # exact shape that became the client's fake finished==total progress.
+        # Failure must raise (the #47 contract).
         try:
             return self._handle_market_data_method("download_history_data2", params)
         except (NotImplementedError, AttributeError):
-            return False
+            raise RuntimeError(
+                "download_history_data2: no download channel on this terminal "
+                "(download_history_data2/download_history_data/down_history_data "
+                "all unbound; ContextInfo has no download method) -- check "
+                "probe_capabilities qmt_globals")
 
     def _handle_probe_order_identity(self, params):
         """Diagnose the strategy_name backfill chain, one link at a time.
@@ -2882,31 +2912,49 @@ class BigQmtRpcHandlers:
                 except Exception:
                     pass
                 return True
-            # Deadline reached with no remark match -> not in the system. Do NOT
-            # fall back to matching stock_code+action: order_tag is a unique id
-            # we generated, so a miss is always a real miss, while an unrelated
-            # order on the same stock and side (a manual one, or an earlier
-            # unfilled order) would silently suppress this warning and leave
-            # order_sys_id unfilled with no signal at all (issue #41).
-            # The first thing to check is the strategy's run mode, not the
-            # order. QMT's 模型交易 list has a 运行模式 column that defaults to
-            # 模拟, and in that mode passorder matches internally and never
-            # reaches the broker: the call succeeds, SUBMITTED comes back, and
-            # every lookup finds nothing. This message used to lead with
-            # "check price range / permissions", and a reporter spent two
-            # hours there before finding the mode (issue #122).
+            # Deadline reached with no remark match. Do NOT fall back to
+            # matching stock_code+action (issue #41). But a deadline miss is
+            # NOT proof of refusal either: on a live terminal the ORDER row /
+            # order_callback can arrive seconds after ANY fixed window
+            # (measured +4.1s during market hours, issue #360 — the order was
+            # live and filled while the caller was told "not found"). So the
+            # synchronous verdict is "unconfirmed", not "failed": answer ok
+            # with no id and keep watching as a shadow settlement on an
+            # extended deadline. Only a miss at the END of that extended window
+            # is reported as a refusal. (inline mode has no drain loop to keep
+            # watching on, so it keeps the old immediate verdict.)
+            if not settlement.shadow and not inline:
+                settlement.shadow = True
+                settlement.deadline = _monotonic() + max(
+                    4.0 * float(getattr(self, "order_settle_timeout_seconds", 3.0)), 10.0)
+                try:
+                    settlement.result.message = (
+                        "submitted but UNCONFIRMED after %d lookup(s): no order "
+                        "row yet. This can be plain callback latency (observed "
+                        ">4s on a live terminal during market hours, #360) -- "
+                        "DO NOT RESUBMIT. Watch order_callback / the 委托 list "
+                        "for the id; if the extended watch also misses, an "
+                        "order_error push follows (#345)." % settlement.attempts)
+                except Exception:
+                    pass
+                return True
+            # Extended-window (or inline) miss -> now it is a refusal. The first
+            # thing to check is still the strategy's run mode (#122), but the
+            # late-callback cause is real too (#360).
             message = (
                 "passorder submitted but order not found in system "
-                "(stock=%s action=%s price=%s volume=%d, %d lookup(s)). "
-                "FIRST check the strategy's run mode: in QMT's 模型交易 list the "
-                "运行模式 column defaults to 模拟, where passorder matches "
-                "internally and never reaches the broker -- switch it to 实盘 "
-                "(a simulated account stays simulated). The editor window and "
-                "backtest/signal modes place no real order either. If the mode "
-                "is already 实盘, the terminal refused the order BEFORE creating "
-                "a record -- insufficient funds/position, price range, "
+                "(stock=%s action=%s price=%s volume=%d, %d lookup(s) including "
+                "an extended watch). FIRST check the strategy's run mode: in "
+                "QMT's 模型交易 list the 运行模式 column defaults to 模拟, where "
+                "passorder matches internally and never reaches the broker -- "
+                "switch it to 实盘 (a simulated account stays simulated; the "
+                "editor window and backtest/signal modes place no real order "
+                "either). Second: the terminal refused the order BEFORE "
+                "creating a record -- insufficient funds/position, price range, "
                 "permissions: it shows a dialog on the QMT screen and fires no "
-                "callback, so this reply is the only signal (#345)."
+                "callback (#345). Third: the ORDER row / order_callback was "
+                "simply late -- observed >4s on a live terminal during market "
+                "hours (#360). Check the 委托 list before resubmitting."
                 % (request.stock_code, request.action, request.price,
                    request.volume, settlement.attempts)
             )
@@ -4037,6 +4085,13 @@ class RedisPubSubRpcService:
             except Exception:
                 pass
             settled += 1
+            if (getattr(settlement, "shadow", False)
+                    and not isinstance(settlement, CancelSettlement)):
+                # Converted at its deadline (#360): the reply answered
+                # "unconfirmed"; keep watching on the shadow queue so a late
+                # callback settles it silently and only a true refusal pushes
+                # order_error at the extended deadline.
+                self._shadow_settlements.put(settlement)
         settled += self._settle_shadow_orders(orders_cache, max_items)
         return settled
 
