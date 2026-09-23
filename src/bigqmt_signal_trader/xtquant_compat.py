@@ -518,6 +518,69 @@ def _credit_order_type_from_op(op_type, fallback):
     return _CREDIT_ORDER_TYPE_BY_OP.get(value, fallback)
 
 
+# enum_EEntrustTypes（迅投知识库）: 54 融资委托 / 55 融券委托 / 57 信用普通委托。
+# reporter 实盘数据（#330, 2026-09-23）: 融资买入 m_eEntrustType=54、担保品
+# 买入=57，而 m_nOpType 两者没有区别——0.3.52 按 m_nOpType 的判据因此
+# 对这批终端永不生效。m_eEntrustType + 开平方向才是可靠判据。
+_CREDIT_ORDER_TYPE_BY_ENTRUST = {
+    # (entrust_type, is_buy) -> MiniQMT order_type
+    (54, True): 27,    # 融资委托 + 买 = 融资买入 CREDIT_FIN_BUY
+    (54, False): 31,   # 融资委托 + 卖 = 卖券还款 CREDIT_SELL_SECU_REPAY
+    (55, True): 29,    # 融券委托 + 买 = 买券还券 CREDIT_BUY_SECU_REPAY
+    (55, False): 28,   # 融券委托 + 卖 = 融券卖出 CREDIT_SLO_SELL
+    (57, True): 23,    # 信用普通委托 + 买 = 担保品买入 CREDIT_BUY
+    (57, False): 24,   # 信用普通委托 + 卖 = 担保品卖出 CREDIT_SELL
+}
+
+# 「专项」名称只从 m_strOptName 拿（entrust 枚举不分专项）。
+_CREDIT_SPECIAL_UPGRADE = {27: 40, 28: 41, 29: 42, 31: 44, 32: 45}
+
+
+def _credit_order_type_from_entrust(entrust_type, offset_flag, opt_name, fallback):
+    """The MiniQMT order_type from m_eEntrustType + side, else ``fallback``.
+
+    ``opt_name`` 含「专项」时升级到专项族（40-45）；56 信用平仓等未列出的
+    类别回退给调用方的下一个判据。
+    """
+    try:
+        entrust = int(entrust_type)
+    except (TypeError, ValueError):
+        return fallback
+    try:
+        side = int(offset_flag)
+    except (TypeError, ValueError):
+        return fallback
+    if side == 48:
+        is_buy = True
+    elif side == 49:
+        is_buy = False
+    else:
+        return fallback
+    mapped = _CREDIT_ORDER_TYPE_BY_ENTRUST.get((entrust, is_buy))
+    if mapped is None:
+        return fallback
+    if "专项" in str(opt_name or ""):
+        mapped = _CREDIT_SPECIAL_UPGRADE.get(mapped, mapped)
+    return mapped
+
+
+def _credit_order_type_for_row(item, fallback):
+    """Credit order_type for a snapshot dict: entrust first, op second (#330).
+
+    0.3.55+ 的服务端在快照里带 m_eEntrustType；老服务端/老终端没有它时
+    退回 0.3.52 的 m_nOpType 映射，再不行才用方向推的 23/24。
+    """
+    order_type = _credit_order_type_from_entrust(
+        item.get("entrust_type"),
+        item.get("offset_flag", item.get("direction")),
+        item.get("opt_name"),
+        None)
+    if order_type is not None:
+        return order_type
+    return _credit_order_type_from_op(item.get("op_type"), fallback)
+
+
+
 def _account_type_name(value):
     """The NAME of an account type, whatever form it arrives in.
 
@@ -6725,7 +6788,8 @@ class BigQmtXtTrader:
         action = item.get("action")
         order_type = (option_order_type(item.get("direction"), item.get("offset_flag"), action)
                       if self._account_type_value(item) == 6 else _action_to_order_type(action))
-        order_type = _credit_order_type_from_op(item.get("op_type"), order_type)
+        # #330 跟修：entrust 判据优先，op 判据兜底
+        order_type = _credit_order_type_for_row(item, order_type)
         order_sysid = str(item.get("order_sys_id") or item.get("order_sysid") or item.get("order_id") or "")
         return CompatObject(
             account_id=account_id,
@@ -6773,7 +6837,7 @@ class BigQmtXtTrader:
         action = item.get("action")
         order_type = (option_order_type(item.get("direction"), item.get("offset_flag"), action)
                       if self._account_type_value(item) == 6 else _action_to_order_type(action))
-        order_type = _credit_order_type_from_op(item.get("op_type"), order_type)
+        order_type = _credit_order_type_for_row(item, order_type)
         order_sysid = str(item.get("order_sys_id") or item.get("order_sysid") or "")
         trade_id = str(item.get("trade_id") or "")
         traded_volume = _safe_int(item.get("volume", item.get("traded_volume")))

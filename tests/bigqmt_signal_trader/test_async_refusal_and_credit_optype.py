@@ -42,6 +42,8 @@ from bigqmt_signal_trader.redis_rpc import (  # noqa: E402
 )
 from bigqmt_signal_trader.xtquant_compat import (  # noqa: E402
     BigQmtXtTrader,
+    _credit_order_type_for_row,
+    _credit_order_type_from_entrust,
     _credit_order_type_from_op,
 )
 
@@ -377,6 +379,86 @@ class CreditOrderTypeTest(unittest.TestCase):
 
         trader.client = Client()
         self.assertEqual(xtconstant.CREDIT_SELL_SECU_REPAY, trader.query_stock_trades("acct")[0].order_type)
+
+
+class EntrustOrderTypeTest(unittest.TestCase):
+    """#330 跟修（2026-09-23，jerry87n 的实盘数据）：融资买入 m_eEntrustType=54、
+    担保品买入=57，而 m_nOpType 两者没有区别——0.3.52 的 op 判据对这批终端
+    永不生效。m_eEntrustType + 开平方向才是可靠判据；op 判据降级为兜底。"""
+
+    def test_the_entrust_map(self):
+        FIN, SLO, NORMAL = 54, 55, 57
+        BUY, SELL = 48, 49
+        self.assertEqual(xtconstant.CREDIT_FIN_BUY,
+                         _credit_order_type_from_entrust(FIN, BUY, "", 23))
+        self.assertEqual(xtconstant.CREDIT_SELL_SECU_REPAY,
+                         _credit_order_type_from_entrust(FIN, SELL, "", 24))
+        self.assertEqual(xtconstant.CREDIT_SLO_SELL,
+                         _credit_order_type_from_entrust(SLO, SELL, "", 24))
+        self.assertEqual(xtconstant.CREDIT_BUY_SECU_REPAY,
+                         _credit_order_type_from_entrust(SLO, BUY, "", 23))
+        self.assertEqual(xtconstant.CREDIT_BUY,
+                         _credit_order_type_from_entrust(NORMAL, BUY, "", 27))
+        self.assertEqual(xtconstant.CREDIT_SELL,
+                         _credit_order_type_from_entrust(NORMAL, SELL, "", 27))
+
+    def test_special_upgrades_only_via_opt_name(self):
+        self.assertEqual(xtconstant.CREDIT_FIN_BUY_SPECIAL,
+                         _credit_order_type_from_entrust(54, 48, "专项融资买入", 23))
+        self.assertEqual(xtconstant.CREDIT_SELL_SECU_REPAY_SPECIAL,
+                         _credit_order_type_from_entrust(54, 49, "专项卖券还款", 24))
+        self.assertEqual(xtconstant.CREDIT_FIN_BUY,
+                         _credit_order_type_from_entrust(54, 48, "融资买入", 23))
+
+    def test_unknown_entrust_or_side_falls_back(self):
+        self.assertEqual(23, _credit_order_type_from_entrust(56, 48, "", 23))   # 信用平仓未列
+        self.assertEqual(24, _credit_order_type_from_entrust(54, 50, "", 24))   # 非买卖方向
+        self.assertEqual(24, _credit_order_type_from_entrust(None, 48, "", 24))
+        self.assertEqual(23, _credit_order_type_from_entrust("x", 48, "", 23))
+
+    def test_the_gateway_carries_entrust_type(self):
+        rows = [_Row(m_strOrderSysID="1", m_strRemark="r", m_strInstrumentID="600000",
+                     m_strExchangeID="SH", m_nOffsetFlag=48, m_nOpType=23,
+                     m_eEntrustType=54, m_strOptName="融资买入",
+                     m_nVolumeTotalOriginal=100, m_nVolumeTraded=0, m_nOrderStatus=50,
+                     m_dLimitPrice=10.0)]
+        gateway = BigQmtOrderGateway(account_id="acct", passorder_func=None, context_info=object(),
+                                     get_trade_detail_data_func=lambda *a: rows)
+        snap = gateway.query_orders("acct", "")[0]
+        self.assertEqual(54, snap.entrust_type)
+        self.assertEqual("融资买入", snap.opt_name)
+        self.assertEqual(54, to_jsonable(snap)["entrust_type"])
+
+    def test_query_stock_orders_prefers_entrust_over_op(self):
+        """jerry87n 的那两行：op_type 分不出（都是 23 的形状），entrust 分得清。"""
+        trader = BigQmtXtTrader(account_id="acct")
+
+        class Client(object):
+            account_id = "acct"
+
+            def call(self_, method, params=None, account_id=None, timeout_seconds=None):
+                return [  # 融资买入：op 平平无奇，entrust=54
+                        {"order_sys_id": "1", "stock_code": "600000.SH", "action": "BUY",
+                         "volume": 100, "traded_volume": 0, "status": 50, "price": 10.0,
+                         "op_type": 23, "entrust_type": 54, "offset_flag": 48,
+                         "opt_name": "融资买入"},
+                        # 担保品买入：同样的 op，entrust=57
+                        {"order_sys_id": "2", "stock_code": "600000.SH", "action": "BUY",
+                         "volume": 100, "traded_volume": 0, "status": 50, "price": 10.0,
+                         "op_type": 23, "entrust_type": 57, "offset_flag": 48,
+                         "opt_name": "担保品买入"}]
+
+        trader.client = Client()
+        orders = trader.query_stock_orders("acct")
+        self.assertEqual(xtconstant.CREDIT_FIN_BUY, orders[0].order_type)
+        self.assertEqual(xtconstant.CREDIT_BUY, orders[1].order_type)
+
+    def test_no_entrust_type_falls_back_to_op_mapping(self):
+        """老服务端/老终端不带 entrust_type 时，0.3.52 的 op 判据照旧。"""
+        self.assertEqual(27, _credit_order_type_for_row(
+            {"op_type": 27, "offset_flag": 48}, 23))
+        self.assertEqual(23, _credit_order_type_for_row(
+            {"op_type": 23, "offset_flag": 48}, 23))
 
 
 if __name__ == "__main__":

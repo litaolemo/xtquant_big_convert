@@ -785,6 +785,10 @@ class BigQmtOrderGateway:
                     direction=_attr(row, ("m_nDirection", "direction")),
                     # the terminal's own opType, for the client's order_type (#330)
                     op_type=_attr(row, ("m_nOpType", "op_type")),
+                    # m_eEntrustType（54 融资/55 融券/57 信用普通）才是信用委托
+                    # 的可靠判别；m_nOpType 经 reporter 实盘数据证实分不出（#330 跟修）
+                    entrust_type=_attr(row, ("m_eEntrustType", "entrust_type")),
+                    opt_name=str(_attr(row, ("m_strOptName", "opt_name"), "") or ""),
                 )
             )
         return result
@@ -860,6 +864,10 @@ class BigQmtOrderGateway:
                     direction=_attr(row, ("m_nDirection", "direction")),
                     # the terminal's own opType, for the client's order_type (#330)
                     op_type=_attr(row, ("m_nOpType", "op_type")),
+                    # m_eEntrustType（54 融资/55 融券/57 信用普通）才是信用委托
+                    # 的可靠判别；m_nOpType 经 reporter 实盘数据证实分不出（#330 跟修）
+                    entrust_type=_attr(row, ("m_eEntrustType", "entrust_type")),
+                    opt_name=str(_attr(row, ("m_strOptName", "opt_name"), "") or ""),
                 )
             )
         return result
