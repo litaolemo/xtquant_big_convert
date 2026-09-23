@@ -28,6 +28,7 @@ from xtquant import xtconstant as _xtconstant
 from xtquant.xtconstant import ORDER_UNKNOWN, STOCK_BUY, STOCK_SELL
 from xtquant.xttype import StockAccount
 
+from .code_utils import is_bond_code
 from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
 from .local_cache import LocalMarketCache
 from .order_id import OrderId, order_sys_id_of
@@ -1719,6 +1720,62 @@ def _markets_of(codes):
     return markets
 
 
+# Which instrument kinds a market token has to be asked for, per exchange.
+#
+# The server narrows a market token to `types` and defaults to ("stock",) --
+# "SH" becomes the 上证A股 sector listing. So a token request that does not say
+# what it wants silently loses convertibles, funds, ETFs and indices: they are
+# subscribed and pushed, but absent from the first frame (#358). Asking for
+# ["all"] instead costs the whole exchange listing (26744 instruments, ~7.5s on
+# the adjust thread), which is exactly what #247/#104 removed. So infer the
+# kinds from the codes actually asked for.
+#
+# Prefixes are the exchanges' own code segments. Convertibles are not listed
+# here -- code_utils.is_bond_code already owns those prefixes, and duplicating
+# them is how the two copies drift apart.
+#
+#   SH  600/601/603/605/688/689 股票 · 5xx 基金/ETF · 000xxx 指数
+#   SZ  00x/30x 股票 · 15x/16x/18x 基金/ETF · 39xxxx 指数 (980xxx.SZ 也是指数，
+#       不在「沪深指数」板块里，所以不认它)
+#   BJ  43/83/87/88/92 股票 (899050.BJ 北证50 is an index and 沪深指数 does not
+#       carry it, so it stays unclassified on purpose)
+#
+# A code that matches nothing here is NOT guessed at: it goes down the direct
+# per-code path instead, which is slower and right. Guessing is how the codes
+# went missing in the first place.
+_PRIME_TYPES_BY_PREFIX = {
+    "SH": ((("600", "601", "603", "605", "688", "689"), ("stock",)),
+           (("5",), ("fund", "etf")),
+           (("000",), ("index",))),
+    # 30 rather than 300/301: 深证A股 already lists 302132.SZ, and the 30x
+    # segment is 创业板 only, so widening it cannot swallow another kind.
+    "SZ": ((("000", "001", "002", "003", "30"), ("stock",)),
+           (("15", "16", "18"), ("fund", "etf")),
+           (("39",), ("index",))),
+    "BJ": ((("43", "83", "87", "88", "92"), ("stock",)),),
+}
+
+
+def _prime_tick_types(code):
+    """Instrument kinds to narrow a market token to for `code`, or ().
+
+    () means "not confidently classified" -- the caller must not narrow on this
+    code's behalf.
+    """
+    text = str(code or "").strip().upper()
+    if "." not in text:
+        return ()
+    pure, _, market = text.partition(".")
+    if not pure.isdigit():
+        return ()
+    if is_bond_code(text):
+        return ("convertible",)
+    for prefixes, kinds in _PRIME_TYPES_BY_PREFIX.get(market, ()):
+        if pure.startswith(prefixes):
+            return kinds
+    return ()
+
+
 def _full_tick_params(codes, types=None):
     """RPC params for get_full_tick. `types` narrows a whole-market token to one
     instrument kind at REQUEST time -- filtering the reply would still pay QMT's
@@ -3163,6 +3220,12 @@ class BigQmtXtData:
         # get_full_tick with those tokens -- QMT handles exchange tokens as
         # whole-exchange operations (fast). Then filter the result to only the
         # codes the caller actually asked for.
+        #
+        # The token path cannot pass ["all"] -- that is the 26744-instrument
+        # read #247 removed -- so it passes the kinds the requested codes
+        # actually are (#358). Saying nothing there is what made convertibles
+        # disappear from the first frame above 100 codes while the push kept
+        # delivering them.
         if callback is not None:
             try:
                 # Called unconditionally, including with an empty snapshot:
@@ -3215,12 +3278,25 @@ class BigQmtXtData:
         if whole:
             wanted = set()
             tokens = set()
+            kinds = set()
             for code in whole:
+                code_kinds = _prime_tick_types(code)
+                if not code_kinds:
+                    # Unclassified: the server would narrow the token to stocks
+                    # and drop this code without saying so (#358). Read it
+                    # directly instead -- slow beats silently absent.
+                    direct.append(code)
+                    continue
                 wanted.add(code.upper())
                 tokens.add(code.rsplit(".", 1)[-1].upper())
-            full = self.get_full_tick(sorted(tokens)) or {}
-            snapshot.update(
-                (k, v) for k, v in full.items() if str(k).upper() in wanted)
+                kinds.update(code_kinds)
+            if tokens:
+                # types= is what keeps the push side and the primer covering the
+                # same instruments: the push is ContextInfo's own
+                # subscribe_whole_quote and is not narrowed at all.
+                full = self.get_full_tick(sorted(tokens), types=sorted(kinds)) or {}
+                snapshot.update(
+                    (k, v) for k, v in full.items() if str(k).upper() in wanted)
         if direct:
             # No whole-market token for these (futures, and anything new).
             # Slow for a long list, but slow-and-correct beats fast-and-empty:
