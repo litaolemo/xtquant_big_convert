@@ -3,6 +3,20 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [0.3.60] - 2026-09-24
+
+### 修复
+
+- **pipe/沙箱部署的最后两处 socket 漏网**（0.3.58 后实盘逐行核对）。（1）客户端事件线程的 redis
+  探测：非 redis 传输且没有显式 redis 配置时，`_exec_events_redis_or_none` 每轮开头仍建 client 并
+  ping 默认的 127.0.0.1:6379——外连即杀的沙箱里一次探测就死；现在整步跳过（不建不 ping）。新增
+  客户端 `_redis_explicit` 判定（合并配置或环境变量给了 host/username/password 任一才算显式）；
+  显式给了的 zmq/pipe + redis 组合探测照旧。全推推送通道同闸：pipe/mysql 且无显式 redis 时明确
+  报错指路（`get_full_tick` 轮询或显式 redis 块），不再默拨。（2）服务端 native xtdata：SDK 调用
+  会拨本地 58610 行情服务，新增 `native_xtdata_enabled` 门——pipe 默认 False（`_native()` 恒 None，
+  `probe_capabilities` 的 native 探测也跳过并写明），显式 True 才开；redis/zmq 默认 True 不变。
+  pipe 部署从本版起不再需要在配置里写 `redis_enabled=False`（0.3.58 起已是默认），库补丁也可以撤了。
+
 ## [0.3.59] - 2026-09-24
 
 ### 修复
