@@ -3,6 +3,17 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [0.3.59] - 2026-09-24
+
+### 修复
+
+- **公式族进入注入捕获名单与 probe 名单**（#374 收尾）。0.3.57 的「全局优先」漏了前提：
+  `capture_qmt_injected_funcs` 的名单里没有 `call_formula` / `subscribe_formula` /
+  `unsubscribe_formula` / `get_formula_result` / `gen_factor_index`，实盘 `qmt_api` 永远拿不到——
+  0.3.58 实盘复验暴露。补上后：注入了这些全局的终端 RPC 真正走通；没注入的终端
+  `probe_capabilities` 的 `qmt_globals` 直接回答能力问题（本机终端实测五个全 False，
+  call_formula 不可用是终端真实能力，不是路由问题）。
+
 ## [0.3.58] - 2026-09-24
 
 ### 修复
