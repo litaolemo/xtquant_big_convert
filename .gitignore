@@ -31,5 +31,6 @@ qmt_backtest_runs/
 # Build artifacts (~900KB each) -- regenerate rather than commit.
 src/BIGQMT_REDIS_DRYRUN_ALL_IN_ONE.py
 src/BIGQMT_DRYRUN_NO_REDIS_FLAT_ALL_IN_ONE.py
+src/BIGQMT_DRYRUN_PIPE_FLAT_ALL_IN_ONE.py
 
 .idea/

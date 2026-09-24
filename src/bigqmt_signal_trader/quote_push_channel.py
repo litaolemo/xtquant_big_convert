@@ -76,6 +76,25 @@ class QuotePushChannel(object):
         raise NotImplementedError
 
 
+class NullQuotePushChannel(QuotePushChannel):
+    """No-op push channel for deployments with no push wire (pipe, or redis
+    absent). Publishing is a silent no-op -- the alternative was
+    RedisQuotePushChannel(None), whose publish raised AttributeError per event.
+    """
+
+    def start_publisher(self):
+        pass
+
+    def start_subscriber(self, topics, on_msg):
+        raise NotImplementedError("no push channel on this deployment")
+
+    def publish(self, topic, data):
+        pass
+
+    def stop(self):
+        pass
+
+
 class ZmqQuotePushChannel(QuotePushChannel):
     def __init__(self, bind_address=None, connect_address=None, context=None, print_prefix="[bigqmt_quote_push]", extra_bind_addresses=None):
         self.bind_address = bind_address

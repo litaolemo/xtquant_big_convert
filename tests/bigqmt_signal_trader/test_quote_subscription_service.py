@@ -7,6 +7,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from bigqmt_signal_trader.quote_push_channel import (
+    NullQuotePushChannel,
     RedisQuotePushChannel,
     ZmqQuotePushChannel,
 )
@@ -61,6 +62,20 @@ class BuildQuoteSubscriptionServiceTest(unittest.TestCase):
         manager, channel = service
         self.assertIsInstance(channel, ZmqQuotePushChannel)
         self.assertEqual(channel.bind_address, "tcp://127.0.0.1:15561")
+
+    def test_no_redis_non_zmq_gets_the_null_channel(self):
+        """pipe（或 redis 被关的部署）没有推送线：空通道静默 noop，而不是
+        RedisQuotePushChannel(None) 每条事件一行 AttributeError（2026-09-24
+        pipe 实盘噪音）。"""
+        service = build_quote_subscription_service(
+            FakeContextInfo(), transport_name="pipe", account_id="acct",
+            redis_client=None, enabled=True,
+        )
+        manager, channel = service
+        self.assertIsInstance(channel, NullQuotePushChannel)
+        channel.start_publisher()
+        channel.publish("topic", {"x": 1})   # must not raise
+        channel.stop()
 
     def test_manager_on_push_publisher_is_channel_publish(self):
         service = build_quote_subscription_service(

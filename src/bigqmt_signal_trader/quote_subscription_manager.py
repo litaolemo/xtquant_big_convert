@@ -364,7 +364,9 @@ def build_quote_subscription_service(
     #315), so a secondary account's client gets the push on ITS channel."""
     if not enabled:
         return None
-    from .quote_push_channel import RedisQuotePushChannel, ZmqQuotePushChannel
+    from .quote_push_channel import (
+        NullQuotePushChannel, RedisQuotePushChannel, ZmqQuotePushChannel,
+    )
 
     source = ContextInfoQuoteSource(context_info)
     transport_name = str(transport_name or "redis").lower()
@@ -374,6 +376,11 @@ def build_quote_subscription_service(
         extra = [_default_quote_push_zmq_bind(other) for other in served if other != str(account_id or "")]
         channel = ZmqQuotePushChannel(bind_address=bind_address, extra_bind_addresses=extra)
         push_endpoint = bind_address
+    elif redis_client is None:
+        # pipe（或 redis 被关掉的部署）没有推送线——静默空通道，而不是
+        # RedisQuotePushChannel(None) 每条事件一行 AttributeError。
+        channel = NullQuotePushChannel()
+        push_endpoint = ""
     else:
         channel = RedisQuotePushChannel(redis_client, account_id=account_id, account_ids=served)
         push_endpoint = ""
