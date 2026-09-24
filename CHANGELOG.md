@@ -3,6 +3,31 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [0.3.58] - 2026-09-24
+
+### 修复
+
+- **pipe 模式不再向外拨号**（实盘报告：券商沙箱禁 socket，EDR 抓到 `connect()` 杀进程）。审计定位
+  三处：（1）redis 块默认仍在时 exec 事件链路的懒 client 首个命令就拨号——`transport="pipe"` 现在
+  默认不下发 redis 块，显式 `redis_enabled=True` 才保留（zmq/mysql 默认行为不变）；（2）runtime 模块级
+  直挂读取此前不读 `transport` 键，「配了 pipe 实际还在跑 redis」——已补齐并与 `configure_runtime_redis`
+  对齐，同时补读 `pipe` 子配置、`_apply_config` 转发；（3）pipe 下全推推送不再刷 AttributeError 噪音
+  （新增 `NullQuotePushChannel` 静默空通道）。
+
+### 新增
+
+- **独立命名管道单文件打包器** `tools/build_pipe_single_file_flat.py`：flat 真实代码内嵌机制（源码可
+  搜索/阅读/直改），强制 `transport=pipe` + 关 redis/全推推送/下载队列/快照缓存——给禁 socket、禁 pip、
+  外连即杀的券商沙箱一个零外连的单一策略文件。执行回调由客户端轮询合成（#372，0.3.57 起）；全推行情
+  用 `get_full_tick` 轮询。用法：`python tools/build_pipe_single_file_flat.py`，产物
+  `src/BIGQMT_DRYRUN_PIPE_FLAT_ALL_IN_ONE.py`（gitignored，用时重新生成）。
+
+### 验证与未验证
+
+全量单测 2389 passed / 1 skipped（含 pipe 默认丢 redis 块/显式保留/模块级直挂 reload/打包器钉/Null 通道
+等 10 条新回归）；管道单文件构建产物静态验证通过（强制项齐全、gbk 编译通过）。**未在禁 socket 的真沙箱
+里跑过**——本机终端不杀连接；真机部署后启动日志不应再出现任何 redis 连接报错，EDR 应无告警。
+
 ## [0.3.57] - 2026-09-24
 
 ### 修复
