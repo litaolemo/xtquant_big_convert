@@ -671,6 +671,19 @@ class BigQmtMarketDataProvider:
     def _call_context(self, method_name, *args, **kwargs):
         return self._context_method(method_name)(*args, **kwargs)
 
+    def _call_global_first(self, method_name, *args, **kwargs):
+        """Prefer the QMT-injected runtime global; fall back to ContextInfo.
+
+        call_formula 一族的官方入口是注入策略命名空间的**全局函数**，完整
+        大 QMT 的 ContextInfo 上没有它们——只查 ContextInfo 就是
+        「ContextInfo.call_formula is not available」（#374）。和下载全局
+        同一个模式：注入了用注入的，没注入才看 ContextInfo。
+        """
+        func = self.qmt_api.get(method_name)
+        if callable(func):
+            return func(*args, **kwargs)
+        return self._call_context(method_name, *args, **kwargs)
+
     def _native(self):
         """Return the native xtdata SDK, resolving it lazily on first use.
 
@@ -2088,7 +2101,7 @@ class BigQmtMarketDataProvider:
             return None
 
     def call_formula(self, formula_name, stock_code, period, start_time="", end_time="", count=-1, dividend_type=None, extend_param=None):
-        return self._call_context(
+        return self._call_global_first(
             "call_formula",
             formula_name,
             stock_code,
@@ -2101,7 +2114,7 @@ class BigQmtMarketDataProvider:
         )
 
     def subscribe_formula(self, formula_name, stock_code, period, start_time="", end_time="", count=-1, dividend_type=None, extend_param=None):
-        return self._call_context(
+        return self._call_global_first(
             "subscribe_formula",
             formula_name,
             stock_code,
@@ -2114,13 +2127,13 @@ class BigQmtMarketDataProvider:
         )
 
     def unsubscribe_formula(self, request_id):
-        return self._call_context("unsubscribe_formula", request_id)
+        return self._call_global_first("unsubscribe_formula", request_id)
 
     def get_formula_result(self, request_id, start_time="", end_time="", count=-1, timeout_second=-1):
-        return self._call_context("get_formula_result", request_id, start_time, end_time, count, timeout_second)
+        return self._call_global_first("get_formula_result", request_id, start_time, end_time, count, timeout_second)
 
     def gen_factor_index(self, data_name, formula_name, vars, sector_list, start_time="", end_time="", period="1d", dividend_type="none"):
-        return self._call_context(
+        return self._call_global_first(
             "gen_factor_index",
             data_name,
             formula_name,

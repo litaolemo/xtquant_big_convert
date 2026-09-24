@@ -611,9 +611,10 @@ C 接口大部分时间放 GIL，拍的均值不变、最坏从整段读缩到�
 
 传输本身的取舍：redis 跨机、回报有 stream 短时回放、下载任务和全市场快照缓存都在；
 zmq 同机免 Redis；mysql 兼容兜底。
-**mysql 没有推送通道**：`on_stock_order` / `on_stock_trade` / `on_order_error` 一条都到不了
-（只有 redis pub/sub 和 zmq PUB 能推）。那里的 `order_stock_async` 会改成等服务端结算再回
-（调用方照样不阻塞），拒单靠 `server_error` 变成 `on_order_error`；成交要自己 `query_stock_trades`。
+**推送通道只有 redis pub/sub 和 zmq PUB 有**：没有推送通道的部署（mysql，或 redis 宕了），
+客户端自动改走**查询轮询**合成回调（0.3.57 起，#372）——按 sysid+status diff 委托、按
+trade_id diff 成交，`on_stock_order` / `on_stock_trade` / `on_order_error` 与推送同形到达，
+延迟 = 轮询间隔（`BIGQMT_EXEC_POLL_SECONDS`，默认 1s；首轮不补发既有委托）。
 
 六种渠道返回的**数据完全一致**：100 个方法逐项比对结构指纹（字段名 + 嵌套
 形状），零差异；另取 14 个方法做 sha256 全精度逐字节比对（zmq vs redis），
