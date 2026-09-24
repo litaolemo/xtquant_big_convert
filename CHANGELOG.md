@@ -3,6 +3,30 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [0.3.57] - 2026-09-24
+
+### 修复
+
+- **`call_formula` 一族在完整大 QMT 上误走 ContextInfo**（#374）。官方入口是注入策略命名空间的
+  全局函数，适配器只查 ContextInfo 就报 `ContextInfo.call_formula is not available`，根本没进公式
+  计算。`call_formula` / `subscribe_formula` / `unsubscribe_formula` / `get_formula_result` /
+  `gen_factor_index` 五个方法改为「注入了全局用全局，没注入才落 ContextInfo」。
+- **`get_full_tick` 大名单 fallback 覆盖显式超时**（#373）。新增 `market_fallback=False`：接受
+  部分行情的调用方可以关掉交易所扩读（部分结果照实返回、原异常原样抛出；默认 `True` 行为不变）；
+  显式 `timeout_seconds` 不再被硬抬到 60s；直读已拿到的行与扩读结果合并（直读优先），不再被空的
+  市场回包整体顶掉。
+- **pipe / mysql 没有推送通道时的执行回调**（#372，轻路）。客户端新增查询轮询器：redis 不可达
+  且非 zmq 时按 `sysid+status` diff 委托、按 `trade_id` diff 成交，合成与推送同形的
+  `on_stock_order` / `on_stock_trade` / `on_order_error`（首轮打底不补发；回调延迟 = 轮询间隔，
+  `BIGQMT_EXEC_POLL_SECONDS` 默认 1s；查询连续失败自动退回外层重选通道）。不改 pipe 协议，
+  mysql 部署同样受益。
+
+### 验证与未验证
+
+全量单测 2379 passed / 1 skipped，三个修复各有针对性回归（含 reporter 给的复现形状）。**未上
+实盘终端**:#374 依赖终端确实提供 call_formula 全局（reporter 已做路由层验证）;#372 的轮询器
+没在禁 socket/文件 io 的真沙箱里跑过——两处都是路由/合成逻辑单测 + reporter 证据，不是终端实测。
+
 ## [0.3.56] - 2026-09-24
 
 ### 修复
