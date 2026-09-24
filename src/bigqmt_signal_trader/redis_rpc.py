@@ -900,6 +900,9 @@ class BigQmtRpcHandlers:
         "get_assure_contract", "get_enable_short_contract",
         "get_unclosed_compacts", "get_closed_compacts", "get_debt_contract",
         "get_option_subject_position", "get_comb_option", "get_hkt_exchange_rate",
+        # 公式族（#374）：全局优先修复后，这里回答「这台终端到底注没注入」。
+        "call_formula", "subscribe_formula", "unsubscribe_formula",
+        "get_formula_result", "gen_factor_index",
     )
 
     # probe 时抽查的 ContextInfo 方法。

@@ -504,6 +504,13 @@ _EXTRA_QMT_GLOBAL_FUNCS = (
     # signature). Issue #54: without it the download RPC is a silent no-op and
     # reads only ever return the latest day.
     "down_history_data",
+    # 公式族也是运行时全局（官方文档原型就是全局函数，#374）：不在捕获名单里
+    # 的话 qmt_api 永远拿不到，适配器的「全局优先」就没有可优先的对象。
+    "call_formula",
+    "subscribe_formula",
+    "unsubscribe_formula",
+    "get_formula_result",
+    "gen_factor_index",
 )
 
 # The full set of QMT-injected global function names (the three trade entry

@@ -96,5 +96,32 @@ class ContextFallbackStillWorksTest(unittest.TestCase):
         self.assertIn("call_formula", str(caught.exception))
 
 
+class CaptureListTest(unittest.TestCase):
+    """「全局优先」的前提是捕获名单里有这些名字——0.3.57 漏的就是这一环：
+    适配器优先 qmt_api，但 capture_qmt_injected_funcs 从不捕获公式族，
+    实盘上 qmt_api 里永远没有它们（0.3.58 实盘复验暴露）。"""
+
+    def test_the_formula_family_is_captured(self):
+        from bigqmt_signal_trader_strategy import capture_qmt_injected_funcs
+
+        def _stub(*args, **kwargs):
+            return None
+
+        namespace = {name: _stub for name in
+                     ("call_formula", "subscribe_formula", "unsubscribe_formula",
+                      "get_formula_result", "gen_factor_index")}
+        captured = capture_qmt_injected_funcs(namespace)
+
+        for name in namespace:
+            self.assertIs(captured.get(name), _stub, name)
+
+    def test_probe_reports_the_formula_family(self):
+        from bigqmt_signal_trader.redis_rpc import BigQmtRpcHandlers
+
+        for name in ("call_formula", "subscribe_formula", "unsubscribe_formula",
+                     "get_formula_result", "gen_factor_index"):
+            self.assertIn(name, BigQmtRpcHandlers._PROBE_QMT_GLOBALS, name)
+
+
 if __name__ == "__main__":
     unittest.main()
