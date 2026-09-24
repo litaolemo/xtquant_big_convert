@@ -301,6 +301,10 @@ def _build_quote_push_channel(client):
     and when it lived only on BigQmtXtData the trader's call raised
     AttributeError into a silent retry loop — zmq deployments never got a
     single exec callback (#366, broken since #76).
+
+    pipe/mysql 且没有显式 redis 配置时直接报错而不是拨默认的
+    127.0.0.1:6379——外连即杀的沙箱里那一次拨号就是杀进程（2026-09-24
+    实盘逐行核对）。
     """
     from .quote_push_channel import RedisQuotePushChannel, ZmqQuotePushChannel
 
@@ -308,6 +312,12 @@ def _build_quote_push_channel(client):
     if transport_name in ("zmq",):
         address = _quote_push_zmq_address(client)
         return ZmqQuotePushChannel(connect_address=address)
+    if (transport_name not in ("redis", "", "default")
+            and not getattr(client, "_redis_explicit", True)):
+        raise RuntimeError(
+            "transport=%s 没有全推推送通道（服务端 0.3.58 起也不再发）："
+            "请改用 get_full_tick 轮询；或在客户端配置里显式给出 redis 块，"
+            "全推才会走 redis pub/sub。" % transport_name)
     return RedisQuotePushChannel(client._redis(), account_id=client.account_id)
 
 
@@ -1356,6 +1366,19 @@ class BigQmtRpcClient:
             or ""
         )
         self.redis_client = redis_client
+        # 「用户显式配了 redis」和「默认填充」要分得开：非 redis 传输的客户端
+        # （pipe/mysql）默认没有 redis 可连，事件线程每轮开头那次 ping 会照
+        # 127.0.0.1:6379 拨——在外连即杀的沙箱里一次探测就死（2026-09-24
+        # 实盘逐行核对）。显式信号：合并后的配置或环境变量里给了 host /
+        # username / password 任何一个。
+        self._redis_explicit = bool(
+            merged_redis_config.get("host")
+            or merged_redis_config.get("username")
+            or merged_redis_config.get("password")
+            or os.environ.get("BIGQMT_REDIS_HOST")
+            or os.environ.get("BIGQMT_REDIS_USERNAME")
+            or os.environ.get("BIGQMT_REDIS_PASSWORD")
+        )
         self.redis_config = {
             "host": merged_redis_config.get("host") or os.environ.get("BIGQMT_REDIS_HOST", "127.0.0.1"),
             "port": int(merged_redis_config.get("port") or _env_int("BIGQMT_REDIS_PORT", 6379)),
@@ -4855,7 +4878,15 @@ class BigQmtXtTrader:
         _redis() only builds the client object; the connection is lazy, so
         an unreachable server would still return one. Ping it -- the channel
         choice must reflect reachability, not configuration.
+
+        非 redis 传输且没有显式 redis 配置时整步跳过（不建 client、不
+        ping）：pipe/mysql 客户端默认没有 redis 可连，照默认 127.0.0.1:6379
+        拨的那一下在外连即杀的沙箱里就是杀进程（2026-09-24 实盘核对）。
         """
+        transport_name = str(getattr(self.client, "transport_name", "redis") or "redis").lower()
+        if (transport_name not in ("redis", "", "default")
+                and not getattr(self.client, "_redis_explicit", True)):
+            return None
         try:
             client = self.client._redis()
             if client is None:

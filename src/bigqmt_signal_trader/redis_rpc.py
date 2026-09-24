@@ -1479,13 +1479,19 @@ class BigQmtRpcHandlers:
         }
 
         native = None
-        try:
-            from .adapters.market_bigqmt import _load_native_xtdata
+        # pipe（外连即杀的沙箱）：native SDK 的调用会拨 58610，探测也一样死，
+        # 直接跳过并写明——否则 probe_capabilities 本身就杀进程。
+        if getattr(self.market_data, "native_xtdata_enabled", True) is False:
+            report["native_xtdata_loaded"] = False
+            report["native_xtdata_skipped"] = "native_xtdata_enabled=False (pipe transport)"
+        else:
+            try:
+                from .adapters.market_bigqmt import _load_native_xtdata
 
-            native = _load_native_xtdata()
-        except Exception as exc:
-            report["native_xtdata_error"] = "%s: %s" % (exc.__class__.__name__, exc)
-        report["native_xtdata_loaded"] = native is not None
+                native = _load_native_xtdata()
+            except Exception as exc:
+                report["native_xtdata_error"] = "%s: %s" % (exc.__class__.__name__, exc)
+            report["native_xtdata_loaded"] = native is not None
         report["native_sector_names"] = self._enumerate_sector_names(native)
         for name in self._SECTOR_WRITE_NAMES:
             if name in report["write_names_found"]:

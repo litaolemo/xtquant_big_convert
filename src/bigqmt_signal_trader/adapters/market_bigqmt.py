@@ -656,11 +656,17 @@ def _load_native_xtdata():
 
 
 class BigQmtMarketDataProvider:
-    def __init__(self, context_info, native_xtdata=None, qmt_api=None):
+    def __init__(self, context_info, native_xtdata=None, qmt_api=None,
+                 native_xtdata_enabled=True):
         self.context_info = context_info
         # Allow injection for tests; otherwise resolve lazily on first use.
         self._native_xtdata = native_xtdata
         self.qmt_api = dict(qmt_api or {})
+        # pipe 这类沙箱传输的存在理由就是「禁 socket、外连即杀」的终端
+        # （2026-09-24 实盘）：原生 xtdata SDK 的调用会拨本地 58610 行情服务，
+        # 那种终端上一次 SDK 调用就死。关掉后 _native() 恒 None，所有 native
+        # 路径直接走既有回落。
+        self.native_xtdata_enabled = bool(native_xtdata_enabled)
 
     def _context_method(self, method_name):
         method = getattr(self.context_info, method_name, None)
@@ -694,6 +700,8 @@ class BigQmtMarketDataProvider:
         the SDK call itself to raise "无法连接行情服务" and fall back.
         """
         if self._native_xtdata is None:
+            if not self.native_xtdata_enabled:
+                return None
             self._native_xtdata = _load_native_xtdata()
         return self._native_xtdata
 
