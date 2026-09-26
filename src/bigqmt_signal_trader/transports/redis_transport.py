@@ -93,6 +93,29 @@ def _is_redis_timeout(exc):
     return ("redis" in module and "timeout" in name) or "timeout reading from socket" in text
 
 
+def _slim_pipeline_error(exc, keep_chars=500):
+    """Drop the embedded payload from a pipeline error message.
+
+    redis-py renders a failed batch with the full command arguments, and the
+    argument here is the response JSON itself. An OOM refusal on a large K-line
+    reply therefore raises with str(exc) in the megabytes (measured 5 MB on a
+    repro with a 5 MB payload; in production a 542 MB log file accumulated from
+    a handful of such lines and degraded the bridge until it stopped serving).
+    Keep the type and the head of the message -- enough to see "OOM command
+    not allowed" -- and replace the rest with an omission marker so tracebacks
+    and logs stay proportional to the failure, not to the payload.
+    """
+    msg = str(exc)
+    if len(msg) <= keep_chars:
+        return exc
+    slimmed = "%s ...[%d chars of embedded payload omitted]" % (
+        msg[:keep_chars], len(msg) - keep_chars)
+    try:
+        return type(exc)(slimmed)
+    except Exception:
+        return RuntimeError(slimmed)
+
+
 class RedisTransport(RpcTransport):
     """Redis-backed transport. Owns rpush/blpop/brpop/publish/setex."""
 
@@ -366,7 +389,7 @@ class RedisTransport(RpcTransport):
                 results = pipe.execute() if queued else []
             except Exception as exc:
                 if first_error is None:
-                    first_error = exc
+                    first_error = _slim_pipeline_error(exc)
                 continue
             if response_channel:
                 receivers = 0
