@@ -3,6 +3,47 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [未发布]
+
+### 修复
+
+- **自愈补数不再被空表骗过**（#387，@shengyy 报告并附离线复现）。服务端 `_raw_market_data_payload`
+  会为每个被请求的代码补空 envelope，原生读取失败的代码（如分钟订阅超限 ErrorID 210000）返回的是
+  空 DataFrame 而不是缺失键；客户端 `_served_codes` 此前按字典键计数，空表也算"已服务"，
+  `_heal_adjusted` 算出 missing=0，原始下载+重读从不触发——实盘 17 只里 14 只分钟线持续缺失而
+  自愈沉默。现在按真实行数计数；占位帧（#339，有行、量为 0）仍算已服务，多数缺失阈值规则不变，
+  少数停牌股不会变成每次调用都下载。
+
+- **`get_instrument_detail` 撤出 FormulaServer 直连**（#392，@sumo225270 报告并附 300 只双通道
+  对照）。国金 build 上 FormulaServer 的 `getInstrumentDetail` 对日频参考字段回答不可信：
+  `TotalVolume` 43% 返回 0、`OpenDate` 32% 返回 0、22% 非零但陈旧（最大偏差 87.7%），而走桥的
+  `ContextInfo.get_instrument_detail` 300/300 全对。结构完整但值错误的答案比没有答案更糟，
+  适配层无法区分陈旧与正确，三个 `get_instrument*` 方法移出 METHOD_MAP，一律回落 RPC。
+  代价是全市场逐只约 57–60ms；合约元数据属一次性读取，调用方通常有缓存。报告附带的
+  `subscribe=False` 透传诉求在 #361 已实现，无需再改。
+
+- **订单身份不再"突然"变成 QMT 进程名**（#393，@kingtsi 报告）。三条桥侧路径都会造成跳名：
+  （1）两处身份存储（redis + 进程内 journal）此前无条件覆盖——同 remark 复用时，后一笔带空
+  `strategy_name` 的提交会抹掉已记名字，行回落到 `m_strSource`（QMT 侧注册名）；（2）同 remark
+  换策略名提交会 retroactive 改掉已报告行的名字；（3）TTL 只有 24h，次日重读全部翻名；reload
+  会重建 handlers 清空进程内 journal，无 redis 部署瞬间全翻。现在两处存储都是"首个命名记录优先"
+  （空名提交永不覆盖，未命名记录让位给后来的命名提交，冲突改名记警告并忽略），TTL 延长到 7 天，
+  `_perform_reload` 会把 journal 移交新 handlers（该移交在策略文件里，需重启一次后生效）。
+
+- **慢请求日志覆盖回复转换与发送段**（#386，@shengyy 报告并附 `_t_recv`/`_t_reply` 证据）。
+  此前 `_note_slow_request` 只计 `handlers.handle` 段：60 只 × 40 交易日 5m 的回读在服务端
+  `_t_recv`→`_t_reply` 花了约 11.5s 而零慢日志——时间烧在 `to_jsonable`（约 12.7MB 响应的转换）
+  和发布上。现在每个请求都分段计时（handle / to_jsonable / publish），总时长超过
+  `slow_request_seconds` 而 handler 段未超时（即盲区情形）时记一条分段 `slow response` 日志，
+  并在消息里提示可用 `chunk_size` 或收窄窗口。
+
+- **`get_trading_dates` 原生空结果会交叉核对 ContextInfo 指数日历**（#391，@2092330995 报告）。
+  盘前单日查询 SH 有数据、SZ 返回空：SDK 侧某市场日历未加载时回答空列表，而
+  `_native_or_context` 把"原生成功"原样返回，空列表被下游读成"休市"并在交易时段误拦深市任务。
+  现在原生返回空时会再走一遍 ContextInfo 代表指数日历：节假日两条路径同为空（行为不变），
+  数据未就绪时指数日历能给出正确答案。provider 上新增 `_last_trading_dates_answer`
+  （选用路径 + 行数 + 时刻）供诊断探针读取；替代路径命中时每市场每进程打印一次说明。
+
 ## [0.3.60] - 2026-09-24
 
 ### 修复
