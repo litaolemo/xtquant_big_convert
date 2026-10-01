@@ -24,6 +24,11 @@ Deliberately NOT routed here, despite FormulaServer exposing something similar:
 
 * ``get_trading_dates`` — FormulaServer wants a *stock code* (``000001.SZ``);
   passing a market (``SH``) silently returns ``[]``. Our callers pass markets.
+* ``get_instrument`` / ``get_instrument_detail`` — getInstrumentDetail here
+  answers the daily reference fields (TotalVolume, OpenDate) with zeros or
+  stale snapshots on the Guojin build while the bridge's ContextInfo path
+  answers correctly (#392). Contract metadata is a record of reference data,
+  not a quote; it reads through the bridge.
 * ``get_divid_factors`` / ``get_risk_free_rate`` — parameter semantics differ
   (range vs single date, index vs timetag). A wrong calendar or dividend factor
   is worse than a slow one.
@@ -396,14 +401,6 @@ class FormulaServerClient(object):
 # ---------------------------------------------------------------------------
 # Method mapping
 # ---------------------------------------------------------------------------
-# FormulaServer misspells two instrument fields relative to the xtdata SDK
-# (``FloatVolume``/``TotalVolume``). Downstream code reads the SDK spelling, so
-# alias them rather than let the lookup silently miss.
-_INSTRUMENT_ALIASES = (
-    ("FloatVolumn", "FloatVolume"),
-    ("TotalVolumn", "TotalVolume"),
-)
-
 
 def _first(params, names, default=None):
     for name in names:
@@ -426,21 +423,6 @@ def _require_code(params, names):
     if not text:
         raise ValueError("a stock code is required (one of %s)" % ", ".join(names))
     return text
-
-
-def _instrument_params(params):
-    return {"strOptionCode": _require_code(params, ("code", "stock_code", "stockcode"))}
-
-
-def _instrument_result(raw, params):
-    detail = (raw or {}).get("result")
-    if not isinstance(detail, dict):
-        return detail or {}
-    out = dict(detail)
-    for wire_name, sdk_name in _INSTRUMENT_ALIASES:
-        if wire_name in out and sdk_name not in out:
-            out[sdk_name] = out[wire_name]
-    return out
 
 
 def _scalar_result(raw, params):
@@ -600,9 +582,15 @@ def _market_data_result(raw, params):
 
 # our RPC method -> (FormulaServer func, param builder, result adapter)
 METHOD_MAP = {
-    "get_instrument": ("getInstrumentDetail", _instrument_params, _instrument_result),
-    "get_instrumentdetail": ("getInstrumentDetail", _instrument_params, _instrument_result),
-    "get_instrument_detail": ("getInstrumentDetail", _instrument_params, _instrument_result),
+    # get_instrument / get_instrument_detail / get_instrumentdetail used to
+    # map to getInstrumentDetail here. Removed in #392: on the Guojin build
+    # FormulaServer answers the daily reference fields dishonestly --
+    # TotalVolume 0 for 43% of a 300-code sample, OpenDate 0 for 32%, and
+    # 22% non-zero but stale (up to 87.7% off) -- while the RPC path
+    # (ContextInfo.get_instrument_detail) answered all 300 correctly. A
+    # well-formed answer whose values are wrong is worse than no answer,
+    # and the result adapter cannot tell stale from true, so these read
+    # through the bridge like every other record of reference data.
     "get_last_volume": ("getLastVolume", _last_volume_params, _scalar_result),
     "get_total_share": ("getTotalShare", _total_share_params, _scalar_result),
     "get_contract_multiplier": ("getContractMultiplier", _contract_multiplier_params, _scalar_result),

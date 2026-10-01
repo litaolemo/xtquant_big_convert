@@ -55,11 +55,10 @@ getFullTick / getQuote                                   -> 200005
 所以它是**只读快速路径，不是 RPC 桥的替代品**。交易、账户查询、持仓、委托、成交、
 五档盘口全部仍然走 RPC。
 
-### 已接入的方法（10 个）
+### 已接入的方法（8 个）
 
 | 我们的方法 | FormulaServer func |
 |---|---|
-| `get_instrument` / `get_instrument_detail` / `get_instrumentdetail` | `getInstrumentDetail` |
 | `get_last_volume` | `getLastVolume` |
 | `get_total_share` | `getTotalShare` |
 | `get_contract_multiplier` | `getContractMultiplier` |
@@ -67,6 +66,7 @@ getFullTick / getQuote                                   -> 200005
 | `get_weight_in_index` | `getWeightInIndex` |
 | `get_stock_list_in_sector` | `getStockListInSector` |
 | `get_market_data_ex` | `getMarketData` |
+| `get_market_data` | `getMarketData` |
 
 ### 刻意不接的方法，以及原因
 
@@ -85,15 +85,21 @@ getFullTick / getQuote                                   -> 200005
 
 - **`get_risk_free_rate`** —— 我们传 `index=-1`，FormulaServer 要 `timetag`。语义不同。
 
+- **`get_instrument` / `get_instrument_detail`** —— 曾经接入 `getInstrumentDetail`，
+  0.3.61 起移除（#392）：国金 build 上该服务对日频参考字段的回答不可信——300 只抽样里
+  43% 的 `TotalVolume` 返回 0、32% 的 `OpenDate` 返回 0、22% 非零但陈旧（最大偏差 87.7%），
+  而走桥的 `ContextInfo.get_instrument_detail` 300/300 全对。合约元数据是基准数据，
+  结构完整但值错误的答案比没有答案更糟，且适配层无法区分陈旧与正确，所以一律走 RPC。
+
 - **复权 K 线** —— 实测 `dividendType` 传 `none` 和 `front` 返回**完全相同**的价格，
   说明复权没有生效。因此只有 `dividend_type="none"`（或空）才走直连，其他复权类型直接
   判为 unroutable 回退 RPC。否则策略要前复权、拿到的却是不复权价格，且毫无提示。
 
-### 字段名坑
+### 字段名坑（历史记录）
 
 FormulaServer 的 `getInstrumentDetail` 返回 **`FloatVolumn` / `TotalVolumn`**（官方拼写错误），
-而原生 xtdata SDK 用的是 `FloatVolume` / `TotalVolume`。下游代码按 SDK 拼写读，直接透传会
-静默读到 `None`。所以 `_instrument_result` 做了别名归一化，两种拼写都保留。
+而原生 xtdata SDK 用的是 `FloatVolume` / `TotalVolume`。该方法自 0.3.61 起不再走直连（见上），
+此节留档备查。
 
 ### 尚未验证
 
@@ -140,7 +146,7 @@ BIGQMT_FORMULA_SERVER_CONFIG = {
     # "port": 58600,           # 不写则从 qmt_root 的 ini 读，再退回 58600
     # "qmt_root": r"D:\QMT交易端",
     # "timeout_seconds": 3.0,
-    # "methods": ["get_instrument"],      # 只路由白名单
+    # "methods": ["get_total_share"],      # 只路由白名单
     # "failure_cooldown_seconds": 30.0,
 }
 ```
