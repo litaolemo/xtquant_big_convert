@@ -4415,6 +4415,7 @@ class RedisPubSubRpcService:
         waited = self._expired_before_dispatch(request, method)
         if waited is not None:
             return self._refuse_expired(request, response, method, waited, order_key)
+        _t0 = _t1 = _t_json1 = None
         try:
             if self.account_id and account_id and account_id != self.account_id:
                 raise PermissionError("account_id mismatch")
@@ -4428,6 +4429,11 @@ class RedisPubSubRpcService:
                 _t1 = time.perf_counter()
                 self._note_slow_request(method, _t1 - _t0)
             response["data"] = to_jsonable(result)
+            # to_jsonable is where a big answer burns its time (#386: 12.7MB
+            # of 5m bars took ~11s here on the serve side while the handler
+            # itself was fast, and nothing logged it -- the slow-request note
+            # covers only the handler segment).
+            _t_json1 = time.perf_counter()
             response["ok"] = True
             # Surface server-side diagnostics when the handler recorded one.
             server_error = getattr(self.handlers, "_last_server_error", None)
@@ -4456,7 +4462,7 @@ class RedisPubSubRpcService:
         response["_t_reply"] = time.time()
         if order_key is not None:
             self._remember_order_response(order_key, response, state="settled")
-        _t_pub0 = time.perf_counter() if method == "ping" else 0.0
+        _t_pub0 = time.perf_counter()
         try:
             self._publish_response(request, response)
         except Exception:
@@ -4471,6 +4477,8 @@ class RedisPubSubRpcService:
                 )
             except Exception:
                 pass
+        _t_pub1 = time.perf_counter()
+        self._note_slow_response(method, _t0, _t1, _t_json1, _t_pub0, _t_pub1)
         if method == "ping":
             # Logged AFTER publish: this print goes to the QMT output panel,
             # which costs ~1 adjust tick of GIL wait on the serving thread --
@@ -4513,6 +4521,47 @@ class RedisPubSubRpcService:
                 "slow request method=%s took %.1fs thread=%s (#342: this is "
                 "what an [adjust_phase] drain of the same size was inside)",
                 method, seconds, thread_name)
+        except Exception:
+            pass
+
+    def _note_slow_response(self, method, t_handle0, t_handle1, t_json_done,
+                            t_pub0, t_pub1):
+        """Segmented slow note for the time AROUND the handler (#386).
+
+        The handler-level note above covers only ``handlers.handle``; a big
+        answer then burns its real time in ``to_jsonable`` and the publish,
+        neither of which any log named -- a 60-code 40-day 5m read spent
+        ~11.5s server-side with zero slow lines. Fires only when the TOTAL
+        exceeds ``slow_request_seconds`` while the handler segment alone did
+        not (otherwise the handler note already named it). Never raises:
+        this runs on the adjust thread too.
+        """
+        if t_handle0 is None or t_handle1 is None:
+            return
+        try:
+            threshold = float(self.slow_request_seconds)
+        except Exception:
+            threshold = 1.0
+        if threshold <= 0:
+            return
+        handle = t_handle1 - t_handle0
+        total = t_pub1 - t_handle0
+        if total < threshold or handle >= threshold:
+            return
+        jsonable = (t_json_done - t_handle1) if t_json_done is not None else -1.0
+        publish = t_pub1 - t_pub0
+        try:
+            thread_name = threading.current_thread().name
+        except Exception:
+            thread_name = "?"
+        try:
+            from .logging_setup import get_logger
+            get_logger("rpc").warning(
+                "slow response method=%s total=%.1fs handle=%.1fs "
+                "to_jsonable=%.1fs publish=%.1fs thread=%s (#386: the slow "
+                "part is the reply conversion/send, not the handler -- "
+                "consider chunk_size or a narrower window)",
+                method, total, handle, jsonable, publish, thread_name)
         except Exception:
             pass
 

@@ -165,5 +165,98 @@ class SlowRequestLogTest(unittest.TestCase):
         self.assertEqual(self._slow_lines(), [])
 
 
+class SlowResponseSegmentsTest(unittest.TestCase):
+    """#386: the time around the handler must be visible too.
+
+    A 60-code 40-day 5m read spent ~11.5s between ``_t_recv`` and
+    ``_t_reply`` while the handler itself was fast, and no log named where
+    it went -- the slow-request note covers only ``handlers.handle``. The
+    reply conversion (``to_jsonable`` on ~12.7MB of bars) and the publish
+    now get a segmented line when their total crosses the threshold while
+    the handler alone did not.
+    """
+
+    def setUp(self):
+        import bigqmt_signal_trader.redis_rpc as module
+        self.module = module
+        self.clock = _Clock()
+        self._perf_counter = module.time.perf_counter
+        module.time.perf_counter = self.clock
+        self._jsonable = module.to_jsonable
+        self.records = []
+        handler = logging.Handler()
+        handler.emit = lambda record: self.records.append(record)
+        self.handler = handler
+        logging.getLogger("bigqmt").addHandler(handler)
+
+    def tearDown(self):
+        self.module.time.perf_counter = self._perf_counter
+        self.module.to_jsonable = self._jsonable
+        logging.getLogger("bigqmt").removeHandler(self.handler)
+
+    def _messages(self, needle):
+        return [r.getMessage() for r in self.records if needle in r.getMessage()]
+
+    def _request(self, service, request_id="r1"):
+        service.process_request({"request_id": request_id, "account_id": "acct",
+                                 "method": "get_full_tick",
+                                 "params": {"codes": ["600000.SH"]}})
+
+    def _patch_jsonable(self, seconds):
+        real = self._jsonable
+        state = {"done": False}
+
+        def slow(value):
+            # to_jsonable recurses through the module global; advance the
+            # clock once, on the outermost call, not per recursion level.
+            if not state["done"]:
+                state["done"] = True
+                self.clock.append(seconds)
+            return real(value)
+
+        self.module.to_jsonable = slow
+
+    def test_slow_to_jsonable_is_named_with_segments(self):
+        self._patch_jsonable(5.0)
+        service = _service(FakeMarketData())
+
+        self._request(service)
+
+        lines = self._messages("slow response")
+        self.assertEqual(len(lines), 1, self.records)
+        self.assertIn("method=get_full_tick", lines[0])
+        self.assertIn("total=5.0s", lines[0])
+        self.assertIn("handle=0.0s", lines[0])
+        self.assertIn("to_jsonable=5.0s", lines[0])
+        self.assertIn("publish=", lines[0])
+        # The handler note must stay quiet -- the handler was not slow.
+        self.assertEqual(self._messages("slow request"), [])
+
+    def test_slow_handler_does_not_double_log(self):
+        self._patch_jsonable(5.0)
+        service = _service(_Sleepy(self.clock))  # 5s handler AND 5s jsonable
+
+        self._request(service)
+
+        self.assertEqual(len(self._messages("slow request")), 1)
+        self.assertEqual(self._messages("slow response"), [])
+
+    def test_total_below_threshold_is_silent(self):
+        self._patch_jsonable(5.0)
+        service = _service(FakeMarketData(), slow_request_seconds=10.0)
+
+        self._request(service)
+
+        self.assertEqual(self._messages("slow response"), [])
+        self.assertEqual(self._messages("slow request"), [])
+
+    def test_fast_request_is_silent(self):
+        service = _service(FakeMarketData())
+
+        self._request(service)
+
+        self.assertEqual(self.records, [])
+
+
 if __name__ == "__main__":
     unittest.main()
