@@ -3118,11 +3118,29 @@ class BigQmtXtData:
         """Codes the server actually served, across both return shapes:
         get_market_data_ex is code-keyed ({code: DataFrame}), get_market_data
         is field-keyed ({field: {code: [..]}}) -- reading keys off the wrong
-        level would make every code look missing."""
+        level would make every code look missing.
+
+        A code counts only when it carries at least one row (#387): the
+        server fills an empty envelope for every requested code the native
+        read did not return, and counting the envelope as served made the
+        missing-majority heal guard compute missing=0 and skip the raw
+        download entirely -- 14 of 17 natively-failed minute codes came
+        back as empty frames and heal never fired. Placeholder frames keep
+        counting as served: they have rows (volume 0 / suspendFlag 1), so
+        the #339 placeholder branch above still owns them."""
         if not isinstance(data, dict):
             return set()
-        nested = {code for value in data.values() if isinstance(value, dict) for code in value}
-        return nested if nested else set(data.keys())
+
+        def _rows(payload):
+            try:
+                return len(payload) if payload is not None else 0
+            except TypeError:
+                return 0
+
+        if any(isinstance(value, dict) for value in data.values()):
+            return {code for value in data.values() if isinstance(value, dict)
+                    for code, rows in value.items() if _rows(rows) > 0}
+        return {code for code, frame in data.items() if _rows(frame) > 0}
 
     def _heal_adjusted(self, method, params, data, wait_seconds=2.0, timeout_seconds=None):
         """Self-heal reads served from an unready raw store: if the adjusted
