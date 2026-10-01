@@ -1763,9 +1763,55 @@ class BigQmtMarketDataProvider:
             context_stock = {"SH": "000001.SH", "SZ": "399001.SZ"}.get(str(market).upper(), market)
             return self._call_context("get_trading_dates", context_stock, start_time, end_time, count)
 
-        return self._native_or_context(
+        dates = self._native_or_context(
             "get_trading_dates", _via_context, market, start_time, end_time, count
         )
+        if dates:
+            self._note_calendar_path(market, "native/sdk", len(dates))
+            return dates
+        # An empty native answer is ambiguous (#391): on a holiday it is the
+        # truth, but it is also what a not-yet-loaded SDK calendar answers on
+        # a trading day -- that morning SH came back with the date while SZ
+        # stayed empty. Cross-check the ContextInfo (index-calendar) path
+        # before reporting "closed": it is empty on the same holidays, so an
+        # empty second answer costs nothing, and a non-empty one is the
+        # difference between 休市 and 数据未就绪 for the caller.
+        try:
+            via_context = _via_context()
+        except Exception:
+            via_context = None
+        if via_context:
+            self._note_calendar_path(
+                market, "context(empty-native)", len(via_context))
+            return via_context
+        return dates
+
+    def _note_calendar_path(self, market, path, rows):
+        """Record which path answered the calendar (#391's diagnostic ask).
+
+        The last answer stays readable on the provider for probes. When the
+        ContextInfo cross-check had to substitute for an empty SDK calendar,
+        say so once per (market, path) per process -- a print costs ~an
+        adjust tick of GIL on the QMT panel, so it does not fire on the
+        common native path.
+        """
+        self._last_trading_dates_answer = {
+            "market": str(market), "path": path, "rows": rows,
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if path == "native/sdk":
+            return
+        seen = getattr(self, "_calendar_path_notes", None)
+        if seen is None:
+            seen = self._calendar_path_notes = set()
+        marker = (str(market), path)
+        if marker in seen:
+            return
+        seen.add(marker)
+        print("[bigqmt_rpc] get_trading_dates(%s): SDK calendar empty, "
+              "ContextInfo index calendar answered %d rows -- treating the "
+              "empty as 'calendar not loaded', not 'closed' (#391)"
+              % (market, rows))
 
     def get_holidays(self):
         """Return the holiday (non-trading) date list.

@@ -150,3 +150,69 @@ class BothPathsErrorChainingTest(unittest.TestCase):
             provider._native_or_context(
                 "get_trading_dates",
                 lambda: (_ for _ in ()).throw(NotImplementedError("no such method")))
+
+
+class EmptyNativeCalendarCrossCheckTest(unittest.TestCase):
+    """#391: an empty SDK calendar is ambiguous -- cross-check ContextInfo.
+
+    Reported 2026-09-29 09:00: both markets were asked for the same single
+    (trading) day; SH came back with the date, SZ with []. The SDK calendar
+    for one market was not loaded, and the empty list read as 休市 to the
+    caller's executor, which then blocked SZ jobs for the whole session.
+    The ContextInfo index-calendar path is empty on the same holidays, so
+    cross-checking it only ever speaks up when the empty was data-not-ready.
+    """
+
+    class _EmptyNative(object):
+        def __init__(self):
+            self.calls = 0
+
+        def get_trading_dates(self, *args):
+            self.calls += 1
+            return []
+
+    class _CountingContext(object):
+        def __init__(self, answer):
+            self.calls = 0
+            self.answer = answer
+
+        def get_trading_dates(self, *args):
+            self.calls += 1
+            return list(self.answer)
+
+    def test_empty_native_falls_to_the_index_calendar(self):
+        native = self._EmptyNative()
+        context = self._CountingContext(["20260929"])
+        provider = BigQmtMarketDataProvider(context, native_xtdata=native)
+
+        result = provider.get_trading_dates("SZ", "20260929", "20260929")
+
+        self.assertEqual(result, ["20260929"])
+        self.assertEqual(native.calls, 1)
+        self.assertEqual(context.calls, 1)
+        # The diagnostic names the path and the row count (#391's ask).
+        note = provider._last_trading_dates_answer
+        self.assertEqual(note["path"], "context(empty-native)")
+        self.assertEqual(note["rows"], 1)
+        self.assertEqual(note["market"], "SZ")
+
+    def test_both_empty_stays_empty_and_costs_no_error(self):
+        # A holiday: the index calendar is empty too, so empty stands.
+        native = self._EmptyNative()
+        context = self._CountingContext([])
+        provider = BigQmtMarketDataProvider(context, native_xtdata=native)
+
+        result = provider.get_trading_dates("SZ", "20261003", "20261003")
+
+        self.assertEqual(result, [])
+
+    def test_nonempty_native_does_not_pay_for_a_second_path(self):
+        native = _FakeNativeModule(fail=False)
+        context = self._CountingContext(["ctx-must-not-appear"])
+        provider = BigQmtMarketDataProvider(context, native_xtdata=native)
+
+        result = provider.get_trading_dates("SH", "", "", 5)
+
+        self.assertEqual(result, ["20260901", "20260902"])
+        self.assertEqual(context.calls, 0)
+        self.assertEqual(provider._last_trading_dates_answer["path"], "native/sdk")
