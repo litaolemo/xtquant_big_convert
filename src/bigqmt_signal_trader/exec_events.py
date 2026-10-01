@@ -474,7 +474,24 @@ def normalize_order_event(order, account_id=""):
     }
 
 
-def remember_order_identity(redis_client, account_id, user_order_id, strategy_name="", stock_code="", ttl_seconds=86400):
+ORDER_IDENTITY_TTL_SECONDS = 7 * 86400
+
+
+def remember_order_identity(redis_client, account_id, user_order_id, strategy_name="", stock_code="", ttl_seconds=ORDER_IDENTITY_TTL_SECONDS):
+    """Record who submitted an order, keyed by the remark it rides out as.
+
+    The first NAMED record wins (#393): a remark reused across submits
+    otherwise renames rows already reported -- the query side reads this
+    store to put the caller's strategy_name back, and an unconditional
+    overwrite flipped them to whatever the LATEST same-remark submit said
+    or, when that submit passed a blank strategy_name, erased the name
+    entirely so rows fell back to the QMT-side process name ("the name
+    suddenly changed"). An unnamed record yields to a later named one --
+    the blank submit told us nothing.
+
+    TTL is 7 days, not 1: orders stay queryable across days, and a
+    next-day re-read used to come back renamed under the bridge process.
+    """
     user_order_id = str(user_order_id or "").strip()
     if not user_order_id or redis_client is None:
         return None
@@ -485,12 +502,40 @@ def remember_order_identity(redis_client, account_id, user_order_id, strategy_na
         "stock_code": str(stock_code or ""),
         "created_at_ts": time.time(),
     }
+    blob = json.dumps(payload, ensure_ascii=False, default=str)
+    ttl = int(ttl_seconds or ORDER_IDENTITY_TTL_SECONDS)
+    key = order_identity_key(account_id, user_order_id)
     try:
-        redis_client.setex(
-            order_identity_key(account_id, user_order_id),
-            int(ttl_seconds or 86400),
-            json.dumps(payload, ensure_ascii=False, default=str),
-        )
+        try:
+            created = redis_client.set(key, blob, ex=ttl, nx=True)
+        except TypeError:
+            # Old redis-py without ex/nx kwargs on set().
+            created = redis_client.setnx(key, blob)
+            if created:
+                redis_client.expire(key, ttl)
+        if created:
+            return payload
+        # The key exists: this remark was used before.
+        existing_name = ""
+        raw = redis_client.get(key)
+        if raw:
+            try:
+                existing_name = str((json.loads(raw) or {}).get("strategy_name") or "")
+            except Exception:
+                existing_name = ""
+        new_name = payload["strategy_name"]
+        if existing_name:
+            if new_name and new_name != existing_name:
+                print("[bigqmt_rpc] order remark %r reused across strategies: "
+                      "keeping %r, ignoring %r; rows already reported keep "
+                      "their name (#393). Pass a unique remark per order."
+                      % (user_order_id, existing_name, new_name))
+            return None
+        if not new_name:
+            return None
+        # The existing record is unnamed; this named submit knows better.
+        redis_client.setex(key, ttl, blob)
+        return payload
     except Exception:
         pass
     return payload

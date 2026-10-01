@@ -1847,7 +1847,10 @@ class BigQmtRpcHandlers:
         return rows
 
     _ORDER_IDENTITY_LOCAL_LIMIT = 5000
-    _ORDER_IDENTITY_LOCAL_TTL_SECONDS = 86400.0
+    # 7 days, matching exec_events.ORDER_IDENTITY_TTL_SECONDS: orders stay
+    # queryable across days, and a next-day re-read used to come back
+    # renamed under the bridge process (#393).
+    _ORDER_IDENTITY_LOCAL_TTL_SECONDS = 7 * 86400.0
 
     def _remember_order_identity_local(self, account_id, remark, strategy_name):
         remark = str(remark or "").strip()
@@ -1860,7 +1863,24 @@ class BigQmtRpcHandlers:
                 # Tests (and the QMT sandbox) build handlers via __new__ and
                 # skip __init__ -- create on first use.
                 journal = self._order_identity_local = collections.OrderedDict()
-            journal[key] = (time.time(), str(strategy_name or ""))
+            name = str(strategy_name or "")
+            existing = journal.get(key)
+            if existing is not None:
+                existing_name = existing[1]
+                if existing_name and existing_name != name:
+                    # First NAMED record wins (#393): a reused remark must
+                    # not rename rows already reported -- an unconditional
+                    # overwrite flipped them to the latest same-remark
+                    # submit's name, or erased it entirely when that submit
+                    # passed "" and rows fell back to the QMT process name.
+                    if name:
+                        print("[bigqmt_rpc] order remark %r reused across "
+                              "strategies: keeping %r, ignoring %r (#393). "
+                              "Pass a unique remark per order."
+                              % (remark, existing_name, name))
+                    journal.move_to_end(key)
+                    return
+            journal[key] = (time.time(), name)
             journal.move_to_end(key)
             while len(journal) > self._ORDER_IDENTITY_LOCAL_LIMIT:
                 journal.popitem(last=False)

@@ -366,10 +366,26 @@ def _perform_reload(context_info):
                   "%.0fs; the caller may see a timeout even though the reload "
                   "runs" % (_pending_response_count(),
                             _RELOAD_FLUSH_TIMEOUT_SECONDS))
+        # #393: a reload rebuilds the handlers, and with them the in-process
+        # order-identity journal -- on a no-Redis deployment every order this
+        # bridge had named flipped to the QMT-side process name at once.
+        # This module survives the reload (QMT execs it; only the package is
+        # purged), so carry the journal across and hand it to the new
+        # handlers below.
+        identity_journal = None
+        old_handlers = getattr(_rpc_service, "handlers", None)
+        if old_handlers is not None:
+            identity_journal = getattr(old_handlers, "_order_identity_local", None)
         reset_app()
         result["modules_purged"] = len(_purge_package_modules())
         _rebind_module_level_imports()
         init(context_info)
+        if identity_journal:
+            new_handlers = getattr(_rpc_service, "handlers", None)
+            if new_handlers is not None:
+                new_handlers._order_identity_local = identity_journal
+                print("[bigqmt_reload] order identity journal carried across "
+                      "(%d entries)" % len(identity_journal))
         result["version_after"] = _package_version()
         result["ok"] = True
     except Exception as exc:

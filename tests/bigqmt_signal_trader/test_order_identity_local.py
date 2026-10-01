@@ -106,7 +106,9 @@ class LocalIdentityJournalTest(unittest.TestCase):
         _submit(handlers, "sig-1", "my_strat")
         key = ("acct", "sig-1")
         ts, name = handlers._order_identity_local[key]
-        handlers._order_identity_local[key] = (ts - 90000, name)  # > 24h ago
+        # Past the 7-day journal TTL (#393 extended it from 24h so next-day
+        # re-reads keep their attribution).
+        handlers._order_identity_local[key] = (ts - 8 * 86400, name)
 
         rows = handlers._handle_query_orders({})
 

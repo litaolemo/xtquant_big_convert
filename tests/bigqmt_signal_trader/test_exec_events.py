@@ -143,6 +143,21 @@ class FakeRedis:
         self.kv[key] = value
         return True
 
+    def set(self, key, value, ex=None, nx=False):
+        if nx and key in self.kv:
+            return None
+        self.kv[key] = value
+        return True
+
+    def setnx(self, key, value):
+        if key in self.kv:
+            return False
+        self.kv[key] = value
+        return True
+
+    def expire(self, key, ttl):
+        return True
+
     def get(self, key):
         return self.kv.get(key)
 
