@@ -139,6 +139,11 @@ SCHEDULE_ADJUST_INTERVAL = "500nMilliSecond"
 # How long one adjust tick may keep the strategy thread draining RPC requests
 # (#303). None = one adjust interval, never under 0.5s; 0 disables the bound.
 RPC_DRAIN_BUDGET_SECONDS = None
+# Post-submit/-cancel settle window before the RPC answers without a broker id
+# (#396 follow-up). None = the strategy/handlers default (3.0s) owns it; set
+# order_settle_timeout_seconds in the redis block to override. Forwarded only
+# when named, so the default keeps living in one place.
+RPC_ORDER_SETTLE_TIMEOUT_SECONDS = None
 # Heavy reads (downloads, financial data, market-token get_full_tick, tick
 # period / date-window get_market_data_ex, > RPC_HEAVY_CODES_THRESHOLD codes)
 # run on one worker thread instead of the adjust thread in drain mode (#351),
@@ -316,6 +321,8 @@ if not RPC_BACKGROUND_THREADS:
     SCHEDULE_ADJUST_ENABLED = True
 SCHEDULE_ADJUST_INTERVAL = str(BIGQMT_REDIS_CONFIG.get("schedule_adjust_interval", SCHEDULE_ADJUST_INTERVAL))
 RPC_DRAIN_BUDGET_SECONDS = BIGQMT_REDIS_CONFIG.get("drain_budget_seconds", RPC_DRAIN_BUDGET_SECONDS)
+RPC_ORDER_SETTLE_TIMEOUT_SECONDS = BIGQMT_REDIS_CONFIG.get(
+    "order_settle_timeout_seconds", RPC_ORDER_SETTLE_TIMEOUT_SECONDS)
 RPC_HEAVY_OFFLOAD = bool(BIGQMT_REDIS_CONFIG.get("rpc_heavy_offload", RPC_HEAVY_OFFLOAD))
 RPC_HEAVY_CODES_THRESHOLD = int(BIGQMT_REDIS_CONFIG.get("rpc_heavy_codes_threshold", RPC_HEAVY_CODES_THRESHOLD))
 FULL_TICK_CACHE_ENABLED = bool(BIGQMT_REDIS_CONFIG.get("full_tick_cache_enabled", FULL_TICK_CACHE_ENABLED))
@@ -415,6 +422,13 @@ def _apply_config(account_id):
                                   if RPC_NATIVE_XTDATA_ENABLED is not None
                                   else RPC_TRANSPORT != "pipe"),
     }
+    # Forward order_settle_timeout_seconds ONLY when the local config named
+    # it (#396 follow-up): the strategy/handlers default (3.0s) owns the unset
+    # case, and forwarding None would crash its float() -- the chain used to
+    # drop the key outright, so a configured value never took effect.
+    if RPC_ORDER_SETTLE_TIMEOUT_SECONDS is not None:
+        rpc_block["order_settle_timeout_seconds"] = float(
+            RPC_ORDER_SETTLE_TIMEOUT_SECONDS)
     # Forward background_threads ONLY when the local config named it: on
     # non-redis transports the strategy treats an absent key as "historical
     # default" (receiver threads on) and an explicit False as the opt-in to
@@ -463,7 +477,7 @@ def configure_runtime_account(account_id):
 
 
 def configure_runtime_redis(redis_config):
-    global REDIS_ENABLED, REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD, RPC_ALLOW_ORDER_METHODS, RPC_DEFAULT_STRATEGY_NAME, RPC_PROCESS_IN_LISTENER, RPC_BACKGROUND_THREADS, RPC_LISTENER_METHODS, SCHEDULE_ADJUST_ENABLED, SCHEDULE_ADJUST_INTERVAL, FULL_TICK_CACHE_ENABLED, FULL_TICK_DEMAND_TTL_SECONDS, FULL_TICK_CACHE_TTL_SECONDS, FULL_TICK_REFRESH_INTERVAL_SECONDS, FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS, FULL_TICK_REFRESH_MAX_WALL_SECONDS, FULL_TICK_MAX_REQUESTS, RPC_TRANSPORT, RPC_ZMQ_CONFIG, RPC_MYSQL_CONFIG, RPC_PIPE_CONFIG, QUOTE_PUSH_CONFIG, DOWNLOAD_JOBS_ENABLED, DOWNLOAD_JOB_CHUNK_SIZE, DOWNLOAD_JOB_MAX_WALL_SECONDS, DOWNLOAD_JOB_TTL_SECONDS, EXEC_EVENTS_ENABLED, EXEC_EVENTS_DEBUG_RAW_FIELDS, EXEC_EVENTS_HOLD_PRESYSID_SECONDS, RPC_BACKGROUND_THREADS_EXPLICIT, RPC_DRAIN_BUDGET_SECONDS, RPC_HEAVY_OFFLOAD, RPC_HEAVY_CODES_THRESHOLD, REDIS_ENABLED_EXPLICIT, RPC_NATIVE_XTDATA_ENABLED
+    global REDIS_ENABLED, REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD, RPC_ALLOW_ORDER_METHODS, RPC_DEFAULT_STRATEGY_NAME, RPC_PROCESS_IN_LISTENER, RPC_BACKGROUND_THREADS, RPC_LISTENER_METHODS, SCHEDULE_ADJUST_ENABLED, SCHEDULE_ADJUST_INTERVAL, FULL_TICK_CACHE_ENABLED, FULL_TICK_DEMAND_TTL_SECONDS, FULL_TICK_CACHE_TTL_SECONDS, FULL_TICK_REFRESH_INTERVAL_SECONDS, FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS, FULL_TICK_REFRESH_MAX_WALL_SECONDS, FULL_TICK_MAX_REQUESTS, RPC_TRANSPORT, RPC_ZMQ_CONFIG, RPC_MYSQL_CONFIG, RPC_PIPE_CONFIG, QUOTE_PUSH_CONFIG, DOWNLOAD_JOBS_ENABLED, DOWNLOAD_JOB_CHUNK_SIZE, DOWNLOAD_JOB_MAX_WALL_SECONDS, DOWNLOAD_JOB_TTL_SECONDS, EXEC_EVENTS_ENABLED, EXEC_EVENTS_DEBUG_RAW_FIELDS, EXEC_EVENTS_HOLD_PRESYSID_SECONDS, RPC_BACKGROUND_THREADS_EXPLICIT, RPC_DRAIN_BUDGET_SECONDS, RPC_HEAVY_OFFLOAD, RPC_HEAVY_CODES_THRESHOLD, REDIS_ENABLED_EXPLICIT, RPC_NATIVE_XTDATA_ENABLED, RPC_ORDER_SETTLE_TIMEOUT_SECONDS
     redis_config = dict(redis_config or {})
     RPC_BACKGROUND_THREADS_EXPLICIT = "rpc_background_threads" in redis_config
     REDIS_ENABLED_EXPLICIT = "redis_enabled" in redis_config
@@ -500,6 +514,8 @@ def configure_runtime_redis(redis_config):
         SCHEDULE_ADJUST_ENABLED = True
     SCHEDULE_ADJUST_INTERVAL = str(redis_config.get("schedule_adjust_interval", SCHEDULE_ADJUST_INTERVAL))
     RPC_DRAIN_BUDGET_SECONDS = redis_config.get("drain_budget_seconds", RPC_DRAIN_BUDGET_SECONDS)
+    RPC_ORDER_SETTLE_TIMEOUT_SECONDS = redis_config.get(
+        "order_settle_timeout_seconds", RPC_ORDER_SETTLE_TIMEOUT_SECONDS)
     RPC_HEAVY_OFFLOAD = bool(redis_config.get("rpc_heavy_offload", RPC_HEAVY_OFFLOAD))
     RPC_HEAVY_CODES_THRESHOLD = int(redis_config.get("rpc_heavy_codes_threshold", RPC_HEAVY_CODES_THRESHOLD))
     FULL_TICK_CACHE_ENABLED = bool(redis_config.get("full_tick_cache_enabled", FULL_TICK_CACHE_ENABLED))
