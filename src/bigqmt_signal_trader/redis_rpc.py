@@ -2307,12 +2307,23 @@ class BigQmtRpcHandlers:
         # strDatatype, startDate, endDate)（6.9）。原来漏了 strAccountType，
         # 于是 detail_type 被塞进了账户类型的位置 —— 少一个参数、还错位，
         # 和 #96 里 get_ipo_data 把 account_id 当 type 传是同一个形状（#207）。
-        result = self._call_qmt_global(
-            "get_history_trade_detail_data", account_id,
-            self._configured_account_type(account_id),
-            detail_type, start_date, end_date
-        )
-        return result
+        #
+        # NOT _call_qmt_global (#395): that helper's "unavailable -> []" and
+        # exception-swallowing are right for the credit lookups, but here they
+        # made three different worlds indistinguishable -- function not bound,
+        # native raise, and a genuinely empty history all answered
+        # ok=True data=[]. History is a record of facts: unavailable must be
+        # an error, and a native failure must propagate.
+        func = self.qmt_api.get("get_history_trade_detail_data")
+        if func is None:
+            raise RuntimeError(
+                "get_history_trade_detail_data is not bound on this terminal "
+                "(probe_capabilities.qmt_globals shows it false). An empty "
+                "answer here would read as 'no history', which is not the "
+                "same thing (#395)")
+        raw = func(account_id, self._configured_account_type(account_id),
+                   detail_type, start_date, end_date)
+        return _normalize_grouped_detail_rows(raw)
 
     def _handle_get_assure_contract(self, params):
         return self._call_qmt_global("get_assure_contract", self._request_account_id(params))
@@ -3547,6 +3558,40 @@ def _normalize_detail_rows(rows):
                 continue
             item[name] = value
         result.append(item)
+    return result
+
+
+def _jsonable_scalar(value):
+    if value is None or isinstance(value, (int, float, str, bool)):
+        return value
+    return str(value)
+
+
+def _normalize_grouped_detail_rows(rows):
+    """Serialize get_history_trade_detail_data's documented grouped answer.
+
+    The official contract is ``[(timetag, [detail, ...]), ...]`` -- the
+    example iterates ``for time, data in obj_list`` and then the details in
+    ``data``. _normalize_detail_rows alone treats each outer tuple as one
+    detail object: a tuple has no data attributes, so a fully-populated
+    history normalized to [{}], losing both the grouping and every deal in
+    it (#395). Grouped entries become ``{"timetag": t, "details": [...]}``;
+    anything not in the documented shape goes through the flat normaliser so
+    a build that answers flat rows still answers.
+    """
+    if not rows:
+        return []
+    result = []
+    for entry in rows:
+        if (isinstance(entry, (list, tuple)) and len(entry) == 2
+                and isinstance(entry[1], (list, tuple))):
+            timetag, details = entry
+            result.append({
+                "timetag": _jsonable_scalar(timetag),
+                "details": _normalize_detail_rows(details),
+            })
+        else:
+            result.extend(_normalize_detail_rows([entry]))
     return result
 
 
