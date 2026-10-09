@@ -3341,12 +3341,10 @@ class BigQmtRpcHandlers:
             settlement.result.message = ""
             return True
         if status in TERMINAL_NON_CANCEL_ORDER_STATUSES:
-            settlement.result.success = False
-            settlement.result.message = (
+            return self._fail_cancel_settlement(
+                settlement,
                 "cancel was not confirmed: order %s reached status %s"
-                % (order_sys_id, status)
-            )
-            return True
+                % (order_sys_id, status))
         if status in CANCEL_IN_FLIGHT_STATUSES:
             if not final:
                 return False
@@ -3363,12 +3361,52 @@ class BigQmtRpcHandlers:
             return True
         if not final:
             return False
-        settlement.result.success = False
-        settlement.result.message = (
+        return self._fail_cancel_settlement(
+            settlement,
             "cancel was not confirmed after %d lookup(s): order %s is still status %s"
-            % (settlement.attempts, order_sys_id, status or "unknown")
-        )
+            % (settlement.attempts, order_sys_id, status or "unknown"))
+
+    def _fail_cancel_settlement(self, settlement, message):
+        """Settle a cancel as FAILED and push a cancel_error event (#389).
+
+        QMT logs a refused cancel (已成不可撤 etc.) but fires NO callback for
+        it: a strategy that listens on on_cancel_error never learns, and
+        keeps re-cancelling a dead order. The bridge's own settle path is the
+        one place that concludes the failure (status looked up against the
+        order snapshot), so the push is synthesized here and rides the same
+        channel as native order/trade events.
+        """
+        settlement.result.success = False
+        settlement.result.message = message
+        self._publish_cancel_error(settlement, message)
         return True
+
+    def _publish_cancel_error(self, settlement, message):
+        hook = getattr(self, "exec_event_publisher", None)
+        if not callable(hook):
+            # Tests and deployments predating the strategy-side hook have no
+            # channel; the RPC reply still carries the verdict.
+            return
+        try:
+            order_ref = settlement.order_ref
+            order_sys_id = str(getattr(order_ref, "order_sys_id", "") or "")
+            remark = str(getattr(order_ref, "user_order_id", "") or "")
+            event = {
+                "event_type": "cancel_error",
+                "account_id": str(getattr(settlement, "account_id", "") or ""),
+                "stock_code": str(getattr(order_ref, "stock_code", "") or ""),
+                "order_sys_id": order_sys_id,
+                "order_id": order_sys_id,
+                "error_id": None,
+                "order_remark": remark,
+                "user_order_id": remark,
+                "error_msg": str(message or ""),
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "created_at_ts": time.time(),
+            }
+            hook(str(getattr(settlement, "account_id", "") or ""), event)
+        except Exception:
+            pass
 
     def _apply_cancel_lookup(self, settlement, final=False):
         """Resolve an ambiguous native cancel return from the order snapshot."""
@@ -3400,12 +3438,10 @@ class BigQmtRpcHandlers:
         except Exception as exc:
             if not final:
                 return False
-            settlement.result.success = False
-            settlement.result.message = (
+            return self._fail_cancel_settlement(
+                settlement,
                 "cancel status lookup failed after %d attempt(s): %s: %s"
-                % (settlement.attempts, exc.__class__.__name__, exc)
-            )
-            return True
+                % (settlement.attempts, exc.__class__.__name__, exc))
 
         matches = [
             order for order in orders
@@ -3414,12 +3450,10 @@ class BigQmtRpcHandlers:
         if not matches:
             if not final:
                 return False
-            settlement.result.success = False
-            settlement.result.message = (
+            return self._fail_cancel_settlement(
+                settlement,
                 "cancel was not confirmed: order %s was not found after %d lookup(s)"
-                % (order_sys_id, settlement.attempts)
-            )
-            return True
+                % (order_sys_id, settlement.attempts))
 
         status = str(getattr(matches[0], "status", "") or "")
         return self._settle_cancel_from_status(

@@ -803,6 +803,10 @@ def _build_rpc_service(context_info, app, config):
     # any other way.
     handlers.reload_hook = request_reload
     handlers.reload_status_hook = reload_status
+    # Synthesized cancel_error events (#389): QMT fires no callback for a
+    # refused cancel, so the handlers' settle path publishes through this
+    # hook, which rides the same sink/fallback machinery as native events.
+    handlers.exec_event_publisher = _publish_synthesized_cancel_error
     handlers.download_jobs_enabled = _config_bool(
         (config.get("download_jobs") or {}).get("enabled"), False)
     handlers.download_job_chunk_size = int((config.get("download_jobs") or {}).get("chunk_size") or 10)
@@ -1762,6 +1766,35 @@ def _publish_one(exec_events, sink, account_id, event, kind, config):
         return True
     except Exception as exc:
         _note_exec_publish_failure("%s (push fallback)" % kind, exc)
+        return False
+
+
+def _publish_synthesized_cancel_error(account_id, event):
+    """Publish a bridge-synthesized cancel_error through the exec machinery.
+
+    #389: QMT logs a refused cancel (已成不可撤 etc.) but fires NO callback,
+    so the handlers' settle path builds the event and this hook publishes it
+    on the same sink -- with the same push-channel fallback -- as native
+    order/trade events. Installed on the handlers as exec_event_publisher.
+    """
+    try:
+        config = _build_config()
+        event_config = dict(config.get("exec_events") or {})
+        if not _config_bool(event_config.get("enabled"), True):
+            return False
+        exec_events = _exec_events
+        if exec_events is None:
+            return False
+        account_id = str(account_id or event_config.get("account_id")
+                         or config.get("account_id") or _account_id or "")
+        if not account_id:
+            return False
+        sink = _exec_event_sink(config)
+        if sink is None:
+            return False
+        return _publish_one(exec_events, sink, account_id, event,
+                            "cancel_error", config)
+    except Exception:
         return False
 
 
