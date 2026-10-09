@@ -3,6 +3,34 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [未发布]
+
+### 修复
+
+- **pipeline 发布失败的异常消息不再内嵌完整响应载荷**（#398，@yucejade 报告并贡献 PR #399）。
+  redis-py 对失败的 pipeline 批量命令把完整命令参数（=响应 JSON 本身）渲染进异常消息：redis
+  maxmemory 触顶时单行日志实测 20MB、单文件累计 542MB，桥进程 IO 持续劣化直至停止消费请求队列。
+  新增 `_slim_pipeline_error`：消息超 500 字符时保留异常类型与错误头（如 "OOM command not
+  allowed"）、尾部替换为省略标记；短消息原样透传。
+
+- **撤单失败现在会推送 `on_cancel_error`**（#389，@tokens-lin 报告）。已成交的委托再撤，QMT 只在
+  自己日志里记"当前委托状态[已成]不可撤"，**对策略没有任何回调**——此前桥也不推，策略只能对着
+  死单反复撤。客户端订阅与 `on_cancel_error` 分发、事件 normalize/发布通道本来就是通的，缺的
+  是服务端调用点：撤单结算路径（#148 的读回确认）是唯一能结论"撤单没成"的地方，五类失败结局
+  （终态不可撤/超时未找到/查询失败等）现在统一经 `_fail_cancel_settlement` 合成 cancel_error
+  事件，由策略装配的钩子走与原生事件相同的通道与兜底发布。
+
+- **`get_history_trade_detail_data` 保住分组并如实报错**（#395，@shengyy 报告并附离线复现）。
+  ① 官方返回 `[(timetag, [deal, ...]), ...]` 分组形态，此前被 `_normalize_detail_rows` 当平铺
+  行处理，返回 `[{}]`——分组和成交记录全丢；现在分组序列化为 `{timetag, details[]}`（平铺形态
+  仍兼容）。② 函数未绑定/原生抛错/真空历史三者此前都返回 `ok=True, data=[]`，调用方无法区分
+  "没有成交"与"没有函数"；现在未绑定明确报错、原生异常传播、只有真空才返回空。
+
+- **`order_settle_timeout_seconds` 配置真正生效**（#396 附带发现，@TsqGit 报告）。此前
+  `configure_runtime_redis` 不读该键、`_apply_config` 不透传，strategy 侧永远拿默认 3.0——
+  用户在 local_config 里配了不生效。链路照 `drain_budget_seconds` 模式补齐（None 默认不透传，
+  显式配置才进 rpc block）。
+
 ## [0.3.61] - 2026-10-01
 
 ### 升级注意
