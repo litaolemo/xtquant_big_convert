@@ -3,6 +3,19 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [未发布]
+
+### 修复
+
+- **ZMQ 推送通道订阅者泄漏（重订阅阶梯式重复推送）**（#403，@simonfantasy 报告并给出根因与修法）。
+  `ZmqQuotePushChannel._sub_loop` 此前 keyed 在共享实例属性 `_running` 上：`stop()` 置 False，
+  下一次 `start_subscriber()` 置回 True——join 超时（线程卡在 on_msg 回调里）的旧线程看到 True
+  又复活，且挂着它创建时的旧 topic 集合。客户端每次 topic 集合变化都 stop+start，订阅 N 批就
+  留下最多 N-1 个僵尸订阅者，靠前的批被每个僵尸各收一份（实测 1.7×–7× 阶梯复制）。Redis 通道
+  早已是"每个订阅者私有 Event"，ZMQ 这路没跟上。现在对齐：订阅者捕获自己的 Event，join 超时
+  不再泄漏（Event 已置位，回调返回即退出并自闭 socket）；`start_subscriber` 自洽地先停旧的；
+  新增 `active_subscribers()` 诊断（健康值 0 或 1）。
+
 ## [0.3.62] - 2026-10-09
 
 ### 升级注意
