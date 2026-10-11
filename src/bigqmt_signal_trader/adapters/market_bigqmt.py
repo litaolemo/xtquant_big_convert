@@ -1209,7 +1209,17 @@ class BigQmtMarketDataProvider:
 
     def get_instrument(self, code):
         normalized = normalize_stock_code(code)
-        data = self.context_info.get_instrumentdetail(normalized)
+        # Prefer the native SDK (miniQMT parity): the terminal-side ContextInfo
+        # store can itself serve a poisoned contract table -- OpenDate=0 or
+        # renamed-on dates that persist across terminal restarts (#405) --
+        # while the machine's miniQMT quote service answers the correct rows.
+        # Falls back to ContextInfo when no quote service is reachable; the
+        # #160 dead-mark window absorbs the per-process dial-failure cost.
+        data = self._native_or_context(
+            "get_instrument_detail",
+            lambda: self.context_info.get_instrumentdetail(normalized),
+            normalized,
+        )
         return data or {}
 
     def get_instrument_type(self, code, variety_list=None):

@@ -90,6 +90,10 @@ getFullTick / getQuote                                   -> 200005
   43% 的 `TotalVolume` 返回 0、32% 的 `OpenDate` 返回 0、22% 非零但陈旧（最大偏差 87.7%），
   而走桥的 `ContextInfo.get_instrument_detail` 300/300 全对。合约元数据是基准数据，
   结构完整但值错误的答案比没有答案更糟，且适配层无法区分陈旧与正确，所以一律走 RPC。
+  2026-10-11 补充（#405）：ContextInfo 侧的合约库在个别机器上同样会被污染且重启不自愈
+  （OpenDate=0/更名日）；`get_instrument` 因此改为 native SDK 优先（miniQMT 共存时天然
+  对齐）、ContextInfo 回落——native 开关沿用 `native_xtdata_enabled`（redis 传输默认开）。
+  激活条件＝同机保持一个已登录的 miniQMT 进程。
 
 - **复权 K 线** —— 实测 `dividendType` 传 `none` 和 `front` 返回**完全相同**的价格，
   说明复权没有生效。因此只有 `dividend_type="none"`（或空）才走直连，其他复权类型直接

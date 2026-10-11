@@ -118,6 +118,59 @@ class BigQmtAdaptersTest(unittest.TestCase):
         self.assertEqual(context.instrument_codes, ["000001.SZ"])
         self.assertEqual(instrument["InstrumentStatus"], 0)
 
+    def test_get_instrument_prefers_native_sdk(self):
+        """issue #405: the terminal-side ContextInfo store can serve a poisoned
+        contract table (OpenDate=0 / renamed-on dates) while the machine's
+        miniQMT quote service answers the correct rows. When the native SDK is
+        reachable it must win -- it is the miniQMT client, so parity holds by
+        construction."""
+        context = FakeContext()
+        native = Obj()
+        native.get_instrument_detail = lambda code: {"OpenDate": 20070925}
+        provider = BigQmtMarketDataProvider(context, native_xtdata=native)
+
+        data = provider.get_instrument("601939.SH")
+
+        self.assertEqual(data["OpenDate"], 20070925)
+        self.assertEqual(context.instrument_codes, [])  # ContextInfo not consulted
+
+    def test_get_instrument_falls_back_to_context_when_native_dies(self):
+        """issue #160 semantics: with no reachable quote service the native call
+        raises, the dead-mark window caches the failure, and ContextInfo answers
+        (the pre-#405 behavior, unchanged for machines without a co-running
+        miniQMT)."""
+        context = FakeContext()
+
+        def boom(code):
+            raise RuntimeError("无法连接xtquant服务")
+
+        native = Obj()
+        native.get_instrument_detail = boom
+        provider = BigQmtMarketDataProvider(context, native_xtdata=native)
+
+        first = provider.get_instrument("sz000001")
+        second = provider.get_instrument("sz000001")
+
+        self.assertEqual(first["InstrumentStatus"], 0)
+        self.assertEqual(second["InstrumentStatus"], 0)
+        self.assertEqual(context.instrument_codes, ["000001.SZ", "000001.SZ"])
+        # window active: the dead native path must not be re-dialled
+        self.assertTrue(
+            provider._native_known_dead("get_instrument_detail")
+        )
+
+    def test_get_instrument_native_absent_uses_context_directly(self):
+        """native_xtdata=None and the flag off -> _native() is None, the
+        ContextInfo path answers directly (no attribute probing)."""
+        context = FakeContext()
+        provider = BigQmtMarketDataProvider(context)
+        provider.native_xtdata_enabled = False
+
+        data = provider.get_instrument("sz000001")
+
+        self.assertEqual(context.instrument_codes, ["000001.SZ"])
+        self.assertEqual(data["InstrumentStatus"], 0)
+
     def test_get_ticks_keys_keep_the_caller_case_for_futures(self):
         """issue #58: futures instrument codes are lower-case ('rb2708.SF'), but
         the keys came back upper-cased, so `code in result` failed for every
