@@ -7,7 +7,7 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
-from bigqmt_signal_trader.adapter_factory import build_app
+from bigqmt_signal_trader.adapter_factory import NoopPositionSyncSink, build_app
 from bigqmt_signal_trader.adapters.market_bigqmt import BigQmtMarketDataProvider
 from bigqmt_signal_trader.adapters.order_bigqmt import BigQmtOrderGateway
 from bigqmt_signal_trader.adapters.position_bigqmt import BigQmtPositionProvider
@@ -76,6 +76,14 @@ class FakeMarketDataFallbackContext(FakeContext):
 
 
 class BigQmtAdaptersTest(unittest.TestCase):
+
+    def test_noop_position_sync_sink_does_not_retain_snapshots(self):
+        sink = NoopPositionSyncSink()
+
+        for index in range(100):
+            sink.publish({"index": index})
+
+        self.assertFalse(hasattr(sink, "snapshots"))
 
     def test_position_code_keeps_future_contract_code(self):
         # A futures row always carries the XunTou-short exchange token, so a

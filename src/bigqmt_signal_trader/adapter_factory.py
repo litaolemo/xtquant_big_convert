@@ -34,11 +34,8 @@ class EmptyPositionProvider:
 
 
 class NoopPositionSyncSink:
-    def __init__(self):
-        self.snapshots = []
-
     def publish(self, snapshot):
-        self.snapshots.append(snapshot)
+        return None
 
 
 class NoopStateStore:
