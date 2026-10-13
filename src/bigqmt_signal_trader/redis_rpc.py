@@ -19,6 +19,7 @@ import uuid
 
 from .adapters.redis_common import decode_text
 from .code_utils import normalize_stock_code
+from . import exec_events as _exec_events
 from .models import AccountSnapshot, OrderRef, OrderRequest
 
 
@@ -1769,6 +1770,7 @@ class BigQmtRpcHandlers:
             self._request_account_id(params),
             str(params.get("strategy_name") or ""),
         )
+        orders = self._recover_order_remarks(self._request_account_id(params), orders)
         if _bool_value(params.get("cancelable_only"), False):
             orders = [
                 order
@@ -1789,8 +1791,15 @@ class BigQmtRpcHandlers:
         account_id = self._request_account_id(params)
         return self._attribute_to_strategies(
             account_id,
-            self.order_gateway.query_trades(account_id, str(strategy_name)),
+            self._recover_order_remarks(
+                account_id, self.order_gateway.query_trades(account_id, str(strategy_name))),
         )
+
+    def _recover_order_remarks(self, account_id, snapshots):
+        return _exec_events.recover_order_remarks(
+            getattr(self, "order_remark_redis_client", None), account_id,
+            self._configured_account_type(account_id), snapshots,
+            _exec_events.ORDER_IDENTITY_TTL_SECONDS)
 
     def _attribute_to_strategies(self, account_id, snapshots):
         """Put the caller's strategy name on rows this bridge submitted.
@@ -1948,12 +1957,17 @@ class BigQmtRpcHandlers:
         trade_name = params.get("trade_strategy_name")
         if trade_name is None:
             trade_name = ""
+        orders = self.order_gateway.query_orders(account_id, str(order_name))
+        trades = self.order_gateway.query_trades(account_id, str(trade_name))
+        # Observe both native sets before filling ANY blanks. A DEAL can reveal
+        # a missing association, or invalidate one an earlier ORDER would use.
+        rows = self._recover_order_remarks(account_id, list(orders) + list(trades))
         return {
             "account_id": account_id,
             "server_time": _dt.datetime.now(),
             "rpc_revision": RPC_REVISION,
-            "orders": self.order_gateway.query_orders(account_id, str(order_name)),
-            "trades": self.order_gateway.query_trades(account_id, str(trade_name)),
+            "orders": rows[:len(orders)],
+            "trades": rows[len(orders):],
         }
 
     def _handle_sync_positions(self, params):

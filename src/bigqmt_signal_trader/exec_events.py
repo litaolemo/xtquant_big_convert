@@ -17,6 +17,8 @@ The normalized field names match ``BigQmtXtTrader._order_from_dict`` /
 import json
 import time
 
+from .order_remarks import recover_order_remarks, bounded_identity_client
+
 
 ORDER_CHANNEL_TEMPLATE = "bigqmt:order_events:{account_id}"
 TRADE_CHANNEL_TEMPLATE = "bigqmt:trade_events:{account_id}"
