@@ -1,11 +1,13 @@
 # coding: utf-8
-"""pipe / mysql 没有推送通道时，客户端轮询合成执行回调 (#372)。
+"""没有推送通道的传输（mysql 等），客户端轮询合成执行回调 (#372)。
 
 通道选择本来就是每轮重探：redis 可达走 redis 频道，zmq 走推送通道，剩下
-（pipe / mysql、或 redis 传输的 redis 宕了）0.3.56 之前什么都不干——
+（mysql、或 redis 传输的 redis 宕了）0.3.56 之前什么都不干——
 on_stock_order 一条都到不了。现在剩下那条路走查询轮询：按 sysid+status
 diff 委托、按 trade_id diff 成交，合成与推送完全同形的事件。首轮只打底
 不补发；查询连续失败退回外层重选。
+
+2026-10-12 更新（#408）：pipe 有了真推送通道（事件管道），轮询只剩 mysql。
 """
 
 import json
@@ -145,21 +147,51 @@ class PollSynthTest(unittest.TestCase):
 
 
 class PollSelectionTest(unittest.TestCase):
-    def test_pipe_without_redis_selects_the_poller(self):
+    def test_mysql_without_redis_selects_the_poller(self):
         client = PollClient([
             ([O("s1", "50")], []),
             ([O("s1", "56")], [T("t1", "s1")]),
         ])
+        client.transport_name = "mysql"
         recorder = Recorder(stop_after=2)
         trader = _trader(client, recorder)
         recorder._trader = trader
 
         trader._event_running = True
-        trader._event_loop()      # 通道选择：pipe 无 redis -> 轮询
+        trader._event_loop()      # 通道选择：mysql 无 redis -> 轮询
 
         self.assertEqual(
             [("order", "600000.SH", "56"), ("trade", "600000.SH", "t1")],
             recorder.items())
+
+    def test_pipe_without_redis_selects_the_push_channel(self):
+        """#408: pipe now has a real push wire -- the poller is NOT chosen."""
+        from unittest import mock
+
+        client = PollClient([([], [])])          # transport_name = "pipe"
+        trader = _trader(client, Recorder())
+        trader._event_running = True
+
+        calls = {}
+
+        class _FakeChannel(object):
+            def start_subscriber(self, topics, on_msg):
+                calls["topics"] = list(topics)
+                trader._event_running = False   # end the round after selection
+
+            def stop(self):
+                calls["stopped"] = True
+
+        # The round builds the channel through the MODULE-level function --
+        # patching an instance method here would leave the real one running.
+        with mock.patch(
+                "bigqmt_signal_trader.xtquant_compat._build_quote_push_channel",
+                return_value=_FakeChannel()):
+            trader._event_loop()
+
+        self.assertIn("topics", calls, "pipe 应进入推送通道分支")
+        self.assertTrue(calls.get("stopped"))
+        self.assertEqual(client.queries, 0, "pipe 不再走轮询合成（#408）")
 
 
 if __name__ == "__main__":

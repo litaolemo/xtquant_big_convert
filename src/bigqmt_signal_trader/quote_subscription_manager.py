@@ -352,6 +352,7 @@ def build_quote_subscription_service(
     heartbeat_timeout_seconds=30.0,
     time_func=None,
     account_ids=None,
+    pipe_name=None,
 ):
     """Assemble the server-side whole-quote service: a ContextInfo-backed source,
     a push channel matching the RPC transport, and a QuoteSubscriptionManager
@@ -376,6 +377,18 @@ def build_quote_subscription_service(
         extra = [_default_quote_push_zmq_bind(other) for other in served if other != str(account_id or "")]
         channel = ZmqQuotePushChannel(bind_address=bind_address, extra_bind_addresses=extra)
         push_endpoint = bind_address
+    elif transport_name == "pipe":
+        # #408: pipe deployments get a real push wire -- a dedicated events
+        # pipe (server writes, clients read), not the RPC request/response
+        # pipe. The exec-event sink falls through to _push_channel_sink, so
+        # order/trade callbacks ride the same channel for free.
+        from .transports.pipe_push_channel import (
+            PipeQuotePushChannel, pipe_events_path,
+        )
+
+        events_address = pipe_events_path(pipe_name, account_id)
+        channel = PipeQuotePushChannel(bind_address=events_address)
+        push_endpoint = events_address
     elif redis_client is None:
         # pipe（或 redis 被关掉的部署）没有推送线——静默空通道，而不是
         # RedisQuotePushChannel(None) 每条事件一行 AttributeError。

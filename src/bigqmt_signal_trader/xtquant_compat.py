@@ -312,6 +312,20 @@ def _build_quote_push_channel(client):
     if transport_name in ("zmq",):
         address = _quote_push_zmq_address(client)
         return ZmqQuotePushChannel(connect_address=address)
+    if transport_name in ("pipe",):
+        # #408: the events pipe path derives from the RPC pipe block exactly
+        # as the server derives it -- no discovery needed. An explicit redis
+        # block keeps winning (config is an opt-in): the pipe channel is the
+        # no-redis default precisely because a named pipe is not a socket and
+        # cannot trip the connection-killing sandbox the gate guards.
+        if not getattr(client, "_redis_explicit", False):
+            from .transports.pipe_push_channel import (
+                PipeQuotePushChannel, pipe_events_path,
+            )
+
+            pipe_config = dict(getattr(client, "pipe_config", {}) or {})
+            address = pipe_events_path(pipe_config.get("pipe_name"), client.account_id)
+            return PipeQuotePushChannel(connect_address=address)
     if (transport_name not in ("redis", "", "default")
             and not getattr(client, "_redis_explicit", True)):
         raise RuntimeError(
@@ -1468,6 +1482,7 @@ class BigQmtRpcClient:
         ).lower()
         self.zmq_config = dict(merged_redis_config.get("zmq") or {})
         self.mysql_config = dict(merged_redis_config.get("mysql") or {})
+        self.pipe_config = dict(merged_redis_config.get("pipe") or {})
         self._transport_instance = None  # lazily built by _transport()
         # FormulaServer read fast-path. QMT's C++ quote service (port 58600)
         # answers reference/history reads in ~0.07ms without touching the QMT
@@ -4879,16 +4894,17 @@ class BigQmtXtTrader:
             redis_client = self._exec_events_redis_or_none()
             if redis_client is not None:
                 self._event_loop_redis(redis_client)
-            elif self._exec_transport_is_zmq():
+            elif self._exec_transport_uses_push_channel():
                 self._event_loop_push_channel()
             else:
-                # pipe / mysql 没有推送通道（redis 传输的 redis 宕了也是）——
+                # mysql 没有推送通道（redis 传输的 redis 宕了也是）——
                 # 查询 RPC 还通，就轮询合成回调（#372）；查询也连续失败时
                 # 它会自己退回来，外层重新探 redis。
                 self._event_loop_poll()
 
-    def _exec_transport_is_zmq(self):
-        return str(getattr(self.client, "transport_name", "redis") or "redis").lower() == "zmq"
+    def _exec_transport_uses_push_channel(self):
+        # zmq and pipe both carry exec events on their push channel (#76, #408).
+        return str(getattr(self.client, "transport_name", "redis") or "redis").lower() in ("zmq", "pipe")
 
     def _exec_events_redis_or_none(self):
         """A REACHABLE Redis client for the exec-event channels, or None.

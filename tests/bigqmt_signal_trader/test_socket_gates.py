@@ -111,14 +111,22 @@ class ClientRedisGateTest(unittest.TestCase):
 
 
 class QuoteChannelGateTest(unittest.TestCase):
-    def test_pipe_without_explicit_redis_raises_instead_of_dialling(self):
+    def test_pipe_without_explicit_redis_gets_the_events_pipe(self):
+        """#408: pipe without explicit redis gets its own push wire -- a named
+        pipe is not a socket, so the connection-killing sandbox this gate
+        guards cannot trip, and redis is never even built."""
+        from bigqmt_signal_trader.transports.pipe_push_channel import (
+            PipeQuotePushChannel,
+        )
+
         client = types.SimpleNamespace(
             transport_name="pipe", account_id="acct", _redis_explicit=False,
+            pipe_config={},
             _redis=lambda: (_ for _ in ()).throw(AssertionError("must not build")),
         )
-        with self.assertRaises(RuntimeError) as caught:
-            _build_quote_push_channel(client)
-        self.assertIn("没有全推推送通道", str(caught.exception))
+        channel = _build_quote_push_channel(client)
+        self.assertIsInstance(channel, PipeQuotePushChannel)
+        self.assertTrue(channel.connect_address.endswith("_events_acct"))
 
     def test_pipe_with_explicit_redis_builds_the_redis_channel(self):
         client = types.SimpleNamespace(

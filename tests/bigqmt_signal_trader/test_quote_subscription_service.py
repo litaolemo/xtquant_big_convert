@@ -63,12 +63,28 @@ class BuildQuoteSubscriptionServiceTest(unittest.TestCase):
         self.assertIsInstance(channel, ZmqQuotePushChannel)
         self.assertEqual(channel.bind_address, "tcp://127.0.0.1:15561")
 
-    def test_no_redis_non_zmq_gets_the_null_channel(self):
-        """pipe（或 redis 被关的部署）没有推送线：空通道静默 noop，而不是
+    def test_pipe_transport_gets_a_real_events_pipe(self):
+        """#408: pipe deployments now get a real push wire (a dedicated
+        events pipe), not the silent noop channel."""
+        from bigqmt_signal_trader.transports.pipe_push_channel import (
+            PipeQuotePushChannel,
+        )
+
+        service = build_quote_subscription_service(
+            FakeContextInfo(), transport_name="pipe", account_id="acct",
+            redis_client=None, enabled=True,
+        )
+        manager, channel = service
+        self.assertIsInstance(channel, PipeQuotePushChannel)
+        self.assertTrue(channel.bind_address.endswith("_events_acct"))
+        channel.stop()
+
+    def test_no_redis_mysql_gets_the_null_channel(self):
+        """mysql（或 redis 被关的部署）没有推送线：空通道静默 noop，而不是
         RedisQuotePushChannel(None) 每条事件一行 AttributeError（2026-09-24
         pipe 实盘噪音）。"""
         service = build_quote_subscription_service(
-            FakeContextInfo(), transport_name="pipe", account_id="acct",
+            FakeContextInfo(), transport_name="mysql", account_id="acct",
             redis_client=None, enabled=True,
         )
         manager, channel = service

@@ -664,6 +664,11 @@ def _build_quote_subscription_service(context_info, config, transport_name, acco
     _qsm = importlib.reload(_qsm)
     heartbeat_timeout = float(quote_config.get("heartbeat_timeout_seconds", 30.0))
     zmq_bind_address = quote_config.get("zmq_bind_address")
+    # #408: the events pipe derives its name from the RPC pipe block so both
+    # sides compute the same path from the same config.
+    pipe_name = dict(config.get("rpc") or {}).get("pipe", {}).get("pipe_name")
+    if pipe_name is None:
+        pipe_name = dict(config.get("pipe") or {}).get("pipe_name")
     return _qsm.build_quote_subscription_service(
         context_info,
         transport_name=transport_name,
@@ -672,6 +677,7 @@ def _build_quote_subscription_service(context_info, config, transport_name, acco
         zmq_bind_address=zmq_bind_address,
         enabled=True,
         heartbeat_timeout_seconds=heartbeat_timeout,
+        pipe_name=pipe_name,
     )
 
 
