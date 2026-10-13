@@ -2468,7 +2468,7 @@ class BigQmtXtData:
         return True
 
     def _backfill_pre_close(self, data, period, dividend_type,
-                            timeout_seconds=None, use_formula=True):
+                            timeout_seconds=None, use_formula=True, subscribe=None):
         """Fill an all-zero preClose from daily bars (#166).
 
         Big QMT answers preClose = 0.0 on every ``1w`` bar. The right value,
@@ -2506,7 +2506,7 @@ class BigQmtXtData:
                 # A filled row carries no real preClose and would be picked as
                 # a period's "first trading day" if it were returned (#167).
                 fill_data=False, timeout_seconds=timeout_seconds,
-                use_formula=use_formula, backfill_pre_close=False,
+                use_formula=use_formula, backfill_pre_close=False, subscribe=subscribe,
             )
         except Exception as exc:
             # Degrade to the terminal's answer. The bars themselves are good;
@@ -2562,7 +2562,7 @@ class BigQmtXtData:
 
     def _resynth_ongoing_multiday_bars(self, data, period, start_time,
                                        end_time, dividend_type,
-                                       timeout_seconds=None, use_formula=True):
+                                       timeout_seconds=None, use_formula=True, subscribe=None):
         """Rebuild the in-progress multi-day bar from the period's daily bars (#226).
 
         Big QMT synthesizes an ongoing 1w/1mon/1q/1hy/1y bar from the bars in
@@ -2651,7 +2651,7 @@ class BigQmtXtData:
                 start_time=first, end_time=today, count=-1,
                 dividend_type=dividend_type, fill_data=False,
                 timeout_seconds=timeout_seconds, use_formula=use_formula,
-                backfill_pre_close=False, resynth_ongoing_multiday=False,
+                backfill_pre_close=False, resynth_ongoing_multiday=False, subscribe=subscribe,
             )
         except Exception as exc:
             # The terminal's answer was good enough to serve; taking the whole
@@ -2917,7 +2917,7 @@ class BigQmtXtData:
             # rather than a copy of the zeros (#166).
             data = self._backfill_pre_close(
                 data, period=period, dividend_type=dividend_type,
-                timeout_seconds=timeout_seconds, use_formula=use_formula,
+                timeout_seconds=timeout_seconds, use_formula=use_formula, subscribe=subscribe,
             )
 
         if resynth_ongoing_multiday:
@@ -2926,7 +2926,7 @@ class BigQmtXtData:
             data = self._resynth_ongoing_multiday_bars(
                 data, period=period, start_time=start_time, end_time=end_time,
                 dividend_type=dividend_type, timeout_seconds=timeout_seconds,
-                use_formula=use_formula,
+                use_formula=use_formula, subscribe=subscribe,
             )
 
         cache = self._local_cache()
@@ -2934,8 +2934,8 @@ class BigQmtXtData:
             for code, df in data.items():
                 try:
                     cache.write(code, period, df, dividend_type=dividend_type)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.warning("local cache write failed code=%s period=%s: %s", code, period, exc)
         return data
 
     def get_local_data(
@@ -3668,6 +3668,7 @@ class BigQmtXtData:
                     # The RPC timeout for one pull is not the poll budget: a
                     # batch of 300 codes x 20k bars is a multi-second reply.
                     timeout_seconds=max(float(data_wait_seconds), 60.0),
+                    subscribe=False,  # Cache population must not allocate native subscriptions.
                     # 等的就是刚提交的那笔下载。heal 看到「还没落地」会把它原样
                     # 再提交一遍、睡 2 秒、再读——每轮如此，等待目标被反复推后，
                     # 单票冷启动必然打满 60 秒（#275）。轮询里的读不参与 heal。

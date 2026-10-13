@@ -9,6 +9,7 @@ back to pickle when pyarrow is unavailable. A cache written in one format is rea
 """
 
 import os
+from contextlib import contextmanager
 
 
 # Candidate time-column names produced by the RPC market-data path.
@@ -99,6 +100,53 @@ def _resolve_format(fmt):
     return "parquet" if _pyarrow_available() else "pkl"
 
 
+@contextmanager
+def _write_lock(path):
+    """Serialize read/merge/replace for one logical key across client processes."""
+    with open(path, "a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _preserve_omitted_columns(old, incoming):
+    """A partial query updates supplied columns, including explicit nulls."""
+    old_axis, old_index = _time_axis(old)
+    new_axis, new_index = _time_axis(incoming)
+    missing = [column for column in old.columns if column not in incoming.columns]
+    if not missing:
+        return incoming
+    result = incoming.copy()
+    if old_index and new_index:
+        previous = old[~old.index.duplicated(keep="last")]
+        for column in missing:
+            result[column] = previous[column].reindex(incoming.index)
+    elif old_axis and new_axis and not old_index and not new_index:
+        previous = old.drop_duplicates(subset=[old_axis], keep="last").set_index(old_axis)
+        for column in missing:
+            if column != old_axis:
+                result[column] = incoming[new_axis].map(previous[column])
+    return result
+
+
 class LocalMarketCache:
     def __init__(self, cache_dir=None, fmt="auto"):
         self.cache_dir = str(cache_dir or os.path.join(os.path.expanduser("~"), ".bigqmt_cache"))
@@ -147,16 +195,25 @@ class LocalMarketCache:
     def write(self, code, period, df, dividend_type="none"):
         """Merge ``df`` into the cache for (code, period, dividend_type).
 
-        Dedupe is by time keeping the LAST write, so re-pulling a range overwrites
-        stale values — which is exactly what front-adjusted (前复权) data needs after
-        a new dividend re-scales history. Returns total rows stored.
+        Dedupe is by time keeping the LAST supplied fields; a partial query
+        preserves omitted columns. Re-pulling a range overwrites stale values —
+        which is exactly what front-adjusted (前复权) data needs after a new
+        dividend re-scales history. Returns total rows stored.
         """
         if df is None or not hasattr(df, "shape") or df.shape[0] == 0:
             return 0
-        import pandas as pd
-
         incoming = _drop_placeholder_rows(df.copy())
         primary = self.path(code, period, dividend_type)
+        directory = os.path.dirname(primary)
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory, exist_ok=True)
+        # Both formats share this lock, including read/migrate/delete operations.
+        with _write_lock(primary[:-len(self._ext())] + ".lock"):
+            return self._merge(code, period, dividend_type, incoming, primary)
+
+    def _merge(self, code, period, dividend_type, incoming, primary):
+        import pandas as pd
+
         existing = self._existing_path(code, period, dividend_type)
         if incoming.shape[0] == 0:
             # Nothing real to add (all 0-fill placeholders); keep existing cache.
@@ -166,15 +223,13 @@ class LocalMarketCache:
                 except Exception:
                     return 0
             return 0
-        directory = os.path.dirname(primary)
-        if directory and not os.path.isdir(directory):
-            os.makedirs(directory, exist_ok=True)
         merged = incoming
         _, incoming_on_index = _time_axis(incoming)
         if existing:
             try:
                 old = self._read_file(existing)
                 _, old_on_index = _time_axis(old)
+                merged = _preserve_omitted_columns(old, incoming)
                 if incoming_on_index and old_on_index:
                     # 保留时间索引（ignore_index=True 会把 MiniQMT 形态的时间轴丢掉）。
                     merged = pd.concat([old, merged])
@@ -195,8 +250,12 @@ class LocalMarketCache:
             merged = merged.drop_duplicates().reset_index(drop=True)
         # Atomic-ish write (temp + replace) so a crash mid-write can't corrupt the file.
         tmp = primary + ".tmp"
-        self._write_file(merged, tmp)
-        os.replace(tmp, primary)
+        try:
+            self._write_file(merged, tmp)
+            os.replace(tmp, primary)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
         # Migrated from the other format? drop the stale file.
         if existing and existing != primary:
             try:
