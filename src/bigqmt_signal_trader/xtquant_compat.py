@@ -945,6 +945,14 @@ def _digits_only(value):
     return "".join(ch for ch in str(value or "") if ch.isdigit())
 
 
+def _time_compare_digits(value):
+    """A 14-digit string so QMT timestamps compare chronologically."""
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if not digits:
+        return ""
+    return digits[:14].ljust(14, "0")
+
+
 def _parse_qmt_stime(value):
     digits = _digits_only(value)
     if len(digits) >= 14:
@@ -3636,6 +3644,7 @@ class BigQmtXtData:
         if step <= 0:
             step = 300
         finished = 0
+        skipped_all = []
         for i in range(0, total, step):
             batch = codes[i:i + step]
             # QMT 的下载全局是「提交任务即返回」，数据在服务端异步落地
@@ -3689,14 +3698,73 @@ class BigQmtXtData:
                     "downloaded for these codes" % (
                         period, start_time, end_time, server_download_error,
                         ",".join(missing)))
+            skipped = []
+            if start_time and ready < len(batch):
+                no_data = [code for code in batch
+                           if getattr((data or {}).get(code), "shape", (0,))[0] == 0]
+                skipped = self._download_skipped_dead_zone(
+                    no_data, period, start_time, end_time)
+                if skipped:
+                    skipped_all.extend(skipped)
+                    # #397: the terminal's injected download only appends from
+                    # its local last bar -- these windows ended before it, so
+                    # nothing was written even though the task was accepted.
+                    # Name them instead of reporting fake progress.
+                    log.warning(
+                        "download_history_data2 %s %s~%s: %d code(s) sit in the "
+                        "append-only dead zone (window ends before the terminal's "
+                        "local last bar; nothing was written for them). They are "
+                        "in 'skipped', not 'finished': %s",
+                        period, start_time, end_time, len(skipped),
+                        ",".join(skipped[:5]))
             for code in batch:
+                if code in skipped:
+                    continue
                 finished += 1
                 if callback is not None:
                     try:
                         callback({"finished": finished, "total": total, "stockcode": code})
                     except Exception:
                         pass
-        return {"finished": finished, "total": total}
+        result = {"finished": finished, "total": total}
+        if skipped_all:
+            result["skipped"] = skipped_all
+        return result
+
+    def _download_skipped_dead_zone(self, codes, period, start_time, end_time):
+        """Empty-poll codes that are in the append-only dead zone, not data-less.
+
+        #397: the terminal's injected download only appends from its local
+        last bar; a window ending BEFORE that bar is silently not written.
+        Telling that from a genuinely data-less code (suspended / delisted /
+        never downloaded -- the tolerance those were for) needs one tail read:
+        a code with later data is in the dead zone; a code with none is not.
+        Batched, count=1, heal off -- cheap, and read-only.
+        """
+        if not codes or not start_time:
+            return []
+        try:
+            tails = self.get_market_data_ex(
+                field_list=["close"], stock_list=list(codes), period=period,
+                count=1, dividend_type="none", fill_data=False,
+                heal=False, subscribe=False, timeout_seconds=60.0)
+        except Exception:
+            return []   # cannot tell: keep the old tolerant finish
+        end_digits = _time_compare_digits(end_time)
+        if not end_digits:
+            return []
+        skipped = []
+        for code in codes:
+            frame = (tails or {}).get(code)
+            if frame is None or getattr(frame, "shape", (0,))[0] == 0:
+                continue
+            try:
+                last_stamp = str(list(frame.index)[-1])
+            except Exception:
+                continue
+            if _time_compare_digits(last_stamp) > end_digits:
+                skipped.append(code)
+        return skipped
 
     def download_history_data(self, stock_code, period, start_time="", end_time="", incrementally=None, dividend_type="none"):
         return self.download_history_data2([stock_code], period, start_time, end_time, dividend_type=dividend_type)
@@ -5119,6 +5187,20 @@ class BigQmtXtTrader:
             m_dTotalAsset=_safe_float(total_asset, 0.0) if total_asset is not None else None,
             m_dMarketValue=_safe_float(market_value, 0.0) if market_value is not None else 0.0,
         )
+
+    def query_secu_account(self, account):
+        """query_stock_asset 的别名（#406）。
+
+        不在 xtquant 公开文档里，但光大 2.1.29 终端在下单校验与账户会话探测
+        链上会按属性名回调 trader 对象的 query_secu_account；缺这个属性时
+        AttributeError 直接把当前操作打断（实盘下单被迫人工兜底、清算后每
+        5 分钟一条报错）。账户信息探针要的就是这份资产答案
+        （cash / frozen / market_value / total_asset）。
+        """
+        return self.query_stock_asset(account)
+
+    def query_secu_account_async(self, account, callback=None):
+        return self._async_query(self.query_secu_account, account, callback)
 
     def _position_object(self, account_id, item):
         volume = _safe_int(item.get("volume"))
