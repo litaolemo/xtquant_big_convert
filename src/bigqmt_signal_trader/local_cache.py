@@ -218,29 +218,23 @@ class LocalMarketCache:
         if incoming.shape[0] == 0:
             # Nothing real to add (all 0-fill placeholders); keep existing cache.
             if existing:
-                try:
-                    return self._read_file(existing).shape[0]
-                except Exception:
-                    return 0
+                return self._read_file(existing).shape[0]
             return 0
         merged = incoming
         _, incoming_on_index = _time_axis(incoming)
         if existing:
-            try:
-                old = self._read_file(existing)
-                _, old_on_index = _time_axis(old)
-                merged = _preserve_omitted_columns(old, incoming)
-                if incoming_on_index and old_on_index:
-                    # 保留时间索引（ignore_index=True 会把 MiniQMT 形态的时间轴丢掉）。
-                    merged = pd.concat([old, merged])
-                elif incoming_on_index and not old_on_index:
-                    # 老缓存无时间轴（旧版写出），行不可切片、合并还会毁掉新数据
-                    # 的时间索引。老行丢弃——cache-through 每次都会重拉完整窗口。
-                    merged = incoming
-                else:
-                    merged = pd.concat([old, merged], ignore_index=True)
-            except Exception:
-                pass
+            old = self._read_file(existing)
+            _, old_on_index = _time_axis(old)
+            merged = _preserve_omitted_columns(old, incoming)
+            if incoming_on_index and old_on_index:
+                # 保留时间索引（ignore_index=True 会把 MiniQMT 形态的时间轴丢掉）。
+                merged = pd.concat([old, merged])
+            elif incoming_on_index and not old_on_index:
+                # 老缓存无时间轴（旧版写出），行不可切片、合并还会毁掉新数据
+                # 的时间索引。老行丢弃——cache-through 每次都会重拉完整窗口。
+                merged = incoming
+            else:
+                merged = pd.concat([old, merged], ignore_index=True)
         axis, on_index = _time_axis(merged)
         if on_index:
             merged = merged[~merged.index.duplicated(keep="last")].sort_index()

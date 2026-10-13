@@ -163,3 +163,25 @@ def test_automatic_cache_write_failure_is_logged_without_losing_rpc_data(tmp_pat
                                      backfill_pre_close=False, resynth_ongoing_multiday=False)
     assert result["X"] is frame
     assert "local cache write failed code=X period=5m: disk full" in caplog.text
+
+
+@pytest.mark.parametrize("failure", ["read", "merge"])
+def test_existing_cache_failure_never_replaces_history_with_partial_update(tmp_path, monkeypatch, failure):
+    cache = LocalMarketCache(str(tmp_path), fmt="pkl")
+    cache.write("X", "5m", pd.DataFrame({"close": [10., 11.]}, index=["20260930093000", "20260930093500"]))
+    path = cache.path("X", "5m")
+    with open(path, "rb") as handle:
+        original = handle.read()
+
+    def failed(*args, **kwargs):
+        raise OSError("existing history temporarily unreadable")
+
+    if failure == "read":
+        monkeypatch.setattr(cache, "_read_file", failed)
+    else:
+        monkeypatch.setattr(pd, "concat", failed)
+    with pytest.raises(OSError, match="temporarily unreadable"):
+        cache.write("X", "5m", pd.DataFrame({"close": [12.]}, index=["20260930094000"]))
+    with open(path, "rb") as handle:
+        assert handle.read() == original
+    assert not os.path.exists(path + ".tmp")
