@@ -14,6 +14,8 @@ import math
 import time
 from urllib.parse import quote
 
+from .redis_safe_value import PREFIX, LUA_ENCODE, decode_json
+
 
 LOGGER = logging.getLogger(__name__)
 TIMEOUT_SECONDS = 0.25
@@ -22,7 +24,7 @@ _last_warning = -float("inf")
 # One atomic operation: learn every native association (including
 # conflicts) before recovering ANY blank in the batch. A conflict stays poisoned
 # until expiry; neither a later blank nor a later native value clears it.
-_OBSERVE_AND_READ = """
+_OBSERVE_AND_READ = LUA_ENCODE + """
 for i, key in ipairs(KEYS) do
     local observed = ARGV[i + 1]
     local old = redis.call('GET', key)
@@ -47,7 +49,12 @@ for i, key in ipairs(KEYS) do
 end
 local result = {}
 for i, key in ipairs(KEYS) do
-    result[i] = redis.call('GET', key) or false
+    local raw = redis.call('GET', key)
+    if raw and raw ~= '!conflict' then
+        result[i] = safe_encode(raw, ARGV[2 + 2 * #KEYS])
+    else
+        result[i] = raw or false
+    end
 end
 return result
 """
@@ -159,11 +166,15 @@ def recover_order_remarks(client, account_id, account_type, rows, ttl_seconds):
     if not wanted:
         return rows
     try:
+        # Encode inside Redis, before QMT checks the EVAL response. Keeping
+        # stored JSON unchanged also covers legacy bindings without migration,
+        # TTL renewal or a read/modify/write race with native observations.
         values = client.eval(_OBSERVE_AND_READ, len(wanted),
                              *([d[0] for _, d in wanted]
                                + [str(int(ttl_seconds))]
                                + [d[3] for _, d in wanted]
-                               + [json.dumps([d[1], d[2]]) for _, d in wanted]))
+                               + [json.dumps([d[1], d[2]]) for _, d in wanted]
+                               + [PREFIX]))
         if len(values) != len(wanted):
             raise ValueError("incomplete order remark lookup")
         recovered = []
@@ -173,7 +184,7 @@ def recover_order_remarks(client, account_id, account_type, rows, ttl_seconds):
                 continue
             if observed or not value:
                 continue
-            identity = json.loads(value)
+            identity = decode_json(value)
             if (not isinstance(identity, list) or len(identity) != 3
                     or identity[:2] != [stock, action]
                     or not isinstance(identity[2], str) or not identity[2]):

@@ -31,7 +31,7 @@ PREFIX = b"bqidentity:"
 _ALPHA_TO_DIGIT = str.maketrans("ghijklmnop", "0123456789")
 
 # Guojin QMT's redis/client.py response-wide filters (lines 926-927). Only
-# GET/MGET are filtered here; EVAL is delegated to the independent real server.
+# GET/MGET and real Lua EVAL replies are filtered before Python consumes them.
 _STOCK_RE = re.compile(
     r"(^|[^\d])+([36]0[\d]{4}|00(000[1-9]|[1-9][\d]{3}|[\d][1-9][\d]{2}|[\d]{2}[1-9][\d]))([^\d]|$)+"
 )
@@ -72,7 +72,7 @@ class _FilteredRedis(object):
         self.evals.append((script, numkeys, args))
         if self.before_eval is not None:
             self.before_eval(self.client, args[0])
-        return self.client.eval(script, numkeys, *args)
+        return self._filtered(self.client.eval(script, numkeys, *args))
 
 
 @pytest.fixture(scope="module")

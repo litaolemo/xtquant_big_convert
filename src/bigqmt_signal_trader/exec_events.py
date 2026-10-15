@@ -18,6 +18,12 @@ import json
 import time
 
 from .order_remarks import recover_order_remarks, bounded_identity_client
+from .redis_safe_value import (
+    PREFIX as _ORDER_IDENTITY_PREFIX,
+    LUA_ENCODE,
+    encode_json as _encode_order_identity,
+    decode_json,
+)
 
 
 ORDER_CHANNEL_TEMPLATE = "bigqmt:order_events:{account_id}"
@@ -478,12 +484,6 @@ def normalize_order_event(order, account_id=""):
 
 ORDER_IDENTITY_TTL_SECONDS = 7 * 86400
 
-# QMT's bundled Redis checks responses for stock-code/operation digit
-# patterns. Raw identity JSON contains both (#393). Keep keys and decoded
-# fields unchanged, but store values using an alphabet with no digits.
-_ORDER_IDENTITY_PREFIX = "bqidentity:"
-_IDENTITY_DIGIT_ENCODE = str.maketrans("0123456789", "ghijklmnop")
-_IDENTITY_DIGIT_DECODE = str.maketrans("ghijklmnop", "0123456789")
 _last_identity_warning = -float("inf")
 
 # An old JSON value can be rejected before Python receives it. Migrate that
@@ -491,7 +491,7 @@ _last_identity_warning = -float("inf")
 # preserves its exact expiry (including no expiry); the encoded value is
 # always longer, so no old suffix survives. Do not re-serialize with cjson:
 # preserving the original bytes also preserves timestamp precision.
-_MIGRATE_ORDER_IDENTITY = """
+_MIGRATE_ORDER_IDENTITY = LUA_ENCODE + """
 local raw = redis.call('GET', KEYS[1])
 if not raw then return false end
 local prefix = ARGV[3]
@@ -502,35 +502,17 @@ if not ok or type(identity) ~= 'table'
         or identity.user_order_id ~= ARGV[2] then
     return false
 end
-local alphabet = 'ghijklmnopabcdef'
-local parts = {prefix}
-for i = 1, #raw do
-    local value = string.byte(raw, i)
-    local high = math.floor(value / 16) + 1
-    local low = value % 16 + 1
-    parts[#parts + 1] = string.sub(alphabet, high, high)
-    parts[#parts + 1] = string.sub(alphabet, low, low)
-end
-local encoded = table.concat(parts)
+local encoded = safe_encode(raw, prefix)
 redis.call('SETRANGE', KEYS[1], 0, encoded)
 return encoded
 """
-
-
-def _encode_order_identity(identity):
-    raw = json.dumps(identity, ensure_ascii=False, default=str).encode("utf-8")
-    return _ORDER_IDENTITY_PREFIX + raw.hex().translate(_IDENTITY_DIGIT_ENCODE)
 
 
 def _decode_order_identity(raw):
     if not raw:
         return None
     try:
-        text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
-        if text.startswith(_ORDER_IDENTITY_PREFIX):
-            token = text[len(_ORDER_IDENTITY_PREFIX):]
-            text = bytes.fromhex(token.translate(_IDENTITY_DIGIT_DECODE)).decode("utf-8")
-        identity = json.loads(text)
+        identity = decode_json(raw)
         return identity if isinstance(identity, dict) else None
     except (ValueError, TypeError, UnicodeError):
         return None

@@ -2,6 +2,17 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
+## [Unreleased]
+
+### 修复
+
+- **QMT 内 Redis 响应过滤导致重启后备注仍无法恢复**：`order_remarks` 的 Lua 返回值
+  复用 v0.3.67 身份记录的无数字编码，避免原始 JSON 在 Python 收到前被拒绝。只编码返回值，
+  新旧关联的存储内容和剩余 TTL 不变，无需迁移；原生非空备注优先、冲突拒绝、整批失败保留
+  原生值及 250ms 不重试池不变。升级需同步完整包（含共用编码模块）并 reload 或重启策略；
+  未观察、已过期或 Redis 丢失的备注仍不能恢复。已通过响应过滤替身、隔离 Redis Lua 和
+  Python 3.6 编译预检，实际 QMT 响应过滤与自然重启恢复仍待终端验收。
+
 
 ## [0.3.67] - 2026-10-15
 
