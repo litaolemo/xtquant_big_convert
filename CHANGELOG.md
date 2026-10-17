@@ -2,6 +2,21 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
+## [Unreleased]
+
+### 修复
+
+- **pipe 部署的 RPC handlers 仍会拨 58610，QMT 弹 `非法IP:127.0.0.1:58610` 并冻结策略线程**：
+  `_build_rpc_service` 为 handlers 单独构造了一个 `BigQmtMarketDataProvider`，没有像
+  `adapter_factory.build_app` 那样按 `transport` 传入 `native_xtdata_enabled`，于是构造器默认的
+  `True` 生效。`get_instrument_detail` 走原生优先的 `get_instrument`，加载 QMT 自带 xtdata SDK 后
+  `get_client()` 拨 SDK `xtdata.ini` 里的 `127.0.0.1:58610`；终端把这次外连判为非法，弹模态警告并
+  卡住 QMT 主线程，后续 K 线/行情/资产/持仓/委托请求全部超时（客户端显示 `rpc failed` 空错误）。
+  现在 handlers 与下载补种的 provider 都按 `rpc.native_xtdata_enabled` 显式覆盖、否则跟随
+  `transport != "pipe"`，与 `adapter_factory` 同一规则；补 `test_socket_gates` 覆盖 helper 规则、
+  pipe 默认关闭和显式覆盖。已在 QMT（Wine）终端用弹窗、终端日志与 12:18 那次 RPC 时间线定位；
+  修复后的终端复验待做。
+
 ## [0.3.68] - 2026-10-15
 
 ### 修复
