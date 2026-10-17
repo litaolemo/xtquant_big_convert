@@ -74,9 +74,14 @@ def _kernel32():
             "zmq for cross-platform deployments." % os.name)
     from ctypes import wintypes
 
+    # Some QMT-bundled Python 3.6 builds expose the Windows scalar types but
+    # omit wintypes.HANDLE.  A Win32 HANDLE is pointer-sized, so c_void_p is
+    # the compatible ctypes restype on those builds.
+    handle_type = getattr(wintypes, "HANDLE", ctypes.c_void_p)
+
     dll = ctypes.WinDLL("kernel32", use_last_error=True)
-    dll.CreateNamedPipeW.restype = wintypes.HANDLE
-    dll.CreateFileW.restype = wintypes.HANDLE
+    dll.CreateNamedPipeW.restype = handle_type
+    dll.CreateFileW.restype = handle_type
     # drain 模式要用它做非阻塞探测：有数据才 ReadFile，绝不在 adjust 线程上阻塞
     dll.PeekNamedPipe.restype = wintypes.BOOL
     return dll, wintypes

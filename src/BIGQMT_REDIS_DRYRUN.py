@@ -46,6 +46,13 @@ _ORIGINAL_IMPORT_MODULE = _importlib.import_module
 _ORIGINAL_RELOAD = _importlib.reload
 
 
+def _native_import_module(name, package=None):
+    """Use QMT/Python's importer without opening local source files."""
+    if package or str(name).startswith("."):
+        return _ORIGINAL_IMPORT_MODULE(name, package)
+    return _builtins.__import__(name, globals(), locals(), ("*",), 0)
+
+
 def _known_qmt_python_dir():
     # Find the QMT python dir from sys.path instead of a hardcoded path, so
     # the bridge loads regardless of broker install location or launch mode
@@ -166,13 +173,17 @@ def _load_local_module(name):
     # QMT native allowlist rejects the root package eager exports.
     if name == "bigqmt_signal_trader":
         return module
+    source = None
     try:
+        print("[bigqmt_shell] reading source: %s" % source_path)
         with open(source_path, "rb") as source_file:
             source = source_file.read()
         exec(compile(source, source_path, "exec"), module.__dict__)
-    except Exception:
+    except Exception as exc:
         sys.modules.pop(name, None)
-        if _looks_like_a_token_not_python(source):
+        print("[bigqmt_shell] load failed: module=%s path=%s error=%s: %s" % (
+            name, source_path, type(exc).__name__, exc))
+        if source is not None and _looks_like_a_token_not_python(source):
             raise RuntimeError(
                 "%s is not Python source -- its first line is one long token, "
                 "so the file was saved from something other than the code "
@@ -195,33 +206,15 @@ def _local_import(name, module_globals=None, module_locals=None, fromlist=(), le
     absolute_name = _resolve_name(name, module_globals, level)
     if not _is_local_module(absolute_name):
         return _ORIGINAL_IMPORT(name, module_globals, module_locals, fromlist, level)
-    module = _load_local_module(absolute_name)
-    for child in fromlist or ():
-        if child != "*":
-            child_name = absolute_name + "." + child
-            # A fromlist entry is usually an attribute, not a submodule.
-            # Looking one up walks _SOURCE_ROOT plus every sys.path entry
-            # doing os.path.isfile, then raises -- and nothing remembered the
-            # answer, so it ran again on EVERY `from X import Y` in the
-            # sandbox. Measured in the live terminal: a ping whose handler is
-            # one such import took 1493ms in handle(); with the miss
-            # remembered it takes 0ms, and the round trip went from ~1800ms to
-            # ~95-200ms.
-            if child_name in _MISSING_LOCAL_MODULES:
-                continue
-            try:
-                _load_local_module(child_name)
-            except ModuleNotFoundError:
-                _MISSING_LOCAL_MODULES.add(child_name)
-    if fromlist:
-        return module
-    return _load_local_module(absolute_name.split(".", 1)[0])
+    # Let QMT/Python perform the import itself.  The previous implementation
+    # manually opened and exec'd every local .py file, which is rejected by
+    # terminals that deny strategy FileIO (``Forbidden FileIO``).
+    return _ORIGINAL_IMPORT(
+        absolute_name, module_globals, module_locals, fromlist, 0)
 
 
 def _local_import_module(name, package=None):
-    if _is_local_module(name):
-        return _load_local_module(name)
-    return _ORIGINAL_IMPORT_MODULE(name, package)
+    return _native_import_module(name, package)
 
 
 def _local_reload(module):
@@ -259,8 +252,11 @@ def _stop_previous_rpc_service():
 
 _stop_previous_rpc_service()
 _clear_local_modules()
-_importlib.import_module = _local_import_module
-_importlib.reload = _local_reload
+# Do not replace importlib.import_module/reload here.  Local modules now use
+# Python/QMT's native importer; replacing importlib made nested imports from
+# xtquant_compat fall back into _load_local_module(), whose open() call is
+# forbidden by some QMT strategy sandboxes.
+_importlib.import_module = _native_import_module
 print("[bigqmt_shell] importlib entry source_root=%s" % _SOURCE_ROOT)
 
 
