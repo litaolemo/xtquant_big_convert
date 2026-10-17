@@ -79,6 +79,66 @@ class NativeXtdataGateTest(unittest.TestCase):
             market_mod.BigQmtMarketDataProvider = saved
 
 
+class RpcHandlerNativeGateTest(unittest.TestCase):
+    """The RPC handler builds its own market provider.
+
+    `adapter_factory.build_app` gates native xtdata off for pipe, but
+    `_build_rpc_service` constructs a *second* provider for the handlers.
+    That one used to fall back to the constructor default (True), so a pipe
+    strategy answered `get_instrument_detail` by dialing 127.0.0.1:58610 --
+    the terminal shows `非法IP` in a modal dialog and blocks the strategy
+    thread until every later RPC times out.
+
+    No service is started here (no pipe server, no socket), so this runs on
+    POSIX too.
+    """
+
+    def _build_service(self, rpc):
+        import bigqmt_signal_trader_strategy as strategy
+
+        config = {
+            "account_id": "acct",
+            "enable_rpc": True,
+            "rpc": dict({"enabled": True, "account_id": "acct"}, **rpc),
+            "qmt_api": {},
+            "account_type": "STOCK",
+        }
+        app = types.SimpleNamespace(order_gateway=None, position_sync_sink=None)
+        return strategy._build_rpc_service(types.SimpleNamespace(), app, config)
+
+    def test_helper_defaults_off_for_pipe_and_on_elsewhere(self):
+        import bigqmt_signal_trader_strategy as strategy
+
+        self.assertFalse(strategy._native_xtdata_enabled({"transport": "pipe"}))
+        self.assertTrue(strategy._native_xtdata_enabled({"transport": "zmq"}))
+        self.assertTrue(strategy._native_xtdata_enabled({"transport": "redis"}))
+        self.assertTrue(strategy._native_xtdata_enabled({}))
+
+    def test_explicit_value_wins_over_transport_default(self):
+        import bigqmt_signal_trader_strategy as strategy
+
+        self.assertTrue(strategy._native_xtdata_enabled(
+            {"transport": "pipe", "native_xtdata_enabled": True}))
+        self.assertFalse(strategy._native_xtdata_enabled(
+            {"transport": "redis", "native_xtdata_enabled": False}))
+
+    def test_pipe_handler_provider_never_uses_native_xtdata(self):
+        service = self._build_service({
+            "transport": "pipe",
+            "pipe": {"pipe_name": "bigqmt_rpc"},
+        })
+        self.assertIsNotNone(service)
+        self.assertFalse(service.handlers.market_data.native_xtdata_enabled)
+
+    def test_non_pipe_handler_provider_keeps_native_on(self):
+        service = self._build_service({
+            "transport": "zmq",
+            "zmq": {"connect_address": "tcp://127.0.0.1:20146"},
+        })
+        self.assertIsNotNone(service)
+        self.assertTrue(service.handlers.market_data.native_xtdata_enabled)
+
+
 class ClientRedisGateTest(unittest.TestCase):
     def _trader(self, transport, explicit):
         trader = BigQmtXtTrader(account_id="acct")

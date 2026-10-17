@@ -601,6 +601,29 @@ def _config_bool(value, default=False):
     return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _native_xtdata_enabled(rpc_config):
+    """May the RPC-side market provider use the native xtdata SDK?
+
+    Mirrors ``adapter_factory.build_app``: native SDK calls dial the local
+    quote service (127.0.0.1:58610). On a pipe deployment -- the transport
+    whose whole purpose is "sandbox that kills outbound connects" -- that dial
+    is never acceptable, so native stays off unless the config asks for it
+    explicitly.
+
+    This has to be applied to the provider built for the RPC handlers too,
+    not just the one inside the app: ``_build_rpc_service`` constructs its own
+    provider, and without the gate it defaults to native-on. A pipe strategy
+    in that state answers ``get_instrument_detail`` by dialing 58610, which
+    the QMT terminal reports as ``非法IP:127.0.0.1:58610`` and blocks the
+    strategy thread behind a modal dialog until every later RPC times out.
+    """
+    rpc_config = dict(rpc_config or {})
+    enabled = rpc_config.get("native_xtdata_enabled")
+    if enabled is None:
+        enabled = str(rpc_config.get("transport") or "redis").lower() != "pipe"
+    return bool(enabled)
+
+
 _REDIS_TRANSPORT_NAMES = ("redis", "", "default")
 
 
@@ -782,7 +805,13 @@ def _build_rpc_service(context_info, app, config):
     )
     handlers = BigQmtRpcHandlers(
         account_id=account_id,
-        market_data=BigQmtMarketDataProvider(context_info, qmt_api=qmt_api),
+        market_data=BigQmtMarketDataProvider(
+            context_info,
+            qmt_api=qmt_api,
+            # The handlers build their own provider; without this it defaults
+            # to native-on even on transport=pipe and dials 58610.
+            native_xtdata_enabled=_native_xtdata_enabled(rpc_config),
+        ),
         position_provider=BigQmtPositionProvider(
             get_trade_detail_data_func=qmt_api.get("get_trade_detail_data"),
             account_type=config.get("account_type", "STOCK"),
@@ -1512,7 +1541,11 @@ def _pump_download_jobs(context_info, config):
     if market_data is None:
         from bigqmt_signal_trader.adapters.market_bigqmt import BigQmtMarketDataProvider
 
-        market_data = BigQmtMarketDataProvider(context_info, qmt_api=dict(config.get("qmt_api") or {}))
+        market_data = BigQmtMarketDataProvider(
+            context_info,
+            qmt_api=dict(config.get("qmt_api") or {}),
+            native_xtdata_enabled=_native_xtdata_enabled(config.get("rpc")),
+        )
     try:
         from bigqmt_signal_trader.download_jobs import pump_download_jobs
 
