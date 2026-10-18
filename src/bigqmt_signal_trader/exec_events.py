@@ -20,7 +20,7 @@ import time
 from .order_remarks import recover_order_remarks, bounded_identity_client
 from .redis_safe_value import (
     PREFIX as _ORDER_IDENTITY_PREFIX,
-    LUA_ENCODE,
+    LUA_ENCODE, LUA_RESEGMENT,
     encode_json as _encode_order_identity,
     decode_json,
 )
@@ -508,6 +508,32 @@ return encoded
 """
 
 
+# Bound old all-letter replies before QMT checks the whole batch (#423).
+# This script is read-only: failures can safely use the original MGET/GET path.
+# Like MGET, a non-string key is missing rather than fatal to other identities;
+# any other error (e.g. an ACL denying GET) is raised so that path still runs.
+_READ_ORDER_IDENTITIES = LUA_RESEGMENT + """
+local result = {}
+local prefix = ARGV[1]
+for i, key in ipairs(KEYS) do
+    local raw = redis.pcall('GET', key)
+    if type(raw) == 'table' and raw.err then
+        if string.sub(raw.err, 1, 9) ~= 'WRONGTYPE' then
+            return redis.error_reply(raw.err)
+        end
+        result[i] = 0
+    elseif type(raw) ~= 'string' then
+        result[i] = 0
+    elseif string.sub(raw, 1, #prefix) == prefix then
+        result[i] = safe_resegment(raw, prefix)
+    else
+        result[i] = raw
+    end
+end
+return result
+"""
+
+
 def _decode_order_identity(raw):
     if not raw:
         return None
@@ -631,7 +657,7 @@ def order_identity_map(redis_client, account_id, user_order_ids, limit=500):
     terminal have no remark and stay unattributed -- there is nothing to
     recover.
 
-    One mget rather than N gets: this runs on the main strategy thread, where
+    One batch read rather than N gets: this runs on the main strategy thread, where
     every round trip is charged to the whole bridge.
     """
     wanted = []
@@ -648,8 +674,15 @@ def order_identity_map(redis_client, account_id, user_order_ids, limit=500):
 
     keys = [order_identity_key(account_id, text) for text in wanted]
     raws = None
+    read = getattr(redis_client, "eval", None)
+    if callable(read):
+        try:
+            raws = read(_READ_ORDER_IDENTITIES, len(keys),
+                        *(keys + [_ORDER_IDENTITY_PREFIX]))
+        except Exception:
+            pass
     mget = getattr(redis_client, "mget", None)
-    if mget is not None:
+    if raws is None and mget is not None:
         try:
             raws = mget(keys)
         except Exception:

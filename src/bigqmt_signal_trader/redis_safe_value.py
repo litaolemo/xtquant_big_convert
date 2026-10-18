@@ -30,6 +30,26 @@ end
 """
 
 
+# QMT's stock regex backtracks over non-digit runs (#423). 32 letters per
+# reply chunk cost ~3% extra wire bytes. Start the first chunk with a zero too,
+# so JSON punctuation cannot join short replies into an unbounded run. Each
+# zero has non-digit neighbours and cannot form a six-digit stock code.
+# Storage stays all-letter for byte-for-byte compatibility with old readers.
+_REPLY_CHUNK_LETTERS = 32
+LUA_RESEGMENT = """
+local function safe_resegment(raw, prefix)
+    local token = string.gsub(string.sub(raw, #prefix + 1), '0', '')
+    if #token == 0 or string.find(token, '[^a-p]') then return 0 end
+    local parts = {prefix}
+    for i = 1, #token, CHUNK_LETTERS do
+        parts[#parts + 1] = '0'
+        parts[#parts + 1] = string.sub(token, i, i + CHUNK_LETTERS - 1)
+    end
+    return table.concat(parts)
+end
+""".replace("CHUNK_LETTERS", str(_REPLY_CHUNK_LETTERS))
+
+
 def encode_json(value):
     raw = json.dumps(value, ensure_ascii=False, default=str).encode("utf-8")
     return PREFIX + raw.hex().translate(_DIGIT_ENCODE)
@@ -38,6 +58,7 @@ def encode_json(value):
 def decode_json(raw):
     text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
     if text.startswith(PREFIX):
-        token = text[len(PREFIX):]
+        # Replies have separators; persisted all-letter values do not.
+        token = text[len(PREFIX):].replace("0", "")
         text = bytes.fromhex(token.translate(_DIGIT_DECODE)).decode("utf-8")
     return json.loads(text)

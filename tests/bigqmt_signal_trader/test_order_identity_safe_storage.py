@@ -65,6 +65,14 @@ def _check_response(response):
     return response
 
 
+def _assert_bounded_response(response):
+    text = json.dumps(response, cls=_JsonBytesEncoder)
+    assert max(map(len, re.findall(r"\D+", text)), default=0) <= len(PREFIX) + 32 + 4
+    assert set(re.findall(r"\d+", text)) == {"0"}
+    assert not _STOCK_RE.findall(text)
+    assert _check_response(response) == response
+
+
 def _legacy(remark=REMARK, name=NAME, stock_code="600036.SH", account=ACCOUNT):
     return json.dumps({
         "account_id": account,
@@ -144,6 +152,9 @@ class FilteredRedis(object):
         return True
 
     def eval(self, script, numkeys, *keys_and_args):
+        from bigqmt_signal_trader.exec_events import _MIGRATE_ORDER_IDENTITY
+        if script != _MIGRATE_ORDER_IDENTITY:
+            raise NotImplementedError("batch scripting covered by real Redis tests")
         self.evals.append((script, numkeys, keys_and_args))
         if self.eval_error is not None:
             raise self.eval_error

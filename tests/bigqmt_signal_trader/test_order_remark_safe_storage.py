@@ -2,11 +2,12 @@
 """Real Lua replies pass the same response-wide filter as QMT identity reads."""
 
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
 
-from test_order_identity_safe_storage import DataError, _check_response
+from test_order_identity_safe_storage import DataError, _assert_bounded_response, _check_response
 from test_order_remark_recovery import (
     NO_RETRY, client, handler, recover, redis_socket, row,
 )
@@ -65,8 +66,8 @@ def test_filtered_eval_recovers_after_fresh_handler(client, redis_socket, decode
         assert recovered.user_order_id == recovered.remark == REMARK
         assert vars(missing) == vars(_row(""))
         assert writer.rejected == reader.rejected == 0
-        assert all(not any(c.isdigit() for c in str(value))
-                   for reply in writer.replies + reader.replies for value in reply)
+        for reply in writer.replies + reader.replies:
+            _assert_bounded_response(reply)
     finally:
         fresh.close()
 
@@ -157,3 +158,41 @@ def test_failed_filtered_batch_keeps_every_native_row(client, failure):
     rows = [_row(""), _row("", order_sys_id="second"), _row("native", order_sys_id="third")]
     assert recover(Broken(client), rows) == rows
     assert [item.user_order_id for item in rows] == ["", "", "native"]
+
+
+@pytest.mark.parametrize("decode_responses", [False, True])
+def test_large_lua_remark_reply_has_bounded_runs_and_preserves_storage(client, redis_socket,
+                                                                    decode_responses):
+    import redis
+
+    # Bound the raw reply before running the expensive guard, including RED on
+    # the old codec. A single long remark must be safe as well as many rows.
+    native = [_row(REMARK + str(i), order_sys_id="synthetic-" + str(i)) for i in range(200)]
+    native[-1] = _row("中文600036_1" * 500, order_sys_id="synthetic-199")
+    recover(client, native)
+    stored = {key: (client.get(key), client.pttl(key)) for key in client.keys("*")}
+
+    class BoundedRedis(FilteredRedis):
+        def eval(self, *args):
+            result = self.client.eval(*args)
+            _assert_bounded_response(result)
+            start = time.monotonic()
+            checked = _check_response(result)
+            assert time.monotonic() - start < 5  # structural bound is the main check
+            self.replies.append(result)
+            return checked
+
+    fresh = redis.Redis(unix_socket_path=redis_socket, decode_responses=decode_responses,
+                        socket_timeout=0.25, **NO_RETRY)
+    try:
+        filtered = BoundedRedis(fresh)
+        missing = [_row("", order_sys_id=item.order_sys_id) for item in native]
+        result = recover(filtered, missing)
+        assert [item.user_order_id for item in result] == [item.user_order_id for item in native]
+        assert all(item.user_order_id == "" for item in missing)
+        assert len(filtered.replies) == 1
+        for key, (raw, ttl) in stored.items():
+            assert client.get(key) == raw
+            assert 0 < client.pttl(key) <= ttl
+    finally:
+        fresh.close()

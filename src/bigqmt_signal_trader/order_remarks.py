@@ -14,7 +14,7 @@ import math
 import time
 from urllib.parse import quote
 
-from .redis_safe_value import PREFIX, LUA_ENCODE, decode_json
+from .redis_safe_value import PREFIX, LUA_ENCODE, LUA_RESEGMENT, decode_json
 
 
 LOGGER = logging.getLogger(__name__)
@@ -24,7 +24,7 @@ _last_warning = -float("inf")
 # One atomic operation: learn every native association (including
 # conflicts) before recovering ANY blank in the batch. A conflict stays poisoned
 # until expiry; neither a later blank nor a later native value clears it.
-_OBSERVE_AND_READ = LUA_ENCODE + """
+_OBSERVE_AND_READ = LUA_ENCODE + LUA_RESEGMENT + """
 for i, key in ipairs(KEYS) do
     local observed = ARGV[i + 1]
     local old = redis.call('GET', key)
@@ -51,9 +51,11 @@ local result = {}
 for i, key in ipairs(KEYS) do
     local raw = redis.call('GET', key)
     if raw and raw ~= '!conflict' then
-        result[i] = safe_encode(raw, ARGV[2 + 2 * #KEYS])
+        result[i] = safe_resegment(safe_encode(raw, ARGV[2 + 2 * #KEYS]), ARGV[2 + 2 * #KEYS])
+    elseif raw == '!conflict' then
+        result[i] = -1
     else
-        result[i] = raw or false
+        result[i] = 0
     end
 end
 return result
@@ -179,7 +181,9 @@ def recover_order_remarks(client, account_id, account_type, rows, ttl_seconds):
             raise ValueError("incomplete order remark lookup")
         recovered = []
         for (index, (_, stock, action, observed)), value in zip(wanted, values):
-            if value == b"!conflict" or value == "!conflict":
+            # Integer sentinels also bound runs of missing/conflicting replies
+            # under QMT's response-wide regex; storage stays JSON/!conflict.
+            if value == -1:
                 _warn("Conflicting native order remark association; recovery refused")
                 continue
             if observed or not value:

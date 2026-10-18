@@ -22,6 +22,8 @@ from bigqmt_signal_trader.exec_events import (
     order_identity_map,
     remember_order_identity,
 )
+from bigqmt_signal_trader.redis_safe_value import LUA_ENCODE, LUA_RESEGMENT, decode_json, encode_json
+from test_order_identity_safe_storage import _assert_bounded_response
 
 
 ACCOUNT = "integration-account"
@@ -78,8 +80,13 @@ class _FilteredRedis(object):
 @pytest.fixture(scope="module")
 def _isolated_redis(tmp_path_factory):
     redis = pytest.importorskip("redis")
-    from redis.backoff import NoBackoff
-    from redis.retry import Retry
+    try:
+        from redis.backoff import NoBackoff
+        from redis.retry import Retry
+    except ImportError:
+        no_retry = {"retry_on_timeout": False}
+    else:
+        no_retry = {"retry": Retry(NoBackoff(), 0)}
 
     executable = shutil.which("redis-server")
     if executable is None:
@@ -93,7 +100,7 @@ def _isolated_redis(tmp_path_factory):
     logfile = directory / "redis.log"
     client = redis.Redis(host="127.0.0.1", port=port, db=0,
                          socket_connect_timeout=0.2, socket_timeout=0.5,
-                         retry=Retry(NoBackoff(), 0))
+                         **no_retry)
     options = {}
     if os.name == "nt":
         options["creationflags"] = subprocess.CREATE_NO_WINDOW
@@ -198,7 +205,7 @@ def test_real_lua_migrates_filtered_legacy_without_changing_bytes_or_ttl(real_re
 
     assert _decode_storage(real_redis.get(key)) == raw
     assert abs(_expiry_deadline(real_redis, key) - before) < 50
-    assert len(filtered.evals) == 1
+    assert sum("SETRANGE" in script for script, _, _ in filtered.evals) == 1
     # A fresh client with no submit-time memory reads the migrated record.
     assert order_identity_map(_FilteredRedis(real_redis), ACCOUNT, [REMARK]) == {REMARK: payload}
 
@@ -228,7 +235,7 @@ def test_real_lua_does_not_rewrite_a_mismatched_identity(real_redis, field):
 
     assert real_redis.get(key) == raw
     assert abs(_expiry_deadline(real_redis, key) - before) < 50
-    assert len(filtered.evals) == 1
+    assert sum("SETRANGE" in script for script, _, _ in filtered.evals) == 1
 
 
 def test_real_lua_does_not_resurrect_a_record_that_expires_before_eval(real_redis):
@@ -263,3 +270,69 @@ def test_real_redis_new_record_survives_a_fresh_filtered_client(real_redis):
     assert stored == payload
     assert stored["strategy_name"] == NAME
     assert stored["stock_code"] == "cu2610.SF"
+
+
+@pytest.mark.parametrize("size", [0, 1, 13, 14, 15, 16, 17, 30, 31, 32, 33, 10000])
+def test_real_lua_codec_matches_python_at_chunk_boundaries(real_redis, size):
+    value = "x" * size
+    raw = json.dumps(value, ensure_ascii=False).encode("utf-8")
+    encoded = real_redis.eval(LUA_ENCODE + "return safe_encode(ARGV[1], ARGV[2])",
+                              0, raw, PREFIX)
+    assert not re.search(rb"\d", encoded)
+    reply = real_redis.eval(LUA_RESEGMENT + "return safe_resegment(ARGV[1], ARGV[2])",
+                            0, encoded, PREFIX)
+    _assert_bounded_response([reply] * 200)
+    assert decode_json(reply) == value
+    assert encoded == encode_json(value).encode("ascii")
+    assert decode_json(encoded) == value
+    assert len(encoded) > len(raw)  # SETRANGE must overwrite every old byte
+
+
+def test_real_lua_batch_migration_preserves_long_original_bytes_and_expiry(real_redis):
+    before = {}
+    for i in range(200):
+        remark = "synthetic-" + str(i)
+        _, raw = _legacy(remark=remark)
+        if i == 199:
+            raw = raw[:-1] + b', "padding": "' + b"x" * 10000 + b'"}'
+        key = order_identity_key(ACCOUNT, remark)
+        real_redis.set(key, raw, px=120000)
+        before[key] = (raw, _expiry_deadline(real_redis, key))
+    # Exercise the actual migration script without first returning legacy
+    # values through the guard. Existing per-key fallback semantics stay intact.
+    from bigqmt_signal_trader.exec_events import _MIGRATE_ORDER_IDENTITY
+    replies = [real_redis.eval(_MIGRATE_ORDER_IDENTITY, 1, key, ACCOUNT,
+                              json.loads(raw.decode("utf-8"))["user_order_id"], PREFIX)
+               for key, (raw, _) in before.items()]
+    assert all(not re.search(rb"\d", reply) for reply in replies)
+    for key, (raw, deadline) in before.items():
+        stored = real_redis.get(key)
+        assert len(stored) > len(raw)
+        assert _decode_storage(stored) == raw
+        assert abs(_expiry_deadline(real_redis, key) - deadline) < 50
+
+
+def test_real_redis_reads_old_unseparated_identity_without_rewriting(real_redis):
+    payload, raw = _legacy()
+    key = order_identity_key(ACCOUNT, REMARK)
+    old = PREFIX + raw.hex().translate(str.maketrans("0123456789", "ghijklmnop")).encode("ascii")
+    real_redis.set(key, old, px=120000)
+    deadline = _expiry_deadline(real_redis, key)
+    reader = _FilteredRedis(real_redis)
+    assert order_identity_map(reader, ACCOUNT, [REMARK]) == {REMARK: payload}
+    assert real_redis.get(key) == old
+    assert abs(_expiry_deadline(real_redis, key) - deadline) < 50
+    assert len(reader.evals) == 1
+
+
+def test_real_redis_large_new_identity_batch_needs_no_migration(real_redis):
+    filtered = _FilteredRedis(real_redis)
+    expected = {}
+    for i in range(200):
+        remark = "synthetic-" + str(i)
+        expected[remark] = remember_order_identity(filtered, ACCOUNT, remark, NAME, "600036.SH")
+    values = real_redis.mget([order_identity_key(ACCOUNT, remark) for remark in expected])
+    assert all(not re.search(rb"\d", value) for value in values)
+    assert all(value is not None for value in expected.values())
+    assert order_identity_map(filtered, ACCOUNT, list(expected)) == expected
+    assert len(filtered.evals) == 1
