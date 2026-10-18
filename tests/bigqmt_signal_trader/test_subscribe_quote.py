@@ -312,10 +312,14 @@ class NoDataDiagnosticTest(unittest.TestCase):
         import logging
 
         with self.assertLogs("bigqmt.xtquant_compat", level=logging.WARNING) as caught:
+            # Other asynchronous pollers share this logger. Their warnings
+            # must not end the wait and cancel this subscription prematurely.
+            logging.getLogger("bigqmt.xtquant_compat").warning("unrelated fixture warning")
             seq = data.subscribe_quote("600000.SH", period="1m",
                                        callback=lambda d: None)
             try:
-                self.assertTrue(self._wait(lambda: bool(caught.output)))
+                self.assertTrue(self._wait(lambda: any(
+                    "no 1m bars for 600000.SH" in message for message in caught.output)))
             finally:
                 data.unsubscribe_quote(seq)
 
