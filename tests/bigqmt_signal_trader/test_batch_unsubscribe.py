@@ -10,6 +10,8 @@ instead of swallowed-as-released.
 """
 import os
 import sys
+import threading
+import time
 import unittest
 
 
@@ -177,3 +179,111 @@ class ReplayInterleaveTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReportContractTest(unittest.TestCase):
+    """#427: an issued RPC that answers None must not read as 'nothing to do'."""
+
+    def test_none_report_raises_instead_of_faking_empty(self):
+        bus = InProcPushBus()
+        channel = _CountingChannel(bus)
+        rpc_calls = []
+
+        def rpc_call(method, params):
+            rpc_calls.append((method, dict(params)))
+            if method == "unsubscribe_whole_quote_batch":
+                return None  # a broken/legacy answer: no report at all
+            return {"topic": ",".join(params.get("codes") or [])}
+
+        session = WholeQuoteClientSession(
+            rpc_call=rpc_call, push_channel=channel, client_id="clientA",
+            heartbeat_interval_seconds=60.0)
+        seq = session.subscribe_whole_quote(["600519.SH"], callback=lambda d: None)
+
+        with self.assertRaises(RuntimeError) as caught:
+            session.unsubscribe_quotes([seq])
+
+        self.assertIn("no release report", str(caught.exception))
+        self.assertIn("unsubscribe_whole_quote_batch", rpc_calls[-1][0])
+
+    def test_non_dict_report_raises(self):
+        bus = InProcPushBus()
+        channel = _CountingChannel(bus)
+
+        def rpc_call(method, params):
+            if method == "unsubscribe_whole_quote_batch":
+                return "ok"
+            return {"topic": ",".join(params.get("codes") or [])}
+
+        session = WholeQuoteClientSession(
+            rpc_call=rpc_call, push_channel=channel, client_id="clientA",
+            heartbeat_interval_seconds=60.0)
+        seq = session.subscribe_whole_quote(["600519.SH"], callback=lambda d: None)
+
+        with self.assertRaises(RuntimeError):
+            session.unsubscribe_quotes([seq])
+
+    def test_nothing_to_release_stays_a_quiet_empty_report(self):
+        bus = InProcPushBus()
+        session = _session(bus, [], _CountingChannel(bus))
+
+        report = session.unsubscribe_quotes([])
+
+        self.assertEqual(report, {"released": [], "unknown": [], "native_errors": []})
+
+
+class ReplayRaceTest(unittest.TestCase):
+    """#428: a release landing between the membership check and the subscribe
+    RPC must be undone right after the RPC, not left for the reaper."""
+
+    def test_release_during_subscribe_rpc_is_undone(self):
+        bus = InProcPushBus()
+        channel = _CountingChannel(bus)
+        rpc_calls = []
+        in_subscribe = threading.Event()
+        finish_subscribe = threading.Event()
+        seen = set()
+
+        def rpc_call(method, params):
+            rpc_calls.append((method, dict(params)))
+            if method == "subscribe_whole_quote":
+                seen.add(str(params.get("sub_id")))
+                in_subscribe.set()
+                finish_subscribe.wait(5.0)   # hold the RPC open
+                return {"topic": ",".join(params.get("codes") or [])}
+            if method == "unsubscribe_whole_quote":
+                seen.discard(str(params.get("sub_id")))
+                return {}
+            if method == "unsubscribe_whole_quote_batch":
+                for s in params.get("sub_ids") or []:
+                    seen.discard(str(s))
+                return {"released": list(params.get("sub_ids") or []),
+                        "unknown": [], "native_errors": []}
+            return {}
+
+        session = WholeQuoteClientSession(
+            rpc_call=rpc_call, push_channel=channel, client_id="clientA",
+            heartbeat_interval_seconds=60.0)
+        seq = session.subscribe_whole_quote(["600519.SH"], callback=lambda d: None)
+        assert in_subscribe.wait(2.0) and finish_subscribe.is_set() is False
+        finish_subscribe.set()
+        time.sleep(0.2)
+        in_subscribe.clear()
+        finish_subscribe.clear()
+        rpc_calls.clear()
+
+        thread = threading.Thread(target=session.replay_subscriptions, daemon=True)
+        thread.start()
+        self.assertTrue(in_subscribe.wait(3.0), "replay never issued the subscribe")
+
+        # The release lands while the replay's subscribe RPC is still open.
+        session.unsubscribe_quotes([seq])
+        finish_subscribe.set()
+        thread.join(5.0)
+        self.assertFalse(thread.is_alive(), "replay stuck")
+
+        methods = [m for m, _ in rpc_calls]
+        self.assertIn("subscribe_whole_quote", methods)
+        self.assertIn("unsubscribe_whole_quote", methods,
+                      "the released handle must be un-subscribed right after the RPC")
+        self.assertNotIn(str(seq), seen, "net server state must be released")

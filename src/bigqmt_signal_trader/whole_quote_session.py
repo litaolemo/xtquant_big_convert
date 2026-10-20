@@ -97,6 +97,15 @@ class WholeQuoteClientSession(object):
         finally:
             with self._lock:
                 self._sync_subscriber_locked()
+        if not isinstance(report, dict):
+            # #427: the RPC went out and came back with nothing usable. An
+            # empty report here would read as "nothing to release" while the
+            # server-side state is actually unknown -- fail loud instead.
+            raise RuntimeError(
+                "unsubscribe_whole_quote_batch returned %r: the server gave "
+                "no release report for %d handle(s); their server-side state "
+                "is unknown -- verify with quote_subscription_status "
+                "before assuming they are released" % (report, len(wanted)))
         return report
 
     def has_subscription(self, sub_id):
@@ -125,6 +134,20 @@ class WholeQuoteClientSession(object):
             except Exception as exc:
                 if error is None:
                     error = exc
+            # #428: the membership check above and the RPC are not one
+            # critical section (holding the lock across an RPC would stall
+            # every unsubscribe behind it), so a release can land between
+            # them. Re-check after the RPC: a handle released in that window
+            # is on the server again -- undo it immediately rather than leave
+            # it for the reaper's heartbeat timeout.
+            with self._lock:
+                still_mine = sub_id in self._subscriptions
+            if not still_mine:
+                try:
+                    self._rpc("unsubscribe_whole_quote",
+                              {"client_id": self.client_id, "sub_id": sub_id})
+                except Exception:
+                    pass
         if error is not None:
             raise error
         with self._lock:
