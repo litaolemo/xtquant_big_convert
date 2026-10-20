@@ -3508,6 +3508,44 @@ class BigQmtXtData:
         self._record_subscription(seq, {}, active=False)
         return 0
 
+    def unsubscribe_quotes(self, seqs):
+        """Batch-release whole-quote handles: one RPC, one topic re-sync (#418).
+
+        ``unsubscribe_quote`` per handle costs an RPC plus a subscriber
+        rebuild each -- a 26-handle exit paid 26 RPCs and 25 rebuilds and
+        took seconds. This releases only THIS client's named handles server-
+        side (shared combos stay up for their other subscribers;
+        quote_unsubscribe_all remains the last resort it was). Handles that
+        are K-line pollers keep their per-item semantics (they are local
+        threads, no RPC at all). Returns the server's report: released /
+        unknown / native_errors.
+        """
+        wanted = [s for s in (seqs or [])]
+        session_owned = []
+        session = self._quote_session
+        with self._bar_poller_lock:
+            pollers = []
+            for seq in wanted:
+                poller = self._bar_pollers.pop(seq, None)
+                if poller is not None:
+                    pollers.append((seq, poller))
+                elif session is not None and session.has_subscription(seq):
+                    session_owned.append(seq)
+        for seq, poller in pollers:
+            poller.stop()
+            self._record_subscription(seq, {}, active=False)
+        report = None
+        if session_owned and session is not None:
+            report = session.unsubscribe_quotes(session_owned)
+            for seq in session_owned:
+                self._record_subscription(seq, {}, active=False)
+        for seq in wanted:
+            if seq not in session_owned:
+                self._record_subscription(seq, {}, active=False)
+        if report is None:
+            report = {"released": [], "unknown": [], "native_errors": []}
+        return report
+
     def stop_all_subscriptions(self):
         """Stop every K-line poller this object owns. Daemon threads die with
         the process anyway; this is for tests and for callers that recycle a

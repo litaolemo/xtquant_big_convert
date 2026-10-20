@@ -132,6 +132,7 @@ ORDER_METHODS = {
 QUOTE_SUBSCRIPTION_METHODS = {
     "subscribe_whole_quote",
     "unsubscribe_whole_quote",
+    "unsubscribe_whole_quote_batch",
     "quote_keepalive",
     "quote_unsubscribe_all",
 }
@@ -1582,6 +1583,16 @@ class BigQmtRpcHandlers:
         client_id, sub_id, _codes = self._quote_params(params)
         manager.unsubscribe(client_id, sub_id)
         return {}
+
+    def _handle_unsubscribe_whole_quote_batch(self, params):
+        """Release many sub_ids in one RPC (#418): per-item release cost N
+        RPCs plus N push-subscriber rebuilds on the client."""
+        manager = self._require_quote_manager()
+        client_id = str(params.get("client_id") or "")
+        sub_ids = params.get("sub_ids") or params.get("sub_id") or []
+        if isinstance(sub_ids, (str, int)):
+            sub_ids = [sub_ids]
+        return manager.unsubscribe_batch(client_id, [str(s) for s in sub_ids])
 
     def _handle_quote_keepalive(self, params):
         manager = self._require_quote_manager()
