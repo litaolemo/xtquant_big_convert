@@ -96,6 +96,34 @@ def pipe_path(name=DEFAULT_PIPE_NAME, account_id=""):
     return _PIPE_ROOT + str(name or DEFAULT_PIPE_NAME) + suffix
 
 
+class _ClientHandleFinalizer(object):
+    """一条客户端线程的句柄收尸人（#431）。
+
+    threading.local 的值随线程退出被销毁，这个对象的 __del__ 就在那时
+    触发 —— CPython 只给了这一个「线程退出」钩子。没有它之前，每条线程
+    的管道句柄都活到进程退出：客户端每死一条线程，服务端就白留一条连接
+    （background 模式下还搭一个工作线程），churn 下去一路积到
+    PIPE_UNLIMITED_INSTANCES 上限，之后谁 CreateFileW 都是 PIPE_BUSY。
+
+    释放只认 (ident, token) 全等的注册项：ident 和内核句柄值都会被系统
+    回收复用，只靠其中任何一个比对都可能错关一条活连接的句柄。
+    """
+
+    __slots__ = ("_transport", "_ident", "_token")
+
+    def __init__(self, transport, ident, token):
+        self._transport = transport
+        self._ident = ident
+        self._token = token
+
+    def __del__(self):
+        try:
+            self._transport._release_thread_handle(self._ident, self._token)
+        except Exception:
+            # 解释器退出边缘模块可能已被拆半，句柄由 OS 收，别在这里出事。
+            pass
+
+
 class NamedPipeTransport(RpcTransport):
     """Request/response over a Windows named pipe in message mode.
 
@@ -127,7 +155,9 @@ class NamedPipeTransport(RpcTransport):
         # caller behind one round trip -- exactly the bug #186 fixed for the ZMQ
         # DEALER, and the reason that fix is not worth repeating here.
         self._client_local = threading.local()
-        self._client_handles = []
+        # 注册表 ident -> (handle, token)：线程退出时由 finalizer 精确释放，
+        # finalizer 没跑成的由 _sweep_dead_thread_handles 兜底（#431）。
+        self._client_threads = {}
         # 读缓冲也按线程持有 —— 见 _read_buffer 里的实测数字。
         self._io_local = threading.local()
 
@@ -201,6 +231,7 @@ class NamedPipeTransport(RpcTransport):
         handle = getattr(self._client_local, "handle", None)
         if handle is not None:
             return handle
+        self._sweep_dead_thread_handles()
         dll = self._dll()
         deadline = time.time() + self.connect_timeout_seconds
         while True:
@@ -220,10 +251,69 @@ class NamedPipeTransport(RpcTransport):
             time.sleep(_CONNECT_POLL_SECONDS)
         mode = self._wintypes.DWORD(PIPE_READMODE_MESSAGE)
         dll.SetNamedPipeHandleState(handle, ctypes.byref(mode), None, None)
+        ident = threading.current_thread().ident
+        token = object()
         self._client_local.handle = handle
+        # 赋新 finalizer 会释放掉旧 finalizer 的最后一个引用，它的 __del__
+        # 就地触发 —— 所以注册必须放在赋值之后：旧 finalizer 按 token 找
+        # 自己的条目时，旧条目要么已被 _drop_client_handle 摘掉、要么根本
+        # 没存在过，它必然空转，绝碰不到新句柄。
+        self._client_local.finalizer = _ClientHandleFinalizer(self, ident, token)
         with self._server_lock:
-            self._client_handles.append(handle)
+            stale = self._client_threads.get(ident)
+            self._client_threads[ident] = (handle, token)
+        if stale is not None:
+            # ident 被系统复用、旧线程的 finalizer 又没跑成（非 CPython 的
+            # thread-local 回收时点不保证）。旧线程已死，ident 在我们手上，
+            # 这条注册只可能是死线程的残留，替它关。
+            try:
+                dll.CloseHandle(stale[0])
+            except Exception:
+                pass
         return handle
+
+    def _release_thread_handle(self, ident, token):
+        """线程退出时关它自己的句柄 —— finalizer 的唯一入口。
+
+        必须 (ident, token) 全等才动手：注册表里已是别的 token，说明这个
+        ident 被新线程领走了，旧句柄由新线程注册时的 stale 分支（或
+        _sweep）代关。内核句柄值会被回收复用，错关一次就是杀了一个无辜的
+        活句柄 —— 那种 bug 只会在高并发下偶发，最难查。
+        """
+        with self._server_lock:
+            entry = self._client_threads.get(ident)
+            if entry is None or entry[1] is not token:
+                return
+            del self._client_threads[ident]
+        try:
+            self._dll().CloseHandle(entry[0])
+        except Exception:
+            pass
+
+    def _sweep_dead_thread_handles(self):
+        """finalizer 没跑成的条目在这里兜底，每次新建连接前过一次。
+
+        ident 同一时刻只属于一条活线程，所以不在 threading.enumerate()
+        里的 ident 一定是死线程的残留。finalizer 在 CPython 上是随线程
+        退出即时触发的，这里只为回收时点不保证的运行时（或解释器退出
+        边缘）兜底。
+        """
+        live = set(t.ident for t in threading.enumerate())
+        dead = []
+        with self._server_lock:
+            for ident, entry in list(self._client_threads.items()):
+                if ident in live:
+                    continue
+                del self._client_threads[ident]
+                dead.append(entry[0])
+        if not dead:
+            return
+        dll = self._dll()
+        for handle in dead:
+            try:
+                dll.CloseHandle(handle)
+            except Exception:
+                pass
 
     def _cancel_read(self, handle):
         """Abort whatever ReadFile is pending on the handle -- the timeout
@@ -284,14 +374,15 @@ class NamedPipeTransport(RpcTransport):
         handle = getattr(self._client_local, "handle", None)
         if handle is None:
             return
+        # 本线程还活着，ident 此刻只属于它，按 ident 摘即可。thread-local
+        # 里的旧 finalizer 留下无妨：它触发时按 token 找不到条目，空转。
+        with self._server_lock:
+            self._client_threads.pop(threading.current_thread().ident, None)
         try:
             self._dll().CloseHandle(handle)
         except Exception:
             pass
         self._client_local.handle = None
-        with self._server_lock:
-            if handle in self._client_handles:
-                self._client_handles.remove(handle)
 
     # -- server side -------------------------------------------------------
     def start_receiving(self, on_request, **kwargs):
@@ -513,7 +604,10 @@ class NamedPipeTransport(RpcTransport):
         self._running = False
         with self._server_lock:
             server = list(self._server_handles)
-            clients = list(self._client_handles)
+            clients = [entry[0] for entry in self._client_threads.values()]
+            # 先清空注册表：之后各线程 finalizer 触发时找不到条目，自然不会
+            # 对同一批句柄关第二次。
+            self._client_threads = {}
         # Unblock the accept loop: it is parked in ConnectNamedPipe, which only
         # returns once somebody connects. Connect to our own pipe once.
         if server:
@@ -543,8 +637,6 @@ class NamedPipeTransport(RpcTransport):
                 dll.CloseHandle(handle)
             except Exception:
                 pass
-        with self._server_lock:
-            self._client_handles = []
         self._client_local = threading.local()
         self._io_local = threading.local()
         super(NamedPipeTransport, self).stop()

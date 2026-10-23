@@ -1557,6 +1557,24 @@ class BigQmtRpcClient:
             )
         return self._transport_instance
 
+    def close(self):
+        """Release the swappable transport's connections, if one was built.
+
+        The transport is built lazily and otherwise lives until process exit:
+        every per-thread pipe connection it opened stays up, and a pipe
+        connection costs the server a worker thread each (#431). Called by
+        ``BigQmtXtTrader.stop()``; xtdata-only clients that want the same
+        teardown can call it directly. Safe to call more than once -- the
+        transport is rebuilt lazily if the client is used again afterwards.
+        """
+        transport = self._transport_instance
+        self._transport_instance = None
+        if transport is not None:
+            try:
+                transport.stop()
+            except Exception:
+                pass
+
     def _formula_router(self):
         """Lazily build the FormulaServer router. Never raises — a router that
         cannot be built simply means every read goes over RPC."""
@@ -4751,6 +4769,13 @@ class BigQmtXtTrader:
         if thread is not None and thread.is_alive():
             thread.join(1.0)
         self._event_thread = None
+        # The trader built its client in __init__, so it owns the transport
+        # too: without this, every per-thread pipe connection lives until
+        # process exit, and each one costs the server a worker thread (#431).
+        try:
+            self.client.close()
+        except Exception:
+            pass
         return 0
 
     def _start_event_listener(self):
