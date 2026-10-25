@@ -852,7 +852,8 @@ def _build_rpc_service(context_info, app, config):
     handlers.download_job_redis_client = _store_redis
     handlers.order_identity_redis_client = _store_redis
     handlers.order_remark_redis_client = _exec_events.bounded_identity_client(_store_redis)
-    if _store_redis is None:
+    # #420：无 Redis 默认仍恢复 journal；禁 FileIO 的终端可显式只留内存归属。
+    if _store_redis is None and _config_bool(rpc_config.get("order_identity_persistence"), True):
         # Pipe and other Redis-free transports need a durable source after a
         # real strategy/process restart, when the in-memory journal is gone.
         handlers.enable_order_identity_persistence(

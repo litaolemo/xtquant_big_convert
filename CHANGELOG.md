@@ -2,6 +2,39 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
+## [Unreleased]
+
+### 新增
+
+- **WSL/Linux 客户端经 Windows stdio 中继访问同机管道**（#385/#433）：
+  `pipe.relay_command` 配 argv 列表，Windows 侧运行
+  `python -m bigqmt_signal_trader.transports.pipe_relay`。账号随首帧握手传递，
+  不进 argv；每线程惰性启动并复用进程，线程退出、`close()` / `stop()` 释放（#431）。
+  超时终止中继并抛 `TransportTimeout`，EOF/崩溃抛 `TransportError`，下次调用重建。
+  完整请求帧一旦写入 stdin，任何后续错误都不自动重发；只有 stdin 写入未完成时
+  允许重建重发一次，避免下单/撤单的未知结果变成重复委托（#195/#245）。
+- **QMT 侧零文件 I/O 开关**（#420）：`BIGQMT_REDIS_CONFIG` 新增
+  `log_file_enabled` 和 `order_identity_persistence`。默认仍写日志、无 Redis 时
+  仍用身份 journal；显式 False 时分别只留 stdout、只留内存身份。
+  pipe flat 构建默认关闭两者，已有 Redis/ZMQ 及 no-redis flat 的默认行为不变。
+
+### 修复
+
+- **flat 入口漏绑 QMT 下载/公式全局**（#202 同类）：pipe/no-redis 共用入口改为
+  `capture_qmt_injected_funcs(globals())`，不再手抄函数名单。只有单票下载全局的
+  终端也能让 `download_history_data2` 正常逐票回落。
+- **客户端首次并发调用与关闭共用 transport owner**（#431）：避免同时建出多个
+  实例却只关闭最后一个；显式构造参数中的 `pipe` 配置也完整传到工厂。
+- RPC 管道、事件管道和能力探测创建管道时均加 `PIPE_REJECT_REMOTE_CLIENTS`，
+  拒绝远程 SMB 客户端；同机消息格式不变。
+
+### 测试
+
+- 增加 pipe flat 真实构建/exec 门禁：禁用文件及 socket 调用后运行 init、adjust、
+  inline/deferred 分发和下载回落；记录被吞掉的禁调用，避免「没崩溃」被误当零 I/O。
+- 增加 stdio 分帧、大包、未知结果不重发、短写重试、超时和线程生命周期测试；
+  真 Windows 管道中继 e2e 在非 Windows 平台跳过。
+
 ## [0.3.73] - 2026-10-24
 
 ### 文档与测试

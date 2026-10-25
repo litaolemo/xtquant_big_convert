@@ -285,6 +285,8 @@ def _report_account_type():
 
 _report_deployment()
 _report_account_type()
+LOG_FILE_ENABLED = bool(BIGQMT_REDIS_CONFIG.get("log_file_enabled", True))
+ORDER_IDENTITY_PERSISTENCE = bool(BIGQMT_REDIS_CONFIG.get("order_identity_persistence", True))
 REDIS_ENABLED = bool(BIGQMT_REDIS_CONFIG.get("redis_enabled", REDIS_ENABLED))
 # 「redis_enabled 是否被显式写过」要单独记：pipe 这类沙箱传输默认不下发
 # redis 块，但显式 redis_enabled=True 的部署是真的要 redis 附加能力。
@@ -392,6 +394,8 @@ def _redis_block():
 
 
 def _apply_config(account_id):
+    from bigqmt_signal_trader.logging_setup import configure_file_logging
+    configure_file_logging(LOG_FILE_ENABLED)
     account_id = str(account_id or "")
     if account_id:
         set_account_id(account_id)
@@ -399,6 +403,7 @@ def _apply_config(account_id):
         "enabled": True,
         "account_id": account_id,
         "allow_order_methods": RPC_ALLOW_ORDER_METHODS,
+        "order_identity_persistence": ORDER_IDENTITY_PERSISTENCE,
         "default_strategy_name": RPC_DEFAULT_STRATEGY_NAME,
         "request_channel_template": "bigqmt:rpc:req:{account_id}",
         "response_channel_template": "bigqmt:rpc:resp:{account_id}:{request_id}",
@@ -477,8 +482,12 @@ def configure_runtime_account(account_id):
 
 
 def configure_runtime_redis(redis_config):
+    global LOG_FILE_ENABLED, ORDER_IDENTITY_PERSISTENCE
     global REDIS_ENABLED, REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD, RPC_ALLOW_ORDER_METHODS, RPC_DEFAULT_STRATEGY_NAME, RPC_PROCESS_IN_LISTENER, RPC_BACKGROUND_THREADS, RPC_LISTENER_METHODS, SCHEDULE_ADJUST_ENABLED, SCHEDULE_ADJUST_INTERVAL, FULL_TICK_CACHE_ENABLED, FULL_TICK_DEMAND_TTL_SECONDS, FULL_TICK_CACHE_TTL_SECONDS, FULL_TICK_REFRESH_INTERVAL_SECONDS, FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS, FULL_TICK_REFRESH_MAX_WALL_SECONDS, FULL_TICK_MAX_REQUESTS, RPC_TRANSPORT, RPC_ZMQ_CONFIG, RPC_MYSQL_CONFIG, RPC_PIPE_CONFIG, QUOTE_PUSH_CONFIG, DOWNLOAD_JOBS_ENABLED, DOWNLOAD_JOB_CHUNK_SIZE, DOWNLOAD_JOB_MAX_WALL_SECONDS, DOWNLOAD_JOB_TTL_SECONDS, EXEC_EVENTS_ENABLED, EXEC_EVENTS_DEBUG_RAW_FIELDS, EXEC_EVENTS_HOLD_PRESYSID_SECONDS, RPC_BACKGROUND_THREADS_EXPLICIT, RPC_DRAIN_BUDGET_SECONDS, RPC_HEAVY_OFFLOAD, RPC_HEAVY_CODES_THRESHOLD, REDIS_ENABLED_EXPLICIT, RPC_NATIVE_XTDATA_ENABLED, RPC_ORDER_SETTLE_TIMEOUT_SECONDS
     redis_config = dict(redis_config or {})
+    LOG_FILE_ENABLED = bool(redis_config.get("log_file_enabled", LOG_FILE_ENABLED))
+    ORDER_IDENTITY_PERSISTENCE = bool(redis_config.get(
+        "order_identity_persistence", ORDER_IDENTITY_PERSISTENCE))
     RPC_BACKGROUND_THREADS_EXPLICIT = "rpc_background_threads" in redis_config
     REDIS_ENABLED_EXPLICIT = "redis_enabled" in redis_config
     if redis_config.get("native_xtdata_enabled") is not None:

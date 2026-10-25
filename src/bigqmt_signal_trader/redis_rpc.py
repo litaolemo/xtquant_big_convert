@@ -1286,7 +1286,7 @@ class BigQmtRpcHandlers:
             path = "%s%s" % (chr(92) * 2 + "." + chr(92) + "pipe" + chr(92),
                              "bigqmt_whitelist_probe")
             handle = dll.CreateNamedPipeW(path, 0x00000003,
-                                          0x00000004 | 0x00000002 | 0x00000000,
+                                          0x00000004 | 0x00000002 | 0x00000008,  # PIPE_REJECT_REMOTE_CLIENTS
                                           1, 4096, 4096, 0, None)
             invalid = ctypes.c_void_p(-1).value
             if handle == invalid:

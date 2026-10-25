@@ -594,21 +594,9 @@ except Exception as account_config_error:
         _runtime.configure_runtime_account(account_id)
 
 try:
-    qmt_extra = {}
-    for function_name in (
-        "get_history_trade_detail_data", "get_value_by_order_id", "get_last_order_id",
-        "get_ipo_data", "get_new_purchase_limit", "get_assure_contract",
-        "get_enable_short_contract", "get_unclosed_compacts", "get_closed_compacts",
-        "get_debt_contract", "get_option_subject_position", "get_comb_option",
-        "get_hkt_exchange_rate",
-    ):
-        if function_name in globals():
-            qmt_extra[function_name] = globals()[function_name]
+    # #202：QMT 只往挂载入口注入全局，所有 flat 构建共用策略的唯一名单。
     _runtime.bind_runtime_api(
-        passorder_func=globals().get("passorder"),
-        cancel_func=globals().get("cancel"),
-        get_trade_detail_data_func=globals().get("get_trade_detail_data"),
-        extra_funcs=qmt_extra or None,
+        extra_funcs=_runtime.capture_qmt_injected_funcs(globals()),
     )
 except NameError:
     pass

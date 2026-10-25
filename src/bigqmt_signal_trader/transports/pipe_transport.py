@@ -50,6 +50,7 @@ PIPE_ACCESS_DUPLEX = 0x00000003
 PIPE_TYPE_MESSAGE = 0x00000004
 PIPE_READMODE_MESSAGE = 0x00000002
 PIPE_WAIT = 0x00000000
+PIPE_REJECT_REMOTE_CLIENTS = 0x00000008  # 同机信任边界：拒绝 SMB 远程客户端。
 PIPE_UNLIMITED_INSTANCES = 255
 GENERIC_READ = 0x80000000
 GENERIC_WRITE = 0x40000000
@@ -411,7 +412,7 @@ class NamedPipeTransport(RpcTransport):
         while self._running:
             handle = dll.CreateNamedPipeW(
                 self.path, PIPE_ACCESS_DUPLEX,
-                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 PIPE_UNLIMITED_INSTANCES, _BUFFER_BYTES, _BUFFER_BYTES, 0, None)
             if handle == INVALID_HANDLE_VALUE:
                 if not self._running:

@@ -42,6 +42,7 @@ from .pipe_transport import (
     OPEN_EXISTING,
     PIPE_READMODE_MESSAGE,
     PIPE_TYPE_MESSAGE,
+    PIPE_REJECT_REMOTE_CLIENTS,
     PIPE_ACCESS_DUPLEX,
     PIPE_UNLIMITED_INSTANCES,
     PIPE_WAIT,
@@ -99,7 +100,7 @@ class PipeQuotePushChannel(object):
             # is still one-directional in practice -- clients never write.
             handle = dll.CreateNamedPipeW(
                 self.bind_address, PIPE_ACCESS_DUPLEX,
-                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 PIPE_UNLIMITED_INSTANCES, _BUFFER_BYTES, _BUFFER_BYTES, 0, None)
             if handle == INVALID_HANDLE_VALUE:
                 if not self._running:
