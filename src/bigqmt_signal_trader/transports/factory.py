@@ -36,6 +36,8 @@ def transport_supports_drain(name):
             from .mysql_transport import MysqlTransport as cls
         elif name == "pipe":
             from .pipe_transport import NamedPipeTransport as cls
+        elif name == "shm":
+            from .shm_transport import SharedMemoryTransport as cls
         else:
             return False
     except ImportError:

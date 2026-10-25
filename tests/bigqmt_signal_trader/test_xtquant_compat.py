@@ -810,6 +810,61 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(transport.connect_address, "tcp://127.0.0.1:20146")
         self.assertIsNone(transport.discovery_redis_client)
 
+    def test_shm_constructor_config_reaches_the_transport_without_redis(self):
+        client = BigQmtRpcClient(
+            account_id="acct",
+            redis_config={
+                "transport": "shm",
+                "shm": {"slot_size": 4096, "slots": 16,
+                        "name_prefix": "constructor_probe"},
+            },
+        )
+        client._redis = lambda: (_ for _ in ()).throw(
+            AssertionError("shm must not build a Redis client"))
+
+        transport = client._transport()
+
+        self.assertEqual(transport.name, "shm")
+        self.assertEqual(transport.slot_size, 4096)
+        self.assertEqual(transport.slots, 16)
+        self.assertEqual(transport.name_prefix, "constructor_probe")
+
+    def test_lazy_transport_initialization_happens_only_once_under_concurrency(self):
+        import threading
+        import time
+        from unittest import mock
+
+        client = BigQmtRpcClient(
+            account_id="acct",
+            redis_config={"transport": "shm", "shm": {"name_prefix": "race_probe"}},
+        )
+        sentinel = object()
+        calls = []
+        barrier = threading.Barrier(8)
+        results = []
+
+        def fake_build(*args, **kwargs):
+            calls.append((args, kwargs))
+            time.sleep(0.05)
+            return sentinel
+
+        def worker():
+            barrier.wait()
+            results.append(client._transport())
+
+        with mock.patch(
+            "bigqmt_signal_trader.transports.factory.build_transport",
+            side_effect=fake_build,
+        ):
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=2)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(results, [sentinel] * 8)
+
     def test_pure_zmq_quote_metadata_does_not_build_redis_client(self):
         """纯 ZMQ 的兼容订阅元数据不能隐式连接 Redis。"""
         client = BigQmtRpcClient(account_id="acct", redis_config={"transport": "zmq"})

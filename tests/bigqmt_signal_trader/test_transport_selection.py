@@ -43,12 +43,13 @@ class BackgroundThreadResolutionTest(unittest.TestCase):
         self.assertFalse(_resolve_background_threads("mysql", False))
         self.assertTrue(_resolve_background_threads("mysql", True))
 
-    def test_drainless_transports_ignore_the_override(self):
-        # shm has no drain_request_queue: without the receiver thread requests
-        # would never be picked up, so even an explicit False cannot turn it
-        # off here.
-        self.assertTrue(_resolve_background_threads("shm", None))
-        self.assertTrue(_resolve_background_threads("shm", False))
+    def test_shm_hears_the_override_now_that_it_has_a_drain(self):
+        # shm implements drain_request_queue (polled from the strategy's
+        # run_time timer -- measured on the live terminal, a receive thread
+        # started in QMT init is never scheduled), so an absent key drains and
+        # an explicit True still buys the thread for a non-QMT supervisor.
+        self.assertFalse(_resolve_background_threads("shm", None))
+        self.assertFalse(_resolve_background_threads("shm", False))
         self.assertTrue(_resolve_background_threads("shm", True))
 
     def test_is_redis_transport(self):

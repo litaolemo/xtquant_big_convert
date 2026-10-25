@@ -40,7 +40,8 @@ import bigqmt_signal_trader_redis_rpc_runtime as runtime
 
 class _RuntimeState(unittest.TestCase):
     KEYS = ("REDIS_ENABLED", "RPC_TRANSPORT", "REDIS_HOST", "REDIS_PORT", "REDIS_DB",
-            "REDIS_ENABLED_EXPLICIT", "RPC_PIPE_CONFIG")
+            "REDIS_ENABLED_EXPLICIT", "RPC_PIPE_CONFIG", "RPC_SHM_CONFIG",
+            "RPC_NATIVE_XTDATA_ENABLED")
 
     def setUp(self):
         self._saved = {k: getattr(runtime, k) for k in self.KEYS}
@@ -262,6 +263,31 @@ class PipeConfigReadingTest(_RuntimeState):
 
         runtime.configure_runtime_redis({"transport": "pipe", "redis_enabled": True})
         self.assertTrue(runtime.REDIS_ENABLED_EXPLICIT)
+
+
+class ShmConfigReadingTest(_RuntimeState):
+    def test_configure_runtime_redis_reads_the_shm_block(self):
+        expected = {"slot_size": 65536, "slots": 16, "name_prefix": "probe\\"}
+        runtime.configure_runtime_redis({"transport": "shm", "shm": expected})
+
+        self.assertEqual("shm", runtime.RPC_TRANSPORT)
+        self.assertEqual(expected, runtime.RPC_SHM_CONFIG)
+
+    def test_shm_disables_the_native_network_data_path_by_default(self):
+        runtime.RPC_TRANSPORT = "shm"
+        runtime.RPC_NATIVE_XTDATA_ENABLED = None
+        captured = {}
+        saved_configure = runtime.configure
+        saved_set_account_id = runtime.set_account_id
+        runtime.configure = lambda **kwargs: captured.update(kwargs)
+        runtime.set_account_id = lambda account_id: None
+        try:
+            runtime._apply_config("")
+        finally:
+            runtime.configure = saved_configure
+            runtime.set_account_id = saved_set_account_id
+
+        self.assertFalse(captured["rpc"]["native_xtdata_enabled"])
 
 
 class ModuleLevelReadTest(unittest.TestCase):

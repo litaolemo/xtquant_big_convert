@@ -1491,6 +1491,8 @@ class BigQmtRpcClient:
         self.zmq_config = dict(merged_redis_config.get("zmq") or {})
         self.mysql_config = dict(merged_redis_config.get("mysql") or {})
         self.pipe_config = dict(merged_redis_config.get("pipe") or {})
+        self.shm_config = dict(merged_redis_config.get("shm") or {})
+        self._transport_lock = threading.Lock()
         self._transport_instance = None  # lazily built by _transport()
         # FormulaServer read fast-path. QMT's C++ quote service (port 58600)
         # answers reference/history reads in ~0.07ms without touching the QMT
@@ -1526,35 +1528,40 @@ class BigQmtRpcClient:
 
     def _transport(self):
         if self._transport_instance is None:
-            if self.transport_name in ("redis", "", "default"):
-                # Legacy path: call_redis_rpc builds its own request envelope.
-                return None
-            from .transports.factory import build_transport
+            with self._transport_lock:
+                if self._transport_instance is None:
+                    if self.transport_name in ("redis", "", "default"):
+                        # Legacy path: call_redis_rpc builds its own request envelope.
+                        return None
+                    from .transports.factory import build_transport
 
-            client_config = load_client_config()
-            config_redis = dict(client_config.get("redis_config") or {})
-            zmq_config = dict(config_redis.get("zmq") or {})
-            zmq_config.update(self.zmq_config)
-            # ZMQ must work without Redis. Discovery is opt-in and unnecessary
-            # when connect_address is explicitly configured.
-            if (
-                not zmq_config.get("connect_address")
-                and bool(zmq_config.get("redis_discovery_enabled", False))
-            ):
-                zmq_config.setdefault("discovery_redis_client", self._redis())
-            factory_config = {
-                "zmq": zmq_config,
-                "mysql": dict(config_redis.get("mysql") or {}, **self.mysql_config),
-                # 管道名两侧必须一致，否则客户端连的是另一条线 —— 表现为
-                # 「连不上」而不是「配错了」，最难查的那种。
-                "pipe": dict(config_redis.get("pipe") or {}),
-            }
-            self._transport_instance = build_transport(
-                self.transport_name,
-                factory_config,
-                account_id=self.account_id,
-                print_prefix="[bigqmt_client]",
-            )
+                    client_config = load_client_config()
+                    config_redis = dict(client_config.get("redis_config") or {})
+                    zmq_config = dict(config_redis.get("zmq") or {})
+                    zmq_config.update(self.zmq_config)
+                    # ZMQ must work without Redis. Discovery is opt-in and unnecessary
+                    # when connect_address is explicitly configured.
+                    if (
+                        not zmq_config.get("connect_address")
+                        and bool(zmq_config.get("redis_discovery_enabled", False))
+                    ):
+                        zmq_config.setdefault("discovery_redis_client", self._redis())
+                    factory_config = {
+                        "zmq": zmq_config,
+                        "mysql": dict(config_redis.get("mysql") or {}, **self.mysql_config),
+                        # 管道名两侧必须一致，否则客户端连的是另一条线 —— 表现为
+                        # 「连不上」而不是「配错了」，最难查的那种。
+                        "pipe": dict(config_redis.get("pipe") or {}),
+                        # 共享内存同理：前缀与槽位尺寸必须与服务端逐字节一致，
+                        # 构造参数里的 shm 块优先于模块配置。
+                        "shm": dict(config_redis.get("shm") or {}, **self.shm_config),
+                    }
+                    self._transport_instance = build_transport(
+                        self.transport_name,
+                        factory_config,
+                        account_id=self.account_id,
+                        print_prefix="[bigqmt_client]",
+                    )
         return self._transport_instance
 
     def _formula_router(self):

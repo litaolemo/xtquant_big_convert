@@ -173,10 +173,16 @@ class FactoryTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_transport("nonsense", {}, account_id="x")
 
-    def test_shm_raises_on_use(self):
-        shm = build_transport("shm", {}, account_id="x")
-        with self.assertRaises(TransportError):
+    def test_shm_is_a_real_transport_that_refuses_a_missing_region(self):
+        # shm used to be a stub that raised "not implemented". It is now a
+        # working transport; a client with no live server must fail with the
+        # diagnosis (which end is missing), not a generic unsupported error.
+        shm = build_transport("shm", {"shm": {"connect_timeout_seconds": 0.1}},
+                              account_id="shm-no-such-server")
+        self.addCleanup(shm.stop)
+        with self.assertRaises(TransportError) as caught:
             shm.send_request(_build_request(), 1.0)
+        self.assertIn("does not exist", str(caught.exception))
 
     def test_redis_factory_with_injected_clients(self):
         sentinel_listen = object()
