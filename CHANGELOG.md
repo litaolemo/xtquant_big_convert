@@ -6,9 +6,8 @@
 
 ### 新增
 
-- **WSL/Linux 客户端经 Windows stdio 中继访问同机管道**（#385/#433）：
-  `pipe.relay_command` 配 argv 列表，Windows 侧运行
-  `python -m bigqmt_signal_trader.transports.pipe_relay`。账号随首帧握手传递，
+- **WSL/Linux 客户端经 Windows stdio 中继使用同机零依赖传输**（#385/#433）：
+  以 argv 列表配置中继启动命令。账号随首帧握手传递，
   不进 argv；每线程惰性启动并复用进程，线程退出、`close()` / `stop()` 释放（#431）。
   超时终止中继并抛 `TransportTimeout`，EOF/崩溃抛 `TransportError`，下次调用重建。
   完整请求帧一旦写入 stdin，任何后续错误都不自动重发；只有 stdin 写入未完成时
@@ -16,7 +15,7 @@
 - **QMT 侧零文件 I/O 开关**（#420）：`BIGQMT_REDIS_CONFIG` 新增
   `log_file_enabled` 和 `order_identity_persistence`。默认仍写日志、无 Redis 时
   仍用身份 journal；显式 False 时分别只留 stdout、只留内存身份。
-  pipe flat 构建默认关闭两者，已有 Redis/ZMQ 及 no-redis flat 的默认行为不变。
+  同机零依赖部署的 flat 构建默认关闭两者，已有 Redis/ZMQ 及 no-redis flat 的默认行为不变。
 - **tick 预热等待可配置**（#310/#351）：`BIGQMT_REDIS_CONFIG.full_tick_warmup_wait_seconds`
   缺省仍为 2.0 秒；设为 0 时继续订阅、登记分组，但本次不轮询等待。
   `probe_capabilities.thread_routing` 返回实际 `heavy_codes_threshold` 和预热等待秒数，
@@ -24,33 +23,32 @@
 
 ### 修复
 
-- **管道迟到回包不能串到复用句柄的新连接**（#431 后续）：请求绑定连接对象，
+- **同机零依赖传输的迟到回包不能串到复用句柄的新连接**（#431 后续）：请求绑定连接对象，
   关闭、停止后丢弃旧回包，I/O 与关闭共用锁；原生和中继客户端都校验
   `request_id`，错配即弃用连接并抛 `TransportError`，绝不重发。
-- **RPC/事件管道停止等待 accept 真正退出**：实例创建后的登记与停止状态检查同锁，
+- **RPC/事件通道停止等待 accept 真正退出**：实例创建后的登记与停止状态检查同锁，
   创建到登记之间遇到 stop 的实例由创建者关闭；自连唤醒阻塞 accept，退出后才交还名字。
 - **drain 回包只发送一次**：移除 `deliver()` 已回包后的重复写入，避免下一请求读到上一条结果。
 - **flat 同进程重跑不再递归调用 import hook**（#420）：保留原始 import/reload 函数，
   第二次 exec 清理旧服务并重建模块后，普通模块的导入与重载仍正常。
-- **原生管道清扫不再误关新注册的活线程句柄**（#431 后续）：存活线程快照改为在
+- **原生连接清扫不再误关新注册的活线程句柄**（#431 后续）：存活线程快照改为在
   注册锁内获取，避免快照之后、清扫之前注册的连接被当成死线程回收。
-- **flat 入口漏绑 QMT 下载/公式全局**（#202 同类）：pipe/no-redis 共用入口改为
+- **flat 入口漏绑 QMT 下载/公式全局**（#202 同类）：两种 flat 共用入口改为
   `capture_qmt_injected_funcs(globals())`，不再手抄函数名单。只有单票下载全局的
   终端也能让 `download_history_data2` 正常逐票回落。
 - **客户端首次并发调用与关闭共用 transport owner**（#431）：避免同时建出多个
-  实例却只关闭最后一个；显式构造参数中的 `pipe` 配置也完整传到工厂。
-- RPC 管道、事件管道和能力探测创建管道时均加 `PIPE_REJECT_REMOTE_CLIENTS`，
-  拒绝远程 SMB 客户端；同机消息格式不变。
+  实例却只关闭最后一个；显式构造参数中的同机传输配置也完整传到工厂。
+- RPC、事件通道及能力探测创建实例时均拒绝远程 SMB 客户端；同机消息格式不变。
 
 ### 测试
 
 - 增加迟到 heavy 回包与句柄复用、写入/关闭交错、accept 停止窗口、客户端错配不重发、
   tick 预热 0/默认等待及 64/65 票真实分发边界回归。
-- 增加 pipe flat 真实构建/exec 门禁：禁用文件及 socket 调用后运行 init、adjust、
+- 增加无 socket 部署的 flat 真实构建/exec 门禁：禁用文件及 socket 调用后运行 init、adjust、
   inline/deferred 分发和下载回落；首次及同进程第二次 exec 均断言真实结果、禁调用零次，
   即使日志/journal 吞掉异常也不能漏检。
 - 增加 stdio 分帧、大包、未知结果不重发、短写重试、超时和线程生命周期测试；
-  真 Windows 管道中继 e2e 在非 Windows 平台跳过。
+  真 Windows stdio 中继 e2e 在非 Windows 平台跳过。
 
 ## [0.3.73] - 2026-10-24
 

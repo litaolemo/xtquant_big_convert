@@ -102,61 +102,6 @@ BIGQMT_REDIS_CONFIG = {
 
 或环境变量：`export BIGQMT_RPC_TRANSPORT=zmq`
 
-## WSL 经 stdio 中继访问同机管道
-
-QMT 在 Windows，客户端在同一台机器的 WSL 时，WSL 不能直接打开 `\\.\pipe`。
-在 Windows Python 环境安装同一版本的包，然后在客户端配置：
-
-```python
-BIGQMT_REDIS_CONFIG = {
-    "transport": "pipe",
-    "pipe": {
-        "pipe_name": "bigqmt_rpc",  # 与服务端一致，账号自动拼到管道名后面
-        "connect_timeout_seconds": 5,
-        "relay_command": [
-            "/mnt/d/ashare-qmt/.venv/Scripts/python.exe", "-I", "-B", "-m",
-            "bigqmt_signal_trader.transports.pipe_relay",
-        ],
-    },
-}
-```
-
-`relay_command` 是 argv 列表，不经过 shell；非 Windows 客户端配置后才启用中继，
-Windows 客户端仍走原生管道。也可把同样的配置传给
-`BigQmtRpcClient(account_id=..., redis_config=BIGQMT_REDIS_CONFIG)`。
-Linux/macOS 上可用同一接口测试假中继；真实中继必须运行在拥有 QMT 管道的 Windows
-主机上，不能用它跨机器连接。`-B` 禁止 Windows Python 生成 `.pyc`。
-
-每个调用线程惰性启动一个常驻中继，冷启动只付一次；线程退出时释放，
-`client.close()` / `trader.stop()` 关闭全部中继。握手首帧携带完整管道路径，账号
-不进进程 argv。连接时对 `PIPE_BUSY` / `FILE_NOT_FOUND` 在期限内重试。
-stdin/stdout 都是二进制帧（4 字节大端长度 + payload，单帧上限 256 MiB）；
-握手是含 `pipe_path`、`connect_timeout_seconds` 的 UTF-8 JSON，成功回空帧，
-之后每帧对应原生管道的一条 JSON 消息。诊断仅写 stderr。中继收到 stdin EOF 即退出，
-包括正在等待管道回复时。
-
-**一次调用的超时覆盖启动、握手、写入和读回。** 超时终止中继并抛 `TransportTimeout`；
-EOF、崩溃或坏响应抛 `TransportError`，下次显式调用重建连接。原生和中继客户端都
-核对响应 `request_id`，错配会废弃当前连接并抛错，绝不自动重发。完整请求帧写入 stdin
-后，任何错误都不自动重发。只有 stdin 写入失败且尚未写完一帧时，才允许重建后重试
-一次。下单/撤单遇到未知结果，应核对委托状态，不能把重连当作重新提交的依据。
-
-QMT 禁止文件/网络 I/O 时用 `python tools/build_pipe_single_file_flat.py` 构建入口。
-pipe flat 默认 `log_file_enabled=False`、`order_identity_persistence=False`；其他
-部署可在 `BIGQMT_REDIS_CONFIG` 显式设置，两个键缺省时均保留原行为。
-关闭文件日志会保留 stdout（仍受原 stdout 开关控制）；关闭 journal 后身份仅存内存，
-策略重启无法从本地文件恢复。服务端不需要配置 `relay_command`，消息格式不变。
-所有服务端管道均拒绝远程客户端；同机访问权限仍由 Windows DACL 管理。
-请求绑定连接对象，断开或停止后的迟到回包直接丢弃；停止会等待 RPC/事件 accept
-线程退出，再由重跑后的模型接手管道名。
-
-drain 模式希望小批 tick 读立即返回时，可在 QMT 侧 `BIGQMT_REDIS_CONFIG` 设置
-`"full_tick_warmup_wait_seconds": 0`。缺票仍会订阅预热并登记分组，只跳过本次等待；
-后续请求可获得预热后的报价。此键缺省仍为 2.0 秒，包括 pipe flat。
-`probe_capabilities()["thread_routing"]` 可读回实际 `full_tick_warmup_wait_seconds`
-和 `heavy_codes_threshold`；例如设置 `"rpc_heavy_codes_threshold": 64` 后，64 票
-仍内联、65 票转 heavy worker（启用 `rpc_heavy_offload` 时）。
-
 ## 策略名与重启恢复
 
 RPC 通道与策略归属存储是两件事。`zmq` 等模式若同时配置 Redis，身份记录仍经
