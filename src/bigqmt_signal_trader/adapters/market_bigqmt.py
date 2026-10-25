@@ -657,8 +657,10 @@ def _load_native_xtdata():
 
 class BigQmtMarketDataProvider:
     def __init__(self, context_info, native_xtdata=None, qmt_api=None,
-                 native_xtdata_enabled=True):
+                 native_xtdata_enabled=True, full_tick_warmup_wait_seconds=None):
         self.context_info = context_info
+        if full_tick_warmup_wait_seconds is not None:
+            self.full_tick_warmup_wait_seconds = full_tick_warmup_wait_seconds
         # Allow injection for tests; otherwise resolve lazily on first use.
         self._native_xtdata = native_xtdata
         self.qmt_api = dict(qmt_api or {})
@@ -1078,6 +1080,19 @@ class BigQmtMarketDataProvider:
     TICK_SUBSCRIBE_POLL_SECONDS = 0.1
     TICK_SUBSCRIBE_IDLE_SECONDS = 300.0
 
+    @property
+    def full_tick_warmup_wait_seconds(self):
+        # 未显式配置时仍用 #310 的 2 秒；保留旧代码调整类常量的行为。
+        return getattr(self, "_full_tick_warmup_wait_seconds", self.TICK_SUBSCRIBE_WAIT_SECONDS)
+
+    @full_tick_warmup_wait_seconds.setter
+    def full_tick_warmup_wait_seconds(self, value):
+        import math
+        value = float(value)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("full_tick_warmup_wait_seconds must be finite and non-negative")
+        self._full_tick_warmup_wait_seconds = value
+
     def _tick_subscription_state(self):
         state = getattr(self, "_tick_subscription_state_dict", None)
         if state is None:
@@ -1147,7 +1162,7 @@ class BigQmtMarketDataProvider:
 
     def _recover_unsubscribed_ticks(self, targets, query_codes, data):
         """Subscribe the requested codes the snapshot left unanswered, then
-        re-read until they appear or TICK_SUBSCRIBE_WAIT_SECONDS elapses.
+        re-read until they appear or full_tick_warmup_wait_seconds elapses.
 
         Only codes with no warm-up subscription yet are subscribed and waited
         for. A code that is already subscribed and still unanswered is QMT's
@@ -1187,7 +1202,12 @@ class BigQmtMarketDataProvider:
             state["groups"].append(group)
             for code in fresh:
                 state["by_code"][code] = group
-        deadline = now + float(self.TICK_SUBSCRIBE_WAIT_SECONDS)
+        wait = self.full_tick_warmup_wait_seconds
+        # #310/#351：drain 的小批读不能被等待卡住；0 只跳过等待，订阅与
+        # 分组登记已经完成，后续请求仍可读到预热后的行情并正常回收订阅。
+        if wait == 0:
+            return data
+        deadline = now + wait
         poll = float(self.TICK_SUBSCRIBE_POLL_SECONDS)
         while True:
             time.sleep(poll)

@@ -20,6 +20,7 @@ Behavior:
 - Each record is also printed to stdout so the QMT output panel still shows it.
 - Thread-safe (logging is; the print side is best-effort wrapped).
 - Never raises: a logging failure must not bring down the strategy.
+- Disable file I/O via BIGQMT_REDIS_CONFIG["log_file_enabled"]=False.
 - Opt out via env BIGQMT_LOG_ENABLED=0 / BIGQMT_LOG_TO_STDOUT=0.
 """
 
@@ -40,6 +41,23 @@ except ImportError:
 
 _LOGGER_NAME = "bigqmt"
 _initialized = False
+# 必须在首个 get_logger 之前读配置：provider 在模块导入时就取 logger，
+# 等到 runtime.init 才关闭文件日志，已经探测/建目录了（#420）。
+try:
+    from bigqmt_signal_trader_local_config import BIGQMT_REDIS_CONFIG as _log_config
+    _file_enabled = bool((_log_config or {}).get("log_file_enabled", True))
+except ImportError:
+    _file_enabled = True
+
+
+def configure_file_logging(enabled=True):
+    """Runtime 配置更新也要撤下旧文件 handler，不能等下一次策略重启。"""
+    global _file_enabled, _initialized
+    enabled = bool(enabled)
+    if enabled != _file_enabled:
+        _file_enabled = enabled
+        _initialized = False
+        _setup()
 
 
 def _env_bool(name, default=True):
@@ -54,6 +72,8 @@ def _resolve_log_dir():
     ending in ``\\python``) so logs sit beside the deployed strategy; falls back
     to a user cache dir otherwise. Deliberately does NOT use this package's own
     src/ directory (a repo checkout is not a writable runtime location)."""
+    if not _file_enabled:
+        return None
     candidates = []
     for entry in sys.path:
         try:
@@ -107,7 +127,7 @@ class _FallbackLogger:
         line = "%s [%s] [%s] %s" % (
             _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), level, self.name, rendered,
         )
-        if _env_bool("BIGQMT_LOG_ENABLED", True):
+        if _file_enabled and _env_bool("BIGQMT_LOG_ENABLED", True):
             log_dir = _resolve_log_dir()
             if log_dir is not None:
                 try:
@@ -143,6 +163,8 @@ def _cleanup_old_logs(log_dir, retention_days):
     TimedRotatingFileHandler only prunes backups at rotation time; this sweeps
     stale files on startup too (e.g. after a weekend gap or a config change).
     """
+    if not _file_enabled:
+        return
     try:
         cutoff = time.time() - retention_days * 86400
         for name in os.listdir(log_dir):
@@ -224,6 +246,8 @@ def _tolerant_rotator(source, dest):
     turn every subsequent log write into a traceback in the QMT panel. Losing
     one rotation is a smaller problem than losing the log's readability.
     """
+    if not _file_enabled:
+        return
     try:
         if os.path.exists(source):
             os.replace(source, dest)
@@ -252,7 +276,7 @@ def _setup():
     )
 
     # File handler: rotate at midnight, keep the last 7 days only.
-    log_dir = _resolve_log_dir()
+    log_dir = _resolve_log_dir() if _file_enabled else None
     if log_dir is not None:
         try:
             fname = os.path.join(log_dir, _log_file_name())
@@ -298,6 +322,8 @@ def get_logger(name=""):
 
 def log_file_path():
     """Return the current log file path (or None if file logging is off)."""
+    if not _file_enabled or not _env_bool("BIGQMT_LOG_ENABLED", True):
+        return None
     _setup()
     log_dir = _resolve_log_dir()
     if log_dir is None:

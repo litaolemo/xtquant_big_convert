@@ -93,6 +93,9 @@ PIPE_TEMPLATE = PIPE_TEMPLATE.replace(
     # 模态框，卡住策略线程。pipe 构建默认关掉（显式写出来，避免任何 provider
     # 忘了按 transport 推导时回落到构造器默认的 True）。
     "native_xtdata_enabled": False,
+    # #420/#433：加载器免 open 还不够，日志和身份 journal 也必须零文件 I/O。
+    "log_file_enabled": False,
+    "order_identity_persistence": False,
     "pipe": {
         "pipe_name": "bigqmt_rpc",   # 管道名前缀，账号 id 自动拼在后面；客户端要一致
     },''')

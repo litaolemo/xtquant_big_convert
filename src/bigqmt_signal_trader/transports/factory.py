@@ -7,6 +7,8 @@ driver) are imported lazily; a missing dependency surfaces as a clear
 ``ImportError`` only when that transport is actually selected.
 """
 
+import os
+
 from .base import RpcTransport
 from .redis_transport import RedisTransport
 
@@ -76,12 +78,19 @@ def build_transport(
         from .pipe_transport import NamedPipeTransport
 
         pipe_config = dict(config.get("pipe") or {})
-        return NamedPipeTransport(
+        transport_class = NamedPipeTransport
+        relay_kwargs = {}
+        if os.name != "nt" and pipe_config.get("relay_command") is not None:
+            from .pipe_relay_transport import PipeRelayTransport
+            transport_class = PipeRelayTransport
+            relay_kwargs["relay_command"] = pipe_config["relay_command"]
+        return transport_class(
             account_id=account_id,
             print_prefix=print_prefix,
             pipe_name=pipe_config.get("pipe_name") or "bigqmt_rpc",
             connect_timeout_seconds=float(
                 pipe_config.get("connect_timeout_seconds") or 5.0),
+            **relay_kwargs
         )
     if name == "shm":
         return _build_shm(config, account_id, print_prefix)

@@ -370,8 +370,22 @@ _LOCAL_ROOTS = (
     "bigqmt_no_redis",
 )
 _ORIGINAL_IMPORT = _builtins.__import__
-_ORIGINAL_IMPORT_MODULE = _importlib.import_module
-_ORIGINAL_RELOAD = _importlib.reload
+# 同进程重跑时不能把上一代 hook 当成原函数；它仍引用被 exec 覆盖的
+# globals，回退普通模块时会无限递归（#420 flat 模型重跑）。
+def _unwrap_flat_hook(hook, name, original_name):
+    original = getattr(hook, "__bigqmt_flat_original__", None)
+    if original is not None:
+        return original
+    # 兼容从尚未保存 original 属性的 flat 产物热重跑升级。
+    if getattr(hook, "__name__", None) == name:
+        return hook.__globals__.get(original_name, hook)
+    return hook
+
+
+_ORIGINAL_IMPORT_MODULE = _unwrap_flat_hook(
+    _importlib.import_module, "_local_import_module", "_ORIGINAL_IMPORT_MODULE")
+_ORIGINAL_RELOAD = _unwrap_flat_hook(
+    _importlib.reload, "_local_reload", "_ORIGINAL_RELOAD")
 
 # QMT runs the strategy via exec, where __file__ may be absent; fall back safely.
 _STRATEGY_FILE_DIR = os.path.dirname(os.path.abspath(globals().get("__file__", os.getcwd())))
@@ -516,6 +530,8 @@ def _stop_previous_rpc_service():
 
 _stop_previous_rpc_service()
 _clear_local_modules()
+_local_import_module.__bigqmt_flat_original__ = _ORIGINAL_IMPORT_MODULE
+_local_reload.__bigqmt_flat_original__ = _ORIGINAL_RELOAD
 _importlib.import_module = _local_import_module
 _importlib.reload = _local_reload
 print("[bigqmt_shell] all-in-one no-redis strategy flat modules=%d" % len(_MODULE_FUNCS))
@@ -594,21 +610,9 @@ except Exception as account_config_error:
         _runtime.configure_runtime_account(account_id)
 
 try:
-    qmt_extra = {}
-    for function_name in (
-        "get_history_trade_detail_data", "get_value_by_order_id", "get_last_order_id",
-        "get_ipo_data", "get_new_purchase_limit", "get_assure_contract",
-        "get_enable_short_contract", "get_unclosed_compacts", "get_closed_compacts",
-        "get_debt_contract", "get_option_subject_position", "get_comb_option",
-        "get_hkt_exchange_rate",
-    ):
-        if function_name in globals():
-            qmt_extra[function_name] = globals()[function_name]
+    # #202：QMT 只往挂载入口注入全局，所有 flat 构建共用策略的唯一名单。
     _runtime.bind_runtime_api(
-        passorder_func=globals().get("passorder"),
-        cancel_func=globals().get("cancel"),
-        get_trade_detail_data_func=globals().get("get_trade_detail_data"),
-        extra_funcs=qmt_extra or None,
+        extra_funcs=_runtime.capture_qmt_injected_funcs(globals()),
     )
 except NameError:
     pass

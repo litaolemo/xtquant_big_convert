@@ -811,6 +811,7 @@ def _build_rpc_service(context_info, app, config):
             # The handlers build their own provider; without this it defaults
             # to native-on even on transport=pipe and dials 58610.
             native_xtdata_enabled=_native_xtdata_enabled(rpc_config),
+            full_tick_warmup_wait_seconds=rpc_config.get("full_tick_warmup_wait_seconds"),
         ),
         position_provider=BigQmtPositionProvider(
             get_trade_detail_data_func=qmt_api.get("get_trade_detail_data"),
@@ -852,7 +853,8 @@ def _build_rpc_service(context_info, app, config):
     handlers.download_job_redis_client = _store_redis
     handlers.order_identity_redis_client = _store_redis
     handlers.order_remark_redis_client = _exec_events.bounded_identity_client(_store_redis)
-    if _store_redis is None:
+    # #420：无 Redis 默认仍恢复 journal；禁 FileIO 的终端可显式只留内存归属。
+    if _store_redis is None and _config_bool(rpc_config.get("order_identity_persistence"), True):
         # Pipe and other Redis-free transports need a durable source after a
         # real strategy/process restart, when the in-memory journal is gone.
         handlers.enable_order_identity_persistence(
@@ -1545,6 +1547,7 @@ def _pump_download_jobs(context_info, config):
             context_info,
             qmt_api=dict(config.get("qmt_api") or {}),
             native_xtdata_enabled=_native_xtdata_enabled(config.get("rpc")),
+            full_tick_warmup_wait_seconds=(config.get("rpc") or {}).get("full_tick_warmup_wait_seconds"),
         )
     try:
         from bigqmt_signal_trader.download_jobs import pump_download_jobs

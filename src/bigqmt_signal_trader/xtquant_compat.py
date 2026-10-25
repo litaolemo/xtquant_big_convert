@@ -1492,6 +1492,7 @@ class BigQmtRpcClient:
         self.mysql_config = dict(merged_redis_config.get("mysql") or {})
         self.pipe_config = dict(merged_redis_config.get("pipe") or {})
         self._transport_instance = None  # lazily built by _transport()
+        self._transport_lock = threading.RLock()
         # FormulaServer read fast-path. QMT's C++ quote service (port 58600)
         # answers reference/history reads in ~0.07ms without touching the QMT
         # python thread. Enabled by default; every miss falls back to RPC, so a
@@ -1525,6 +1526,11 @@ class BigQmtRpcClient:
         return self.redis_client
 
     def _transport(self):
+        # #431：多线程同时首调只能建一个 owner，否则 close 只关最后一个实例。
+        with self._transport_lock:
+            return self._transport_unlocked()
+
+    def _transport_unlocked(self):
         if self._transport_instance is None:
             if self.transport_name in ("redis", "", "default"):
                 # Legacy path: call_redis_rpc builds its own request envelope.
@@ -1547,7 +1553,7 @@ class BigQmtRpcClient:
                 "mysql": dict(config_redis.get("mysql") or {}, **self.mysql_config),
                 # 管道名两侧必须一致，否则客户端连的是另一条线 —— 表现为
                 # 「连不上」而不是「配错了」，最难查的那种。
-                "pipe": dict(config_redis.get("pipe") or {}),
+                "pipe": dict(config_redis.get("pipe") or {}, **self.pipe_config),
             }
             self._transport_instance = build_transport(
                 self.transport_name,
@@ -1567,8 +1573,9 @@ class BigQmtRpcClient:
         teardown can call it directly. Safe to call more than once -- the
         transport is rebuilt lazily if the client is used again afterwards.
         """
-        transport = self._transport_instance
-        self._transport_instance = None
+        with self._transport_lock:
+            transport = self._transport_instance
+            self._transport_instance = None
         if transport is not None:
             try:
                 transport.stop()

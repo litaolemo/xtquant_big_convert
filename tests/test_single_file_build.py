@@ -25,6 +25,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
 
 BUILDERS = {
+    "pipe_flat": ("build_pipe_single_file_flat.py", "gbk"),
     "redis": ("build_single_file.py", "utf-8"),
     "no_redis_flat": ("build_no_redis_single_file_flat.py", "gbk"),
 }
