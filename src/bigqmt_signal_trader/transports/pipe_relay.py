@@ -145,4 +145,11 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        _exit_code = main()
+    except Exception as exc:
+        _diagnostic(RuntimeError("relay startup failed (%s)" % type(exc).__name__))
+        _exit_code = 1
+    # stdin pump 可能仍在 Windows CRT 的阻塞读里。所有帧/诊断已经 flush，
+    # 由 OS 直接回收句柄，别让 Python 终结标准流时再等待该守护线程。
+    os._exit(_exit_code)

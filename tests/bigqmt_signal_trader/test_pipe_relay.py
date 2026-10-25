@@ -411,3 +411,36 @@ def test_missing_relay_command_is_a_transport_error():
     with pytest.raises(TransportError): t.send_request({"method": "order_stock"}, 1)
     assert t._processes == {}
     t.stop()
+
+
+def test_module_pipe_failure_exits_with_stdin_still_open():
+    # 在 POSIX 模拟 Win32 连接；走真实 -m main/帧循环和阻塞 stdin pump。
+    # Windows 真句柄版本见 test_pipe_relay_windows.py。
+    script = '''
+import os,sys,types,runpy
+from bigqmt_signal_trader.transports.pipe_transport import NamedPipeTransport
+NamedPipeTransport._client_handle = lambda self: 42
+NamedPipeTransport._write = lambda self,h,payload: len(payload)
+def broken(*args): raise OSError("pipe closed")
+NamedPipeTransport._read = broken
+NamedPipeTransport.stop = lambda self: None
+sys.modules["msvcrt"] = types.SimpleNamespace(setmode=lambda *args: None)
+os.name = "nt"
+os.O_BINARY = 0
+runpy.run_module("bigqmt_signal_trader.transports.pipe_relay",run_name="__main__")
+'''
+    process = subprocess.Popen([sys.executable, "-B", "-c", script],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        write_frame(process.stdin, json.dumps(dict(pipe_path=r"\\.\pipe\test")).encode())
+        write_frame(process.stdin, b'{"method":"cancel"}')
+        # 故意不关闭 stdin：管道错误本身必须结束中继。
+        assert process.wait(timeout=5) == 1
+        assert process.stdout.read() == frame_header(0)
+        assert len(process.stderr.read().splitlines()) == 1
+    finally:
+        if process.poll() is None: process.kill()
+        process.wait(timeout=3)
+        process.stdin.close()
+        process.stdout.close()
+        process.stderr.close()
