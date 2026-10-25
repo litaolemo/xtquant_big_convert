@@ -811,6 +811,7 @@ def _build_rpc_service(context_info, app, config):
             # The handlers build their own provider; without this it defaults
             # to native-on even on transport=pipe and dials 58610.
             native_xtdata_enabled=_native_xtdata_enabled(rpc_config),
+            full_tick_warmup_wait_seconds=rpc_config.get("full_tick_warmup_wait_seconds"),
         ),
         position_provider=BigQmtPositionProvider(
             get_trade_detail_data_func=qmt_api.get("get_trade_detail_data"),
@@ -1546,6 +1547,7 @@ def _pump_download_jobs(context_info, config):
             context_info,
             qmt_api=dict(config.get("qmt_api") or {}),
             native_xtdata_enabled=_native_xtdata_enabled(config.get("rpc")),
+            full_tick_warmup_wait_seconds=(config.get("rpc") or {}).get("full_tick_warmup_wait_seconds"),
         )
     try:
         from bigqmt_signal_trader.download_jobs import pump_download_jobs

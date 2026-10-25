@@ -27,6 +27,7 @@ from .pipe_transport import (
     _BUFFER_BYTES,
     _CONNECT_POLL_SECONDS,
     _kernel32,
+    _ServerPipeConnection,
     pipe_path,
     DEFAULT_PIPE_NAME,
     ERROR_BROKEN_PIPE,
@@ -67,6 +68,9 @@ class PipeQuotePushChannel(object):
         self._accept_thread = None
         self._sub_handles = {}
         self._sub_handles_lock = threading.Lock()
+        self._publisher_stop = threading.Event()
+        self._publisher_lifecycle_lock = threading.RLock()
+        self._accepting = None
         self._sub_thread = None
         self._subscriber_stop = None
         self._stale_subscriber_threads = []
@@ -84,77 +88,77 @@ class PipeQuotePushChannel(object):
     def start_publisher(self):
         if not self.bind_address:
             raise ValueError("bind_address is required to start a publisher")
-        self._running = True
-        thread = threading.Thread(
-            target=self._accept_loop, name="bigqmt-quote-push-pipe-accept")
-        thread.daemon = True
-        thread.start()
-        self._accept_thread = thread
+        with self._publisher_lifecycle_lock:
+            if self._accept_thread is not None and self._accept_thread.is_alive():
+                raise RuntimeError("pipe publisher already running")
+            with self._sub_handles_lock:
+                self._running = True
+                self._publisher_stop = threading.Event()
+            thread = threading.Thread(
+                target=self._accept_loop, name="bigqmt-quote-push-pipe-accept")
+            thread.daemon = True
+            self._accept_thread = thread
+            thread.start()
 
     def _accept_loop(self):
         dll, _ = self._dll()
-        while self._running:
-            # DUPLEX, not OUTBOUND: the client's SetNamedPipeHandleState
-            # (message read mode) needs GENERIC_WRITE on its handle, and an
-            # OUTBOUND pipe refuses that with ACCESS_DENIED (err=5). The wire
-            # is still one-directional in practice -- clients never write.
+        stopped = self._publisher_stop
+        while self._running and not stopped.is_set():
+            # DUPLEX：订阅端 SetNamedPipeHandleState 需要 GENERIC_WRITE（#408）。
             handle = dll.CreateNamedPipeW(
                 self.bind_address, PIPE_ACCESS_DUPLEX,
                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 PIPE_UNLIMITED_INSTANCES, _BUFFER_BYTES, _BUFFER_BYTES, 0, None)
             if handle == INVALID_HANDLE_VALUE:
-                if not self._running:
+                if not self._running or stopped.is_set():
                     return
                 time.sleep(_CONNECT_POLL_SECONDS)
                 continue
-            connected = dll.ConnectNamedPipe(handle, None)
-            if not connected and self._last_error() != ERROR_PIPE_CONNECTED:
-                try:
-                    dll.CloseHandle(handle)
-                except Exception:
-                    pass
-                continue
-            if not self._running:
-                try:
-                    dll.CloseHandle(handle)
-                except Exception:
-                    pass
-                return
+            connection = _ServerPipeConnection(handle)
             with self._sub_handles_lock:
-                self._sub_handles[handle] = threading.Lock()
+                if self._running and not stopped.is_set():
+                    self._accepting = connection
+                else:
+                    connection.close(dll)
+                    return
+            try:
+                connected = connection.call(dll.ConnectNamedPipe, None)
+                if connected is None or (not connected and self._last_error() != ERROR_PIPE_CONNECTED):
+                    continue
+                with self._sub_handles_lock:
+                    if not self._running or stopped.is_set() or connection.closing.is_set():
+                        return
+                    self._sub_handles[handle] = connection
+                connection = None
+            finally:
+                with self._sub_handles_lock:
+                    self._accepting = None
+                if connection is not None:
+                    connection.close(dll)
 
     def publish(self, topic, data):
-        if not self._running:
+        if not self._running or self._publisher_stop.is_set():
             return
         payload = json.dumps(
             {"topic": str(topic), "data": data},
             ensure_ascii=False, default=str).encode("utf-8")
         dll, wintypes = self._dll()
         with self._sub_handles_lock:
-            items = list(self._sub_handles.items())
-        dead = []
-        for handle, lock in items:
+            connections = list(self._sub_handles.values())
+        def write(handle):
             written = wintypes.DWORD()
-            with lock:
-                ok = dll.WriteFile(handle, payload, len(payload),
-                                   ctypes.byref(written), None)
-            if not ok:
-                dead.append(handle)
-        for handle in dead:
-            self._drop_handle(handle)
+            return dll.WriteFile(handle, payload, len(payload), ctypes.byref(written), None)
+        for connection in connections:
+            if not connection.call(write):
+                self._drop_handle(connection)
 
-    def _drop_handle(self, handle):
+    def _drop_handle(self, connection):
         dll, _ = self._dll()
+        connection.closing.set()
         with self._sub_handles_lock:
-            self._sub_handles.pop(handle, None)
-        try:
-            dll.DisconnectNamedPipe(handle)
-        except Exception:
-            pass
-        try:
-            dll.CloseHandle(handle)
-        except Exception:
-            pass
+            if self._sub_handles.get(connection.handle) is connection:
+                del self._sub_handles[connection.handle]
+        connection.close(dll)
 
     def publisher_subscriber_count(self):
         """Connected clients right now (diagnostic)."""
@@ -303,27 +307,37 @@ class PipeQuotePushChannel(object):
         return len(alive) + (1 if current is not None and current.is_alive() else 0)
 
     # -- both --------------------------------------------------------------
+    def _wake_accept(self):
+        if not self.bind_address:
+            return
+        try:
+            dll, _ = self._dll()
+            handle = dll.CreateFileW(self.bind_address, GENERIC_READ | GENERIC_WRITE,
+                                     0, None, OPEN_EXISTING, 0, None)
+            if handle != INVALID_HANDLE_VALUE:
+                dll.CloseHandle(handle)
+        except Exception:
+            pass
+
     def stop(self):
-        self._running = False
-        self._stop_subscriber()
-        if self.bind_address:
-            try:
-                dll, _ = self._dll()
-                # Unblock the accept loop: ConnectNamedPipe only returns once
-                # somebody connects, so connect to our own pipe once (the RPC
-                # transport's stop() uses the same trick).
-                handle = dll.CreateFileW(self.bind_address,
-                                         GENERIC_READ | GENERIC_WRITE,
-                                         0, None, OPEN_EXISTING, 0, None)
-                if handle != INVALID_HANDLE_VALUE:
-                    dll.CloseHandle(handle)
-            except Exception:
-                pass
-        with self._sub_handles_lock:
-            handles = list(self._sub_handles)
-        for handle in handles:
-            self._drop_handle(handle)
-        thread = self._accept_thread
-        if thread is not None and thread.is_alive():
-            thread.join(1.0)
-        self._accept_thread = None
+        with self._publisher_lifecycle_lock:
+            with self._sub_handles_lock:
+                self._running = False
+                self._publisher_stop.set()
+                connections = list(self._sub_handles.values())
+                if self._accepting is not None:
+                    connections.append(self._accepting)
+                for connection in connections:
+                    connection.closing.set()
+            self._stop_subscriber()
+            if connections:
+                self._wake_accept()
+            for connection in connections:
+                self._drop_handle(connection)
+            thread = self._accept_thread
+            if thread is not None and thread is not threading.current_thread():
+                # 一秒后线程仍活着不等于停止；新模型必须等旧 accept 真正退出。
+                while thread.is_alive():
+                    self._wake_accept()
+                    thread.join(_CONNECT_POLL_SECONDS)
+            self._accept_thread = None

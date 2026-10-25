@@ -56,7 +56,10 @@ while True:
         sys.stdout.buffer.write(struct.pack("!I", 0xffffffff)); sys.stdout.buffer.flush(); sys.exit(0)
     if mode == "bad_json": write(b"{"); continue
     req = json.loads(raw)
-    write(json.dumps(dict(pid=os.getpid(), hello=hello, echo=req)).encode())
+    response = dict(pid=os.getpid(), hello=hello, echo=req, request_id=req.get("request_id"))
+    if mode == "mismatch": response["request_id"] = "somebody-elses-order"
+    if mode == "missing_id": response.pop("request_id")
+    write(json.dumps(response).encode())
 '''
 
 
@@ -444,3 +447,19 @@ runpy.run_module("bigqmt_signal_trader.transports.pipe_relay",run_name="__main__
         process.stdin.close()
         process.stdout.close()
         process.stderr.close()
+
+
+@pytest.mark.parametrize("mode", ["mismatch", "missing_id"])
+def test_response_id_mismatch_drops_relay_without_resend(make_transport, tmp_path, mode):
+    receipt = tmp_path / "requests"
+    transport = make_transport(mode, receipt)
+    request = dict(request_id="our-order", method="order_stock", params={})
+    with pytest.raises(TransportError, match="request_id mismatch"):
+        transport.send_request(request, timeout_seconds=2)
+    assert [json.loads(line) for line in receipt.read_text().splitlines()] == [request]
+    assert not transport._processes
+    # 只有调用者发起下一次调用才能新建中继；旧请求不会由传输层重放。
+    transport.command[-2] = "echo"
+    following = dict(request_id="next-query", method="query_stock_orders", params={})
+    assert transport.send_request(following, timeout_seconds=2)["request_id"] == "next-query"
+    assert [json.loads(line) for line in receipt.read_text().splitlines()] == [request, following]

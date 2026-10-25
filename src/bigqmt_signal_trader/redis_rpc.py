@@ -1347,6 +1347,9 @@ class BigQmtRpcHandlers:
         heavy_thread = getattr(service, "_heavy_thread", None)
         report["background_threads"] = bool(getattr(service, "background_threads", True))
         report["heavy_offload"] = bool(getattr(service, "heavy_offload", False))
+        report["heavy_codes_threshold"] = getattr(service, "heavy_codes_threshold", None)
+        report["full_tick_warmup_wait_seconds"] = getattr(
+            self.market_data, "full_tick_warmup_wait_seconds", None)
         report["heavy_worker_alive"] = bool(heavy_thread is not None and heavy_thread.is_alive())
         is_heavy = getattr(service, "is_heavy_read", None)
         if callable(is_heavy):

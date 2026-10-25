@@ -133,7 +133,8 @@ def build_app(context_info=None, config=None):
         if _native_enabled is None:
             _native_enabled = str(_rpc_cfg.get("transport") or "redis").lower() != "pipe"
         market_data = market_data or BigQmtMarketDataProvider(
-            context_info, qmt_api=qmt_api, native_xtdata_enabled=bool(_native_enabled))
+            context_info, qmt_api=qmt_api, native_xtdata_enabled=bool(_native_enabled),
+            full_tick_warmup_wait_seconds=_rpc_cfg.get("full_tick_warmup_wait_seconds"))
         position_provider = position_provider or BigQmtPositionProvider(
             get_trade_detail_data_func=get_trade_detail_data_func,
             account_type=config.get("account_type", "STOCK"),

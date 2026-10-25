@@ -17,9 +17,21 @@
   `log_file_enabled` 和 `order_identity_persistence`。默认仍写日志、无 Redis 时
   仍用身份 journal；显式 False 时分别只留 stdout、只留内存身份。
   pipe flat 构建默认关闭两者，已有 Redis/ZMQ 及 no-redis flat 的默认行为不变。
+- **tick 预热等待可配置**（#310/#351）：`BIGQMT_REDIS_CONFIG.full_tick_warmup_wait_seconds`
+  缺省仍为 2.0 秒；设为 0 时继续订阅、登记分组，但本次不轮询等待。
+  `probe_capabilities.thread_routing` 返回实际 `heavy_codes_threshold` 和预热等待秒数，
+  票数严格大于阈值才转 heavy worker。
 
 ### 修复
 
+- **管道迟到回包不能串到复用句柄的新连接**（#431 后续）：请求绑定连接对象，
+  关闭、停止后丢弃旧回包，I/O 与关闭共用锁；原生和中继客户端都校验
+  `request_id`，错配即弃用连接并抛 `TransportError`，绝不重发。
+- **RPC/事件管道停止等待 accept 真正退出**：实例创建后的登记与停止状态检查同锁，
+  创建到登记之间遇到 stop 的实例由创建者关闭；自连唤醒阻塞 accept，退出后才交还名字。
+- **drain 回包只发送一次**：移除 `deliver()` 已回包后的重复写入，避免下一请求读到上一条结果。
+- **flat 同进程重跑不再递归调用 import hook**（#420）：保留原始 import/reload 函数，
+  第二次 exec 清理旧服务并重建模块后，普通模块的导入与重载仍正常。
 - **原生管道清扫不再误关新注册的活线程句柄**（#431 后续）：存活线程快照改为在
   注册锁内获取，避免快照之后、清扫之前注册的连接被当成死线程回收。
 - **flat 入口漏绑 QMT 下载/公式全局**（#202 同类）：pipe/no-redis 共用入口改为
@@ -32,8 +44,11 @@
 
 ### 测试
 
+- 增加迟到 heavy 回包与句柄复用、写入/关闭交错、accept 停止窗口、客户端错配不重发、
+  tick 预热 0/默认等待及 64/65 票真实分发边界回归。
 - 增加 pipe flat 真实构建/exec 门禁：禁用文件及 socket 调用后运行 init、adjust、
-  inline/deferred 分发和下载回落；记录被吞掉的禁调用，避免「没崩溃」被误当零 I/O。
+  inline/deferred 分发和下载回落；首次及同进程第二次 exec 均断言真实结果、禁调用零次，
+  即使日志/journal 吞掉异常也不能漏检。
 - 增加 stdio 分帧、大包、未知结果不重发、短写重试、超时和线程生命周期测试；
   真 Windows 管道中继 e2e 在非 Windows 平台跳过。
 

@@ -13,7 +13,7 @@ import threading
 import time
 
 from .base import RpcTransport, TransportError, TransportTimeout
-from .pipe_transport import pipe_path, DEFAULT_PIPE_NAME
+from .pipe_transport import pipe_path, DEFAULT_PIPE_NAME, _validate_pipe_response
 from .pipe_relay import frame_header, frame_size
 
 
@@ -204,7 +204,8 @@ class PipeRelayTransport(RpcTransport):
                     raise
                 # 完整帧已交给中继：从此所有错误（含 EOF、坏 JSON、超时）
                 # 都是未知结果，绝不能自动重发下单/撤单（#195/#245）。
-                return json.loads(self._read_frame(relay, deadline).decode("utf-8"))
+                response = json.loads(self._read_frame(relay, deadline).decode("utf-8"))
+                return _validate_pipe_response(request, response)
         except BaseException as exc:
             self._drop()
             if isinstance(exc, (TransportError, TransportTimeout)):

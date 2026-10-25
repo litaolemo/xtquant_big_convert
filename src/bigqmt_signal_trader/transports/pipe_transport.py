@@ -97,6 +97,65 @@ def pipe_path(name=DEFAULT_PIPE_NAME, account_id=""):
     return _PIPE_ROOT + str(name or DEFAULT_PIPE_NAME) + suffix
 
 
+def _validate_pipe_response(request, response):
+    """完整请求发出后的错配属于未知结果，绝不能触发下单/撤单重发（#195）。"""
+    if not isinstance(response, dict) or response.get("request_id") != request.get("request_id"):
+        raise TransportError("pipe response request_id mismatch; outcome unknown")
+    return response
+
+
+class _ServerPipeConnection(object):
+    """句柄值可复用，连接对象不可复用（#431）。
+
+    请求、待发队列、关闭操作都持有这个对象。I/O 与 CloseHandle 共用锁，
+    防止检查身份后、真正 WriteFile 前句柄已被回收；取消 I/O 用独立状态锁，
+    既能唤醒阻塞读写，又不会在 CloseHandle 后取消另一个连接的同值句柄。
+    """
+    def __init__(self, handle, background=False):
+        self.handle = handle
+        self.outbox = queue.Queue() if background else None
+        self.closing = threading.Event()
+        self._io_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._closed = False
+
+    def call(self, function, *args):
+        with self._io_lock:
+            if self.closing.is_set():
+                return None
+            return function(self.handle, *args)
+
+    def cancel(self, dll):
+        with self._state_lock:
+            if not self._closed:
+                try:
+                    dll.CancelIoEx(self.handle, None)
+                except Exception:
+                    pass
+
+    def close(self, dll):
+        self.closing.set()
+        # 取消可能落在另一个线程检查 closing 与进入内核 I/O 之间，必须在
+        # 等锁期间继续取消；一次 CancelIoEx 不足以保证同步句柄能被关闭。
+        while not self._io_lock.acquire(timeout=_CONNECT_POLL_SECONDS):
+            self.cancel(dll)
+        try:
+            with self._state_lock:
+                if self._closed:
+                    return
+                self._closed = True
+                try:
+                    dll.DisconnectNamedPipe(self.handle)
+                except Exception:
+                    pass
+                try:
+                    dll.CloseHandle(self.handle)
+                except Exception:
+                    pass
+        finally:
+            self._io_lock.release()
+
+
 class _ClientHandleFinalizer(object):
     """一条客户端线程的句柄收尸人（#431）。
 
@@ -147,7 +206,9 @@ class NamedPipeTransport(RpcTransport):
         self._k32 = None
         self._wintypes = None
         self._listener = None
-        self._server_handles = []
+        self._server_handles = {}  # handle -> 不可复用的连接对象
+        self._accepting = None
+        self._lifecycle_lock = threading.RLock()
         # drain 模式下由 adjust 线程轮询的已连接句柄
         self._background_threads = True
         self._drain_handles = []
@@ -347,8 +408,15 @@ class NamedPipeTransport(RpcTransport):
             # that is the #195 class of bug. The caller decides on those.
             self._drop_client_handle()
             self._write(self._client_handle(), payload)
-        return json.loads(decode_text(
-            self._read_with_watchdog(self._client_handle(), timeout_seconds)))
+        try:
+            response = json.loads(decode_text(
+                self._read_with_watchdog(self._client_handle(), timeout_seconds)))
+            return _validate_pipe_response(request, response)
+        except (TransportError, ValueError) as exc:
+            self._drop_client_handle()
+            if isinstance(exc, TransportError):
+                raise
+            raise TransportError("invalid pipe response; outcome unknown") from exc
 
     def _read_with_watchdog(self, handle, timeout_seconds):
         watchdog = None
@@ -400,13 +468,27 @@ class NamedPipeTransport(RpcTransport):
         两种模式下 accept 都留一个线程：它只阻塞在 ConnectNamedPipe 上，不碰
         请求数据，代价是一个常驻线程而不是每连接一个。
         """
-        super(NamedPipeTransport, self).start_receiving(on_request)
-        background = kwargs.get("background_threads")
-        self._background_threads = True if background is None else bool(background)
-        self._listener = threading.Thread(
-            target=self._accept_loop, name="bigqmt-pipe-accept")
-        self._listener.daemon = True
-        self._listener.start()
+        with self._lifecycle_lock:
+            if self._listener is not None and self._listener.is_alive():
+                raise TransportError("pipe listener already running")
+            with self._server_lock:
+                super(NamedPipeTransport, self).start_receiving(on_request)
+                background = kwargs.get("background_threads")
+                self._background_threads = True if background is None else bool(background)
+            self._listener = threading.Thread(
+                target=self._accept_loop, name="bigqmt-pipe-accept")
+            self._listener.daemon = True
+            self._listener.start()
+
+    def _register_server_connection(self, handle):
+        connection = _ServerPipeConnection(handle, self._background_threads)
+        with self._server_lock:
+            if self._running:
+                self._server_handles[handle] = connection
+                return connection
+        # stop 落在 CreateNamedPipeW 和登记之间：创建者自己关闭，绝不再 accept。
+        connection.close(self._dll())
+        return None
 
     def _accept_loop(self):
         dll = self._dll()
@@ -420,71 +502,79 @@ class NamedPipeTransport(RpcTransport):
                     return
                 time.sleep(_CONNECT_POLL_SECONDS)
                 continue
-            with self._server_lock:
-                self._server_handles.append(handle)
-            connected = dll.ConnectNamedPipe(handle, None)
-            if not connected and self._last_error() != ERROR_PIPE_CONNECTED:
-                self._close_server_handle(handle)
-                continue
-            if not self._running:
-                self._close_server_handle(handle)
+            connection = self._register_server_connection(handle)
+            if connection is None:
                 return
-            if not self._background_threads:
-                # drain 模式：不起工作线程，交给 adjust 线程轮询这个句柄。
-                self._drain_handles.append(handle)
-                continue
-            worker = threading.Thread(
-                target=self._serve_connection, args=(handle,),
-                name="bigqmt-pipe-conn")
-            worker.daemon = True
-            worker.start()
+            try:
+                with self._server_lock:
+                    if not self._running:
+                        return
+                    self._accepting = connection
+                connected = connection.call(dll.ConnectNamedPipe, None)
+                if connected is None or (not connected and self._last_error() != ERROR_PIPE_CONNECTED):
+                    continue
+                with self._server_lock:
+                    if not self._running or connection.closing.is_set():
+                        return
+                    if not self._background_threads:
+                        self._drain_handles.append(connection)
+                    else:
+                        worker = threading.Thread(
+                            target=self._serve_connection, args=(connection,),
+                            name="bigqmt-pipe-conn")
+                        worker.daemon = True
+                        worker.start()
+                connection = None  # 已交给 drain/worker，accept 不再负责关闭。
+            finally:
+                with self._server_lock:
+                    self._accepting = None
+                if connection is not None:
+                    self._close_server_connection(connection)
 
-    def _serve_connection(self, handle):
-        """One connection, single-threaded I/O: reads AND writes happen here.
+    def _connection_active(self, connection):
+        with self._server_lock:
+            return (self._running and connection is not None
+                    and self._server_handles.get(connection.handle) is connection
+                    and not connection.closing.is_set())
 
-        This is the deferred-answer defect, finally explained: a deferred
-        answer is produced on the adjust thread while this worker sits in a
-        blocking ReadFile -- and a synchronous handle does not tolerate a
-        WriteFile concurrent with a pending ReadFile (measured: the write
-        blocks forever, or fails err=232 ERROR_NO_DATA). So nobody may write
-        except this thread. send_response on any thread only QUEUES into the
-        outbox and CancelIoEx's the pending read; this loop then writes the
-        payload itself. Write-before-read ordering plus the writer's
-        queue-before-cancel ordering means a cancelled-for payload is always
-        visible when the aborted read returns.
-        """
-        outbox = queue.Queue()
+    def _write_server_connection(self, connection, payload):
+        if not self._connection_active(connection):
+            return
         try:
-            while self._running:
+            connection.call(self._write, payload)
+        except Exception:
+            self._close_server_connection(connection)
+            raise
+
+    def _serve_connection(self, connection):
+        """同一 worker 串行读写；异步回包仅入该连接自己的队列（#236/#431）。
+
+        同步管道句柄不能一边阻塞 ReadFile 一边由 adjust WriteFile。异步
+        回包先入队再 CancelIoEx 唤醒读，只有本 worker 向原连接写出。
+        关闭后队列随连接作废，不能拿相同的整数句柄向新连接补发。
+        """
+        outbox = connection.outbox
+        try:
+            while self._connection_active(connection):
                 while not outbox.empty():
-                    self._write(handle, outbox.get())
+                    self._write_server_connection(connection, outbox.get())
                 try:
-                    raw = self._read(handle)
+                    raw = connection.call(self._read)
                 except TransportError:
                     return
                 if not raw:
-                    # Woken by a writer (payload comes out at the top of the
-                    # loop) or by stop(). Not a close -- a real close raises.
-                    continue
+                    continue  # CancelIoEx 唤醒；关闭时下一轮身份检查会退出。
                 try:
                     request = json.loads(decode_text(raw))
+                    if not isinstance(request, dict):
+                        return
                 except Exception:
                     return
-                # Remember which outbox to answer on. send_response reads it
-                # back, so inline and deferred answers both reach this peer.
-                request["_pipe_handle"] = handle
-                request["_pipe_outbox"] = outbox
+                request["_pipe_connection"] = connection
                 self.deliver(request)
         finally:
-            # Flush whatever is queued before closing: the reload reply is a
-            # deferred answer, and a stop() that swallows it is exactly the
-            # reload self-teardown defect.
-            try:
-                while not outbox.empty():
-                    self._write(handle, outbox.get())
-            except Exception:
-                pass
-            self._close_server_handle(handle)
+            # stop 后迟到的回包必须丢弃，不能在 finally 按旧整数句柄补发。
+            self._close_server_connection(connection)
 
     def _peek_available(self, handle):
         """这个句柄上有没有待读数据。PeekNamedPipe 不阻塞，可用于同步句柄。"""
@@ -509,136 +599,94 @@ class NamedPipeTransport(RpcTransport):
         if self._background_threads:
             return 0                 # 工作线程在收，这里不插手
         processed = 0
-        for handle in list(self._drain_handles):
-            while processed < int(max_items):
+        with self._server_lock:
+            connections = list(self._drain_handles)
+        for connection in connections:
+            while processed < int(max_items) and self._connection_active(connection):
                 try:
-                    if not self._peek_available(handle):
+                    raw = connection.call(self._read_available)
+                    if not raw:
                         break
-                    raw = self._read(handle)
-                except TransportError:
-                    self._forget_drain_handle(handle)
-                    break
-                if not raw:
-                    break
-                try:
                     request = json.loads(decode_text(raw))
-                except Exception:
-                    self._forget_drain_handle(handle)
+                    if not isinstance(request, dict):
+                        raise ValueError("pipe request must be a JSON object")
+                except (TransportError, ValueError):
+                    self._close_server_connection(connection)
                     break
-                request["_pipe_handle"] = handle
-                response = None
-                try:
-                    response = self.deliver(request)
-                except Exception as exc:
-                    response = {"schema_version": 1,
-                                "request_id": request.get("request_id"),
-                                "method": request.get("method"),
-                                "ok": False,
-                                "error": "%s: %s" % (exc.__class__.__name__, exc)}
-                if response is not None:
-                    try:
-                        self._write(handle, json.dumps(
-                            response, ensure_ascii=False, default=str).encode("utf-8"))
-                    except Exception:
-                        self._forget_drain_handle(handle)
-                        break
+                request["_pipe_connection"] = connection
+                # deliver 已调用 send_response；再写一次会把重复回包留给下一请求。
+                self.deliver(request)
                 processed += 1
         return processed
 
-    def _forget_drain_handle(self, handle):
-        try:
-            self._drain_handles.remove(handle)
-        except ValueError:
-            pass
-        self._close_server_handle(handle)
-
+    def _read_available(self, handle):
+        return self._read(handle) if self._peek_available(handle) else None
 
     def send_response(self, request, response):
-        """Queue the answer onto the connection's outbox and wake its worker.
-
-        Never writes directly: only the connection worker may write (a
-        synchronous handle does not tolerate a WriteFile concurrent with a
-        pending ReadFile -- the deferred-answer defect). The worker queues
-        BEFORE cancelling, so the payload is always visible by the time the
-        aborted read returns.
-        """
-        handle = (request or {}).get("_pipe_handle")
-        if handle is None:
-            raise TransportError("no pipe handle on the request to reply to")
-        payload = json.dumps(response, ensure_ascii=False, default=str).encode("utf-8")
-        outbox = (request or {}).get("_pipe_outbox")
-        if outbox is None:
-            # drain 模式：没有工作线程，adjust 线程是唯一的读者也是唯一的写者，
-            # 没有并发读写的问题，直接写。（漏了这一支时服务端自己发响应会抛
-            # 「no pipe handle」，客户端表现为超时，实盘上就是这么卡住的。）
-            self._write(handle, payload)
+        """只向仍属于本服务的原连接回包；句柄相同不代表连接相同（#431）。"""
+        connection = (request or {}).get("_pipe_connection")
+        if not self._connection_active(connection):
             return
-        outbox.put(payload)
-        self._cancel_read(handle)
+        payload = json.dumps(response, ensure_ascii=False, default=str).encode("utf-8")
+        if connection.outbox is None:
+            self._write_server_connection(connection, payload)
+        else:
+            connection.outbox.put(payload)
+            connection.cancel(self._dll())
 
-    def _close_server_handle(self, handle):
-        # 先把句柄从表里摘掉，摘到的那个线程才负责真正关闭。stop() 和工作线程
-        # 的 finally 会同时走到这里，重复 CloseHandle 会关掉一个已被回收复用的
-        # 句柄 —— 那种 bug 只会在高并发下偶发，最难查。
+    def _close_server_connection(self, connection):
+        # 从注册表摘除必须认对象，旧 worker 的 finally 不能关新连接的同值句柄。
+        connection.closing.set()
         with self._server_lock:
-            if handle not in self._server_handles:
-                return
-            self._server_handles.remove(handle)
-        dll = self._dll()
-        # **必须先取消挂起的 I/O。** DisconnectNamedPipe 会等同一句柄上挂起的
-        # 同步 ReadFile 完成，而工作线程正阻塞在那个 ReadFile 上等下一个请求 ——
-        # 谁也等不到谁，主线程和 20 个工作线程一起卡死（实测线程栈确认）。
-        # CancelIoEx 让那次读带 ERROR_OPERATION_ABORTED 返回，循环随即退出。
+            if self._server_handles.get(connection.handle) is connection:
+                del self._server_handles[connection.handle]
+            if connection in self._drain_handles:
+                self._drain_handles.remove(connection)
+        connection.close(self._dll())
+
+    def _wake_accept(self):
         try:
-            dll.CancelIoEx(handle, None)
-        except Exception:
-            pass
-        try:
-            dll.DisconnectNamedPipe(handle)
-        except Exception:
-            pass
-        try:
-            dll.CloseHandle(handle)
+            dll = self._dll()
+            handle = dll.CreateFileW(self.path, GENERIC_READ | GENERIC_WRITE,
+                                     0, None, OPEN_EXISTING, 0, None)
+            if handle != INVALID_HANDLE_VALUE:
+                dll.CloseHandle(handle)
         except Exception:
             pass
 
     def stop(self):
-        self._running = False
-        with self._server_lock:
-            server = list(self._server_handles)
-            clients = [entry[0] for entry in self._client_threads.values()]
-            # 先清空注册表：之后各线程 finalizer 触发时找不到条目，自然不会
-            # 对同一批句柄关第二次。
-            self._client_threads = {}
-        # Unblock the accept loop: it is parked in ConnectNamedPipe, which only
-        # returns once somebody connects. Connect to our own pipe once.
-        if server:
-            try:
+        with self._lifecycle_lock:
+            with self._server_lock:
+                self._running = False
+                server = list(self._server_handles.values())
+                for connection in server:
+                    connection.closing.set()
+                accepting = self._accepting
+                clients = [entry[0] for entry in self._client_threads.values()]
+                self._client_threads = {}
+            # ConnectNamedPipe 可能刚准备进入内核；自连同时覆盖已经阻塞与
+            # 尚未开始的情形（后者得到 ERROR_PIPE_CONNECTED）。
+            if accepting is not None:
+                self._wake_accept()
+            for connection in server:
+                self._close_server_connection(connection)
+            listener = self._listener
+            if listener is not None and listener is not threading.current_thread():
+                while listener.is_alive():
+                    self._wake_accept()
+                    listener.join(_CONNECT_POLL_SECONDS)
+            self._listener = None
+            if clients:
                 dll = self._dll()
-                handle = dll.CreateFileW(self.path, GENERIC_READ | GENERIC_WRITE,
-                                         0, None, OPEN_EXISTING, 0, None)
-                if handle != INVALID_HANDLE_VALUE:
-                    dll.CloseHandle(handle)
-            except Exception:
-                pass
-        for handle in server:
-            self._close_server_handle(handle)
-        dll = self._dll()
-        for handle in clients:
-            try:
-                # CancelIoEx BEFORE CloseHandle even though there is no pump:
-                # a send_request on another thread can have a blocking
-                # ReadFile pending on this handle, and CloseHandle on a
-                # synchronous handle with pending I/O blocks until it
-                # completes -- i.e. stop() hangs for as long as the server
-                # stays silent (this test's exact failure).
-                dll.CancelIoEx(handle, None)
-            except Exception:
-                pass
-            try:
-                dll.CloseHandle(handle)
-            except Exception:
-                pass
-        self._client_local = threading.local()
-        self._io_local = threading.local()
-        super(NamedPipeTransport, self).stop()
+                for handle in clients:
+                    try:
+                        dll.CancelIoEx(handle, None)
+                    except Exception:
+                        pass
+                    try:
+                        dll.CloseHandle(handle)
+                    except Exception:
+                        pass
+            self._client_local = threading.local()
+            self._io_local = threading.local()
+            super(NamedPipeTransport, self).stop()

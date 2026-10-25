@@ -46,7 +46,8 @@ def pair():
 def handshake(server, process, responses, delay=False):
     write_frame(process.stdin, json.dumps(dict(pipe_path=server.path, connect_timeout_seconds=3)).encode())
     if delay: time.sleep(0.2)  # FILE_NOT_FOUND 启动竞态：relay 先等，服务端后起。
-    server.start_receiving(lambda request: {"ok": True, "echo": request})
+    server.start_receiving(lambda request: {"ok": True, "echo": {
+        key: value for key, value in request.items() if not key.startswith("_")}})
     assert responses.get(timeout=5) == b""
 
 
