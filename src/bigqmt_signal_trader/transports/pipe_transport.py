@@ -299,9 +299,10 @@ class NamedPipeTransport(RpcTransport):
         退出即时触发的，这里只为回收时点不保证的运行时（或解释器退出
         边缘）兜底。
         """
-        live = set(t.ident for t in threading.enumerate())
         dead = []
         with self._server_lock:
+            # #431：采样与注册同锁，否则旧快照会漏掉刚注册的活线程并误关句柄。
+            live = set(t.ident for t in threading.enumerate())
             for ident, entry in list(self._client_threads.items()):
                 if ident in live:
                     continue
